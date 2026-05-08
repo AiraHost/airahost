@@ -2,10 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 
-import {
-  executeMlSidecarForecast,
-  normalizeMlForecastRunRow,
-} from "@/lib/mlSidecar";
+import { normalizeMlForecastRunRow } from "@/lib/mlSidecar";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import { getSupabaseServer } from "@/lib/supabaseServer";
 
@@ -24,9 +21,10 @@ function asObject(value: unknown): Record<string, unknown> | null {
 
 function buildMlForecastPayload(params: {
   reportId: string;
+  jobId?: string;
   createdAt?: string | null;
   completedAt?: string | null;
-  status: "running" | "ready" | "error";
+  status: "queued" | "running" | "ready" | "error";
   trainingScope?: string | null;
   modelMode?: string | null;
   nSamples?: number | null;
@@ -38,6 +36,7 @@ function buildMlForecastPayload(params: {
 }) {
   const {
     reportId,
+    jobId = reportId,
     createdAt,
     completedAt,
     status,
@@ -52,7 +51,8 @@ function buildMlForecastPayload(params: {
   } = params;
 
   return {
-    id: reportId,
+    id: jobId,
+    jobId,
     reportId,
     status,
     trainingScope,
@@ -167,7 +167,7 @@ export async function GET(
         report && mlForecast
           ? normalizeMlForecastRunRow({
               ...mlForecast,
-              id: report.id,
+              id: mlForecast.jobId ?? mlForecast.id ?? report.id,
               reportId: report.id,
               createdAt: mlForecast.createdAt ?? report.created_at,
               completedAt: mlForecast.completedAt ?? report.completed_at,
@@ -219,12 +219,32 @@ export async function POST(
     );
   }
 
+  const existingMlForecast = asObject(report.result_summary?.mlForecast);
+  const existingStatus =
+    typeof existingMlForecast?.status === "string" ? existingMlForecast.status : null;
+  if (
+    existingMlForecast &&
+    (existingStatus === "queued" || existingStatus === "running")
+  ) {
+    return NextResponse.json({
+      run: normalizeMlForecastRunRow({
+        ...existingMlForecast,
+        id: existingMlForecast.jobId ?? existingMlForecast.id ?? report.id,
+        reportId: report.id,
+        createdAt: existingMlForecast.createdAt ?? report.created_at,
+        completedAt: existingMlForecast.completedAt ?? report.completed_at,
+      }),
+    });
+  }
+
   const startedAt = new Date().toISOString();
-  const runningPayload = buildMlForecastPayload({
+  const jobId = randomUUID();
+  const queuedPayload = buildMlForecastPayload({
     reportId: report.id,
+    jobId,
     createdAt: startedAt,
     completedAt: null,
-    status: "running",
+    status: "queued",
     trainingScope,
     modelMode: null,
     nSamples: null,
@@ -234,108 +254,42 @@ export async function POST(
     predictions: [],
   });
 
-  await admin
+  const { data: updated, error: updateError } = await admin
     .from("pricing_reports")
     .update({
       result_summary: mergeSummaryWithMlForecast(
         report.result_summary,
-        runningPayload
+        queuedPayload
       ),
     })
-    .eq("id", report.id);
+    .eq("id", report.id)
+    .select("id, created_at, completed_at, result_summary")
+    .single();
 
-  try {
-    const manifest = await executeMlSidecarForecast({
-      savedListingId: id,
-      trainingScope,
-      runId: randomUUID(),
-    });
-
-    const readyPayload = buildMlForecastPayload({
-      reportId: report.id,
-      createdAt: startedAt,
-      completedAt: new Date().toISOString(),
-      status: "ready",
-      trainingScope: manifest.trainingScope ?? trainingScope,
-      modelMode: manifest.modelMode,
-      nSamples: manifest.nSamples,
-      generatedAt: manifest.generatedAt ?? startedAt,
-      errorMessage: null,
-      metrics: manifest.metrics,
-      explanation: manifest.explanation,
-      predictions: manifest.predictions,
-    });
-
-    const { data: updated, error: updateError } = await admin
-      .from("pricing_reports")
-      .update({
-        result_summary: mergeSummaryWithMlForecast(
-          report.result_summary,
-          readyPayload
-        ),
-      })
-      .eq("id", report.id)
-      .select("id, created_at, completed_at, result_summary")
-      .single();
-
-    if (updateError || !updated) {
-      throw new Error(
-        updateError?.message ?? "Failed to persist ML forecast output."
-      );
-    }
-
-    const updatedSummary = asObject(updated.result_summary);
-    const updatedMlForecast = asObject(updatedSummary?.mlForecast);
-
-    return NextResponse.json({
-      run: normalizeMlForecastRunRow({
-        ...(updatedMlForecast ?? readyPayload),
-        id: updated.id,
-        reportId: updated.id,
-        createdAt:
-          updatedMlForecast?.createdAt ??
-          (typeof updated.created_at === "string" ? updated.created_at : null) ??
-          startedAt,
-        completedAt:
-          updatedMlForecast?.completedAt ??
-          (typeof updated.completed_at === "string"
-            ? updated.completed_at
-            : null) ??
-          readyPayload.completedAt,
-      }),
-    });
-  } catch (error) {
-    const errorPayload = buildMlForecastPayload({
-      reportId: report.id,
-      createdAt: startedAt,
-      completedAt: new Date().toISOString(),
-      status: "error",
-      trainingScope,
-      modelMode: null,
-      nSamples: null,
-      generatedAt: null,
-      errorMessage:
-        error instanceof Error ? error.message.slice(0, 1000) : "Unknown ML error",
-      metrics: null,
-      predictions: [],
-    });
-
-    await admin
-      .from("pricing_reports")
-      .update({
-        result_summary: mergeSummaryWithMlForecast(
-          report.result_summary,
-          errorPayload
-        ),
-      })
-      .eq("id", report.id);
-
+  if (updateError || !updated) {
     return NextResponse.json(
       {
-        error: "ML forecast failed.",
-        details: error instanceof Error ? error.message : null,
+        error: "Failed to persist queued ML forecast.",
+        details: updateError?.message ?? null,
       },
       { status: 500 }
     );
   }
+
+  const updatedSummary = asObject(updated.result_summary);
+  const updatedMlForecast = asObject(updatedSummary?.mlForecast);
+
+  return NextResponse.json({
+    run: normalizeMlForecastRunRow({
+      ...(updatedMlForecast ?? queuedPayload),
+      id: updatedMlForecast?.jobId ?? jobId,
+      jobId,
+      reportId: updated.id,
+      createdAt:
+        updatedMlForecast?.createdAt ??
+        (typeof updated.created_at === "string" ? updated.created_at : null) ??
+        startedAt,
+      completedAt: updatedMlForecast?.completedAt ?? null,
+    }),
+  });
 }

@@ -46,6 +46,12 @@ const NIGHTLY_DAYS = 30;
 /** Fallback timezone for listings that have no resolved timezone yet. */
 const FALLBACK_TIMEZONE = "America/Los_Angeles";
 
+function extractAirbnbRoomId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = value.match(/\/rooms\/(\d+)/i);
+  return match?.[1] ?? null;
+}
+
 /**
  * Compute the nightly date range for a specific IANA timezone.
  * startDate = local tomorrow in that timezone
@@ -125,6 +131,7 @@ export async function POST(req: NextRequest) {
   // Always read the raw text first — don't rely on content-type alone.
   // Empty string → no body → full schedule (default).
   let filterIds: string[] | null = null; // null = schedule all (default)
+  let filterAirbnbRoomId: string | null = null;
   let forceDedup = false;                 // bypass 23-hour dedup — local-only
   const rawBody = (await req.text()).trim();
 
@@ -164,14 +171,23 @@ export async function POST(req: NextRequest) {
           );
         }
         filterIds = b.listingIds as string[];
+      } else if ("airbnbRoomId" in b || "listingAirbnbRoomId" in b) {
+        const rawRoomId = b.airbnbRoomId ?? b.listingAirbnbRoomId;
+        if (typeof rawRoomId !== "string" || !/^\d+$/.test(rawRoomId)) {
+          return NextResponse.json(
+            { error: "airbnbRoomId must be a numeric string" },
+            { status: 400 }
+          );
+        }
+        filterAirbnbRoomId = rawRoomId;
       }
 
       // ── force: true — local-dev dedup bypass ───────────────────────────────
       if (b.force === true) {
         // Must have a listing filter — force on all listings is never allowed.
-        if (filterIds === null) {
+        if (filterIds === null && filterAirbnbRoomId === null) {
           return NextResponse.json(
-            { error: "force:true requires listingId or listingIds — cannot force-run all listings" },
+            { error: "force:true requires listingId, listingIds, or airbnbRoomId — cannot force-run all listings" },
             { status: 400 }
           );
         }
@@ -197,7 +213,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const isFiltered = filterIds !== null;
+  const isFiltered = filterIds !== null || filterAirbnbRoomId !== null;
 
   const admin = getSupabaseAdmin();
   const dedupCutoff = new Date(
@@ -207,7 +223,9 @@ export async function POST(req: NextRequest) {
   const targetEnv = process.env.WORKER_TARGET_ENV ?? "production";
   console.log(
     `[nightly/schedule] target_env=${targetEnv} job_lane=nightly` +
-    (isFiltered ? ` filter=partial listingIds=${filterIds!.join(",")}` : " filter=all") +
+    (filterIds ? ` filter=partial listingIds=${filterIds.join(",")}` : "") +
+    (filterAirbnbRoomId ? ` filter=airbnbRoomId(${filterAirbnbRoomId})` : "") +
+    (!isFiltered ? " filter=all" : "") +
     (forceDedup ? " force=true (dedup bypassed)" : "")
   );
 
@@ -219,11 +237,11 @@ export async function POST(req: NextRequest) {
     )
     .order("created_at", { ascending: false });
 
-  if (isFiltered) {
-    listingsQuery = listingsQuery.in("id", filterIds!);
+  if (filterIds) {
+    listingsQuery = listingsQuery.in("id", filterIds);
   }
 
-  const { data: listings, error: listingsErr } = await listingsQuery;
+  const { data: fetchedListings, error: listingsErr } = await listingsQuery;
 
   if (listingsErr) {
     console.error("[nightly/schedule] listings fetch failed", listingsErr);
@@ -233,21 +251,46 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  let listings = fetchedListings ?? [];
+  if (filterAirbnbRoomId) {
+    listings = listings.filter((listing) => {
+      const attrs = (listing.input_attributes ?? {}) as Record<string, unknown>;
+      const listingUrl =
+        (attrs.listingUrl as string | null | undefined) ??
+        (attrs.listing_url as string | null | undefined) ??
+        null;
+      return extractAirbnbRoomId(listingUrl) === filterAirbnbRoomId;
+    });
+  }
+
   if (!listings || listings.length === 0) {
     return NextResponse.json({
-      filter: isFiltered ? { listingIds: filterIds } : "all",
+      filter: filterAirbnbRoomId
+        ? { airbnbRoomId: filterAirbnbRoomId }
+        : isFiltered
+          ? { listingIds: filterIds }
+          : "all",
       scheduled: 0,
-      skipped: 0,
-      total: 0,
-      results: [],
+      skipped: isFiltered ? 1 : 0,
+      total: isFiltered ? 1 : 0,
+      results: filterAirbnbRoomId
+        ? [
+            {
+              listingId: filterAirbnbRoomId,
+              listingName: null,
+              scheduled: false,
+              reason: "not_found",
+            },
+          ]
+        : [],
     });
   }
 
   // ── Report not-found IDs when a filter was requested ────────────────────
   const results: ResultEntry[] = [];
-  if (isFiltered) {
+  if (filterIds) {
     const foundIds = new Set(listings.map((l) => l.id));
-    for (const reqId of filterIds!) {
+    for (const reqId of filterIds) {
       if (!foundIds.has(reqId)) {
         results.push({
           listingId: reqId,
@@ -428,10 +471,20 @@ export async function POST(req: NextRequest) {
 
   const scheduled = results.filter((r) => r.scheduled).length;
   const skipped = results.length - scheduled;
-  const filter = isFiltered ? { listingIds: filterIds } : "all";
+  const filter = filterAirbnbRoomId
+    ? { airbnbRoomId: filterAirbnbRoomId }
+    : isFiltered
+      ? { listingIds: filterIds }
+      : "all";
 
   console.log(
-    `[nightly/schedule] done: filter=${isFiltered ? `partial(${filterIds!.join(",")})` : "all"} ` +
+    `[nightly/schedule] done: filter=${
+      filterAirbnbRoomId
+        ? `airbnbRoomId(${filterAirbnbRoomId})`
+        : filterIds
+          ? `partial(${filterIds.join(",")})`
+          : "all"
+    } ` +
       `force=${forceDedup} ` +
       `${scheduled} scheduled, ${skipped} skipped of ${results.length} total`
   );

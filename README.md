@@ -14,6 +14,40 @@ Open [http://localhost:3000](http://localhost:3000).
 
 The demo report (`/r/demo`) uses a deterministic pricing engine. Real reports require a running Python worker with Chrome CDP.
 
+## One-command Local Nightly + ML Flow
+
+For local end-to-end testing, use the stack launcher from the repo root:
+
+```powershell
+.\run_local_stack.cmd -ForceNightly
+```
+
+This starts:
+
+- Chrome CDP on port `9222`
+- Next.js dev server
+- nightly Python worker (`WORKER_ENV=local`, `WORKER_LANE=nightly`)
+- ML sidecar worker
+- a data-quality monitor window
+- one forced nightly job for the default Airbnb room `1305899249107196055`
+
+The default nightly target can be changed without editing code:
+
+```powershell
+.\run_local_stack.cmd -AirbnbRoomId <airbnb_room_id> -ForceNightly
+.\run_local_stack.cmd -ListingId <saved_listing_uuid> -ForceNightly
+```
+
+Optional switches:
+
+```powershell
+.\run_local_stack.cmd -ForceNightly -SkipDataQuality
+.\run_local_stack.cmd -ForceNightly -SkipChrome
+.\run_local_stack.cmd -SkipSchedule
+```
+
+PowerShell requires the `.\` prefix for local `.cmd` files. Use `.\run_local_stack.cmd`, not `run_local_stack.cmd`.
+
 ## Setup Supabase
 
 1. Copy `.env.example` to `.env.local` and fill in your Supabase credentials
@@ -46,6 +80,104 @@ The worker scrapes Airbnb via Playwright CDP for real pricing data.
 4. Run: `python -m worker.main`
 
 See `worker/README.md` for 24/7 operation via NSSM.
+
+## Setup ML Sidecar Worker
+
+ML forecasts are queued inside the existing `pricing_reports.result_summary`
+payload and processed by a separate Python process, so the deployed frontend
+does not need Python or local access to the ML machine.
+
+No database migration is required for the local ML queue mode.
+
+1. Install ML dependencies: `pip install -r ml_sidecar/requirements.txt`
+2. Configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `.env`, `.env.local`, or `ml_sidecar/.env`
+3. Run the sidecar worker on the backend/ML machine:
+
+```powershell
+python -m ml_sidecar.worker
+# or
+run_ml_sidecar_worker.cmd
+```
+
+The dashboard's ML button marks the latest ready report as
+`result_summary.mlForecast.status = "queued"`. The sidecar worker claims that
+payload, runs `ml_sidecar.batch_pipeline`, and writes the result back to
+`pricing_reports.result_summary.mlForecast`.
+
+## Nightly Data Quality Checks
+
+The local stack launcher automatically starts a data-quality monitor after it schedules a nightly report. The monitor waits for that specific report to become `ready`, then runs:
+
+```powershell
+python -m ml_sidecar.data_quality --report-id <pricing_report_id> --wait-ready
+```
+
+Outputs:
+
+```text
+ml_sidecar/reports/data_quality_latest.json
+ml_sidecar/reports/data_quality_issues_latest.csv
+```
+
+Open the issue CSV when a run looks suspicious:
+
+```powershell
+notepad .\ml_sidecar\reports\data_quality_issues_latest.csv
+```
+
+The checker validates:
+
+- `pricing_reports.result_calendar` was ingested into `market_price_observations`
+- stay dates match between the report and observations
+- calendar prices match observation prices
+- required ML target and raw fields are present
+- the training dataframe has required ML columns
+- the feature matrix has no missing numeric features, NaN, or non-finite values
+
+If the JSON status is `pass`, the latest nightly data is considered safe enough for retraining. If it is `fail`, inspect the CSV before trusting the model output.
+
+## Nightly Automatic ML Retraining
+
+Nightly runs now automatically queue an ML forecast after the report is completed and market observations are ingested. This does not require a new database table.
+
+The nightly worker writes this into the existing report JSON:
+
+```json
+{
+  "mlForecast": {
+    "status": "queued",
+    "trainingScope": "global",
+    "forceRetrain": true,
+    "queuedBy": "nightly_worker"
+  }
+}
+```
+
+The ML sidecar worker polls existing ready reports for `result_summary.mlForecast.status = "queued"`, retrains with the latest `market_price_observations`, writes artifacts under `ml_sidecar/reports/`, then updates `mlForecast.status` to `ready` or `error`.
+
+Controls:
+
+```env
+NIGHTLY_QUEUE_ML_FORECAST=1
+NIGHTLY_ML_FORCE_RETRAIN=1
+NIGHTLY_ML_TRAINING_SCOPE=global
+ML_SIDECAR_FORCE_RETRAIN=1
+```
+
+For split-machine deployment, run these separately:
+
+```powershell
+# Frontend machine
+npm run start
+
+# Scrape worker machine
+python -m worker.main
+
+# ML machine
+python -m ml_sidecar.worker
+```
+
+The machines communicate only through Supabase. The frontend never directly starts Python in production.
 
 ## Vercel Deployment
 

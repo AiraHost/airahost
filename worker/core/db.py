@@ -136,6 +136,9 @@ def complete_job(
     discount_policy: Optional[Dict[str, Any]] = None,
     cache_key: Optional[str] = None,
     source_market_captured_at: Optional[str] = None,
+    queue_ml_forecast: bool = False,
+    ml_training_scope: str = "global",
+    ml_force_retrain: bool = True,
 ) -> None:
     """Mark a job as ready with results. Idempotent — overwrites existing results.
 
@@ -198,6 +201,56 @@ def complete_job(
         logger.warning(
             f"[{report_id}] market observation ingestion failed after report completion: {exc}"
         )
+
+    if queue_ml_forecast:
+        try:
+            import uuid
+
+            queued_at = datetime.now(timezone.utc).isoformat()
+            result = (
+                client.table("pricing_reports")
+                .select("result_summary")
+                .eq("id", report_id)
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+            current_summary = rows[0].get("result_summary") if rows else summary
+            if not isinstance(current_summary, dict):
+                current_summary = dict(summary or {})
+
+            existing_ml = current_summary.get("mlForecast")
+            if not isinstance(existing_ml, dict) or existing_ml.get("status") not in ("queued", "running"):
+                job_id = str(uuid.uuid4())
+                current_summary["mlForecast"] = {
+                    "id": job_id,
+                    "jobId": job_id,
+                    "reportId": report_id,
+                    "status": "queued",
+                    "trainingScope": ml_training_scope,
+                    "modelMode": None,
+                    "nSamples": None,
+                    "generatedAt": None,
+                    "createdAt": queued_at,
+                    "completedAt": None,
+                    "errorMessage": None,
+                    "metrics": None,
+                    "explanation": None,
+                    "predictions": [],
+                    "forceRetrain": bool(ml_force_retrain),
+                    "queuedBy": "nightly_worker",
+                }
+                client.table("pricing_reports").update(
+                    {"result_summary": current_summary}
+                ).eq("id", report_id).execute()
+                logger.info(
+                    "[%s] queued ML forecast after nightly observation ingest (scope=%s force_retrain=%s)",
+                    report_id,
+                    ml_training_scope,
+                    ml_force_retrain,
+                )
+        except Exception as exc:
+            logger.warning(f"[{report_id}] ML forecast queueing failed after nightly completion: {exc}")
 
 
 def sync_linked_listing_attributes(

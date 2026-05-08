@@ -46,7 +46,7 @@ export function MlForecastCard({
   onRun,
 }: Props) {
   const [visibleDays, setVisibleDays] = useState<7 | 30>(7);
-  const isBusy = running || run?.status === "running";
+  const isBusy = running || run?.status === "queued" || run?.status === "running";
   const tone =
     run?.status === "error"
       ? "border-rose-200 bg-rose-50/40"
@@ -110,7 +110,7 @@ export function MlForecastCard({
           disabled={isBusy || loading}
           className="shrink-0 rounded-xl bg-sky-700 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-800 disabled:opacity-40"
         >
-          {running ? "Running..." : "Run ML forecast"}
+          {isBusy ? "Queued..." : "Run ML forecast"}
         </button>
       </div>
 
