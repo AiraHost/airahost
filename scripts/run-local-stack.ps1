@@ -64,17 +64,38 @@ $Command
 function Wait-ForFrontend {
   param([int]$Port)
 
-  $url = "http://localhost:$Port/api/health"
+  $healthUrl = "http://localhost:$Port/api/health"
+  $schedulerUrl = "http://localhost:$Port/api/internal/nightly/schedule"
   for ($i = 0; $i -lt 60; $i++) {
     try {
-      Invoke-RestMethod -Method Get -Uri $url -TimeoutSec 2 | Out-Null
-      return
+      Invoke-RestMethod -Method Get -Uri $healthUrl -TimeoutSec 2 | Out-Null
+
+      try {
+        Invoke-WebRequest `
+          -Method Post `
+          -Uri $schedulerUrl `
+          -ContentType "application/json" `
+          -Body "{}" `
+          -TimeoutSec 2 | Out-Null
+      } catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -eq 401 -or $statusCode -eq 500) {
+          return
+        }
+        if ($statusCode -eq 404) {
+          throw "Frontend is responding on port $Port, but $schedulerUrl returned 404. Stop the existing process on that port or rerun with -FrontendPort <free port>."
+        }
+        throw
+      }
     } catch {
+      if ($_.Exception.Message -like "Frontend is responding on port*") {
+        throw
+      }
       Start-Sleep -Seconds 2
     }
   }
 
-  throw "Frontend did not become ready at $url"
+  throw "Frontend did not become ready at $healthUrl with scheduler route $schedulerUrl"
 }
 
 $envFiles = @(
@@ -113,7 +134,7 @@ if (-not $SkipChrome) {
 }
 
 Write-Host "Starting Next.js dev server" -ForegroundColor Cyan
-Start-StackWindow -Title "airahost frontend" -Command "`$env:WORKER_TARGET_ENV='local'; npm run dev"
+Start-StackWindow -Title "airahost frontend" -Command "`$env:WORKER_TARGET_ENV='local'; `$env:PORT='$FrontendPort'; npm run dev -- -p $FrontendPort"
 
 Write-Host "Starting nightly worker" -ForegroundColor Cyan
 Start-StackWindow -Title "airahost nightly worker" -Command "`$env:WORKER_ENV='local'; `$env:WORKER_LANE='nightly'; python -m worker.main"
