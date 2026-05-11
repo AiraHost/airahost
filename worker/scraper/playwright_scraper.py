@@ -179,13 +179,15 @@ class PlaywrightScraper:
             except Exception:
                 pass
 
-    def _run_async(self, coro, *, op_name: str):
+    def _run_async(self, coro, *, op_name: str, timeout_seconds: Optional[float] = None):
         loop = self._ensure_async_loop()
         if threading.get_ident() == self._runtime_owner_tid:
             raise RuntimeError(f"Playwright {op_name} called from runtime loop thread")
         if callable(coro):
             coro = coro()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
+        if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+            return future.result(timeout=float(timeout_seconds))
         return future.result()
 
     async def _open_capped_page(self, context):
@@ -1349,7 +1351,7 @@ class PlaywrightScraper:
             nav = await self._navigate_and_capture_html(
                 page,
                 url=listing_url,
-                wait_until="commit",
+                wait_until="domcontentloaded",
                 timeout=35000,
                 label=f"pdp_{listing_id}",
             )
@@ -1410,6 +1412,31 @@ class PlaywrightScraper:
                         "Playwright PDP API price missing listing=%s; switching to HTML read on same tab",
                         listing_id,
                     )
+                # Wait briefly for booking widget hydration before polling text.
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                            const sels = [
+                                '[data-testid="book-it-default"]',
+                                '[data-testid="book-it-sidebar"]',
+                                '[data-testid="price-block"]',
+                                '[data-testid="book-it-price-breakdown"]',
+                                '[data-section-id="BOOK_IT_SIDEBAR"]',
+                                '[data-section-id="BOOK_IT_DEFAULT"]',
+                            ];
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (!el) continue;
+                                const t = (el.innerText || el.textContent || '').trim();
+                                if (t && /\\$\\s*\\d{2,}/.test(t)) return true;
+                            }
+                            return false;
+                        }""",
+                        timeout=8000,
+                        polling=400,
+                    )
+                except Exception:
+                    pass
                 dom_price_text: Optional[str] = None
                 for attempt in range(1, 6):
                     logger.info(
@@ -1417,11 +1444,11 @@ class PlaywrightScraper:
                         attempt,
                         listing_id,
                     )
-                    dom_price_text = await self._read_dom_price_text(page, timeout_ms=0)
+                    dom_price_text = await self._read_dom_price_text(page, timeout_ms=1500)
                     if dom_price_text:
                         break
                     if attempt < 5:
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(1500)
                 if dom_price_text:
                     if captured_data is None:
                         captured_data = self._build_minimal_pdp_payload(dom_price_text)
@@ -1506,11 +1533,27 @@ class PlaywrightScraper:
         adults: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Browser-only PDP capture (no request replay/session.post)."""
+        def _is_cdp_connect_error(err: Exception) -> bool:
+            msg = str(err or "").lower()
+            return (
+                "connect_over_cdp" in msg
+                or "retrieving websocket url" in msg
+                or "ws://127.0.0.1:9222/devtools/browser" in msg
+            )
+
         effective_checkin = checkin or self.config.get("CHECKIN", "")
         effective_checkout = checkout or self.config.get("CHECKOUT", "")
         effective_adults = int(adults if adults is not None else self.config.get("ADULTS", 1))
+        # PDP is single-shot by design: callers handle fallback after one failure.
+        max_attempts = 1
+        try:
+            pdp_attempt_timeout_seconds = max(
+                5.0, float(self.config.get("PDP_BROWSER_ATTEMPT_TIMEOUT_SECONDS", 45))
+            )
+        except Exception:
+            pdp_attempt_timeout_seconds = 45.0
         last_exc: Optional[Exception] = None
-        for attempt in range(1, 3):
+        for attempt in range(1, max_attempts + 1):
             try:
                 _, response_data = self._run_async(
                     self._get_listing_details_via_browser(
@@ -1520,11 +1563,24 @@ class PlaywrightScraper:
                         adults=effective_adults,
                     ),
                     op_name="get_listing_details",
+                    timeout_seconds=pdp_attempt_timeout_seconds,
                 )
                 return response_data
             except Exception as exc:
                 last_exc = exc
-                logger.warning("Browser PDP attempt %s/2 failed for listing=%s: %s", attempt, listing_id, exc)
-                if attempt < 2:
-                    time.sleep(1.0)
-        raise RuntimeError(f"Playwright browser PDP failed after 2 attempts for listing={listing_id}: {last_exc}")
+                logger.warning(
+                    "Browser PDP attempt %s/%s failed for listing=%s: %s",
+                    attempt,
+                    max_attempts,
+                    listing_id,
+                    exc,
+                )
+                if _is_cdp_connect_error(exc):
+                    logger.warning(
+                        "Browser PDP fast-fail on CDP connect error for listing=%s (skip retry)",
+                        listing_id,
+                    )
+                    break
+        raise RuntimeError(
+            f"Playwright browser PDP failed after {max_attempts} attempts for listing={listing_id}: {last_exc}"
+        )

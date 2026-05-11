@@ -500,7 +500,12 @@ def _extract_target_spec_via_client_payloads(
     return None, payload_warnings
 
 
-def extract_target_spec(client, listing_url: str) -> Tuple[ListingSpec, List[str]]:
+def extract_target_spec(
+    client,
+    listing_url: str,
+    *,
+    fail_on_unusable: bool = False,
+) -> Tuple[ListingSpec, List[str]]:
     """
     Extract listing specs. Preferred path uses AirbnbClient HTTP fetches.
     Legacy page extraction is retained as a fallback when a non-client object is passed.
@@ -511,6 +516,8 @@ def extract_target_spec(client, listing_url: str) -> Tuple[ListingSpec, List[str
         warnings: List[str] = []
         listing_id = extract_listing_id_from_url(listing_url)
         if not listing_id:
+            if fail_on_unusable:
+                raise ValueError(f"Unable to parse listing_id from URL: {listing_url}")
             return (
                 ListingSpec(url=normalize_airbnb_url(listing_url)),
                 [f"Unable to parse listing_id from URL: {listing_url}"],
@@ -592,6 +599,10 @@ def extract_target_spec(client, listing_url: str) -> Tuple[ListingSpec, List[str
             warnings.extend(dom_warnings)
             if isinstance(dom_spec, ListingSpec):
                 return dom_spec, warnings
+            if fail_on_unusable:
+                raise ValueError(
+                    f"PDP individual listing extraction failed (payload + rendered DOM): {listing_url}"
+                )
             return (
                 ListingSpec(url=normalize_airbnb_url(listing_url)),
                 warnings,
@@ -1350,6 +1361,41 @@ def extract_nightly_price_from_listing_page(
         # Client-backed path: fetch PDP payload for this exact date window and
         # parse nightly price directly. This avoids mixing async Playwright
         # page objects with sync extraction logic.
+        def _extract_from_rendered_html_via_client() -> Tuple[Optional[float], str]:
+            if not hasattr(page, "browse_url_html"):
+                return None, "failed"
+            try:
+                parsed_rb = urlparse(listing_url)
+                url_with_dates_rb = (
+                    f"{parsed_rb.scheme}://{parsed_rb.netloc}{parsed_rb.path}"
+                    f"?check_in={checkin}&check_out={checkout}&guests=1&adults=1"
+                )
+                nav = page.browse_url_html(
+                    url_with_dates_rb,
+                    label="pdp_rendered_html_fallback",
+                    wait_until="domcontentloaded",
+                    timeout=35000,
+                )
+                html = str((nav or {}).get("html") or "")
+                if not html:
+                    return None, "failed"
+
+                # Try price-near-night patterns first.
+                matches = _extract_text_price_matches(html[:50000])
+                if matches:
+                    matches.sort(key=lambda x: x[0])
+                    return matches[-1][1], "low"
+
+                # Fallback: strip tags and retry.
+                plain = re.sub(r"<[^>]+>", " ", html[:50000])
+                matches2 = _extract_text_price_matches(plain)
+                if matches2:
+                    matches2.sort(key=lambda x: x[0])
+                    return matches2[-1][1], "low"
+                return None, "failed"
+            except Exception:
+                return None, "failed"
+
         try:
             listing_id = extract_listing_id_from_url(listing_url)
             if not listing_id:
@@ -1372,9 +1418,26 @@ def extract_nightly_price_from_listing_page(
                     nightly = round(float(total) / max(1, stay_nights), 2)
             if isinstance(nightly, (int, float)) and nightly > 0:
                 return float(nightly), "high"
-            return None, "failed"
-        except Exception:
-            return None, "failed"
+            # PDP returned but had no usable price: switch immediately to rendered HTML fallback.
+            return _extract_from_rendered_html_via_client()
+        except Exception as exc:
+            _msg = str(exc or "").lower()
+            _cdp_connect_failed = (
+                "connect_over_cdp" in _msg
+                or "retrieving websocket url" in _msg
+                or "devtools/browser" in _msg
+            )
+            if _cdp_connect_failed:
+                logger.warning(
+                    "[price_extract] PDP client CDP connect failed; using rendered HTML fallback "
+                    "listing=%s checkin=%s checkout=%s",
+                    listing_url,
+                    checkin,
+                    checkout,
+                )
+                return _extract_from_rendered_html_via_client()
+            # Non-CDP PDP errors: switch immediately to rendered HTML fallback.
+            return _extract_from_rendered_html_via_client()
 
     parsed = urlparse(listing_url)
     # Reconstruct with only check_in / check_out — drop any pre-existing params.
@@ -1776,6 +1839,12 @@ def capture_target_live_price(
                     checkout=_checkout,
                     adults=_adults,
                 )
+                try:
+                    _raw_preview = json.dumps(_pdp_data, ensure_ascii=False, default=str)
+                except Exception:
+                    _raw_preview = str(_pdp_data)
+                if len(_raw_preview) > 5000:
+                    _raw_preview = _raw_preview[:5000] + "...<truncated>"
                 _has_errors = bool((_pdp_data or {}).get("errors"))
                 _sections = (
                     (((_pdp_data or {}).get("data") or {}).get("presentation") or {})
@@ -1799,6 +1868,15 @@ def capture_target_live_price(
                     _backend_label,
                     _has_errors,
                     _section_ids,
+                )
+                logger.info(
+                    "[target_live_price_pdp_payload] listing=%s checkin=%s checkout=%s adults=%s backend=%s payload=%s",
+                    listing_id,
+                    _checkin,
+                    _checkout,
+                    _adults,
+                    _backend_label,
+                    _raw_preview,
                 )
                 _parsed = parse_pdp_response(_pdp_data, str(listing_id), safe_domain_base(listing_url))
                 return _parsed.get("nightly_price"), _parsed.get("total_price"), _section_ids, _has_errors
@@ -1886,6 +1964,45 @@ def capture_target_live_price(
                 f"[target_live_price] No price extracted for listing_id={listing_id}. "
                 f"attempts={debug_attempts}"
             )
+            try:
+                from urllib.parse import urlencode
+                _render_url = (
+                    f"{safe_domain_base(listing_url)}/rooms/{listing_id}?"
+                    + urlencode(
+                        {
+                            "check_in": checkin,
+                            "check_out": checkout,
+                            "adults": 1,
+                            "guests": 1,
+                        }
+                    )
+                )
+                if hasattr(client, "browse_url_html"):
+                    _render = client.browse_url_html(
+                        _render_url,
+                        label="target_live_price_rendered_html",
+                        wait_until="commit",
+                        timeout=35000,
+                    )
+                    _html = str((_render or {}).get("html") or "")
+                    _preview = _html.replace("\n", " ").replace("\r", " ")
+                    if len(_preview) > 5000:
+                        _preview = _preview[:5000] + "...<truncated>"
+                    logger.warning(
+                        "[target_live_price_rendered_html] listing=%s url=%s final_url=%s status=%s html_len=%s html_preview=%s",
+                        listing_id,
+                        _render_url,
+                        str((_render or {}).get("final_url") or ""),
+                        str((_render or {}).get("status")),
+                        len(_html),
+                        _preview,
+                    )
+            except Exception as _render_exc:
+                logger.warning(
+                    "[target_live_price_rendered_html] listing=%s snapshot failed: %s",
+                    listing_id,
+                    _render_exc,
+                )
     except Exception as exc:
         logger.warning(f"[target_live_price] HTTP extraction failed: {exc}")
         return {

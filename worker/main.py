@@ -617,6 +617,10 @@ def _capture_user_listing_prices_for_range(
         checkin_dt = start + _td(days=i)
         checkin = checkin_dt.strftime("%Y-%m-%d")
         checkout = (checkin_dt + _td(days=nights)).strftime("%Y-%m-%d")
+        logger.info(
+            f"[{report_id}] [self_price_capture] day_start "
+            f"index={i} checkin={checkin} checkout={checkout} nights={nights}"
+        )
         time.sleep(RATE_LIMIT_SECONDS)
         # Strict isolation: never reuse Playwright client/scraper objects across
         # user-listing day captures.
@@ -638,6 +642,14 @@ def _capture_user_listing_prices_for_range(
                 client=playwright_live_client,
                 allow_retry_matrix=False,
             )
+            logger.info(
+                f"[{report_id}] [self_price_capture] day_result_raw "
+                f"date={checkin} status={live.get('livePriceStatus')} "
+                f"reason={str(live.get('livePriceStatusReason') or '')[:200]} "
+                f"observed={live.get('observedListingPrice')} "
+                f"source={live.get('observedListingPriceSource')} "
+                f"confidence={live.get('observedListingPriceConfidence')}"
+            )
         except Exception as exc:
             logger.warning(
                 f"[{report_id}] User-listing daily capture failed for {checkin}: {exc}"
@@ -655,6 +667,10 @@ def _capture_user_listing_prices_for_range(
 
         obs = live.get("observedListingPrice")
         price = round(float(obs)) if isinstance(obs, (int, float)) and obs > 0 else None
+        logger.info(
+            f"[{report_id}] [self_price_capture] day_result_normalized "
+            f"date={checkin} normalized_price={price} status={live.get('livePriceStatus')}"
+        )
         return {
             "date": checkin,
             "price": price,
@@ -1952,6 +1968,10 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         # Uses the listing's minimum stay setting so Airbnb shows a price.
         # Non-fatal: failure is logged and recorded in summary but does not
         # block the job from completing.
+        logger.info(
+            f"[{report_id}] [self_price_capture] gate "
+            f"listing_url_present={bool(listing_url)} is_nightly={is_nightly}"
+        )
         if listing_url:
             _progress(85, "capturing_live_price", "Capturing your current listing prices from Airbnb...")
             live_price_info = _capture_user_listing_prices_for_range(

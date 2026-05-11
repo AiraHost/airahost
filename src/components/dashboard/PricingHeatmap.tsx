@@ -259,6 +259,7 @@ export function PricingHeatmap({
             const absDiffPct = Math.abs(diffPct);
             if (absDiffPct > 8) compareToneCls = "border-rose-200 bg-rose-50/60";
             else if (absDiffPct > 3) compareToneCls = "border-amber-200 bg-amber-50/60";
+            else compareToneCls = "border-emerald-200 bg-emerald-50/60";
           }
 
           const tileCls = applyMode && isSelected && !isPast

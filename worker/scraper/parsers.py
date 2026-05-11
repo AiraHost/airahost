@@ -446,6 +446,22 @@ def _extract_structural_context_from_search_result(r: Dict[str, Any]) -> Dict[st
                 except Exception:
                     pass
 
+        if not out["location"]:
+            # Common card text shapes:
+            # - "Home in Oceano"
+            # - "Guest suite in Belmont, CA"
+            # - "Cabin at Lake Tahoe, California"
+            m = re.search(
+                r"\b(?:in|at)\s+([A-Za-z][A-Za-z .'\-]*(?:,\s*[A-Za-z][A-Za-z .'\-]*){0,2})\s*$",
+                text,
+                re.I,
+            )
+            if m:
+                cand = m.group(1).strip(" .,-")
+                # Guard against obvious non-location tails.
+                if cand and not re.search(r"\b(night|guests?|beds?|baths?|reviews?)\b", cand, re.I):
+                    out["location"] = cand
+
     return out
 
 
@@ -833,7 +849,10 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
 
         # Final fallback from search-level context (same request/filter state).
         # Applied only for missing values in skinny listing cards.
-        for key in ("location", "accommodates", "bedrooms", "beds", "baths", "property_type"):
+        # Do not backfill per-comp location from search-level global context.
+        # That context reflects the query area and can overwrite a comp's own
+        # house location with the target listing area.
+        for key in ("accommodates", "bedrooms", "beds", "baths", "property_type"):
             if row.get(key) in (None, "", 0):
                 v = global_ctx.get(key)
                 if v not in (None, "", 0):
@@ -844,6 +863,30 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
             listing_id,
             list(row.get("amenities") or []),
         )
+        if not str(row.get("location") or "").strip():
+            _title = str(row.get("title") or "").strip()
+            _raw_title = str(r.get("title") or "").strip()
+            _raw_subtitle = str(r.get("subtitle") or "").strip()
+            _samples: List[str] = []
+            for _txt in _walk_strings(r):
+                _s = str(_txt or "").strip()
+                if not _s:
+                    continue
+                if len(_s) > 100:
+                    _s = _s[:100] + "...<truncated>"
+                if _s in _samples:
+                    continue
+                _samples.append(_s)
+                if len(_samples) >= 20:
+                    break
+            logger.info(
+                "[search_location_missing_raw] listing_id=%s title=%s raw_title=%s raw_subtitle=%s text_samples=%s",
+                listing_id,
+                _title,
+                _raw_title,
+                _raw_subtitle,
+                _samples,
+            )
 
     return context
 

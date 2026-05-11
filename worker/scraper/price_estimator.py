@@ -420,15 +420,21 @@ def _build_daily_transparent_result(
             if excluded_room_ids and comp_id in excluded_room_ids:
                 continue
             pool_comp = (fixed_comp_pool or {}).get(comp_id) or {}
+            # Do not create anonymous comparables from fallback pool hydration.
+            # These appear in UI as 0% rows with missing title/url.
+            _pool_url = str(pool_comp.get("url") or "").strip()
+            _pool_title = str(pool_comp.get("title") or "").strip()
+            if not _pool_url and not _pool_title:
+                continue
             if comp_id not in comparable_index:
                 comparable_index[comp_id] = {
                     "item": {
                         "id": comp_id,
-                        "title": pool_comp.get("title"),
+                        "title": _pool_title or None,
                         "propertyType": pool_comp.get("propertyType") or pool_comp.get("property_type"),
                         "nightlyPrice": price,
                         "similarity": pool_comp.get("similarity") or 0.0,
-                        "url": pool_comp.get("url"),
+                        "url": _pool_url or None,
                     },
                     "score_sum": float(pool_comp.get("similarity") or 0.0),
                     "count": 1 if pool_comp.get("similarity") is not None else 0,
@@ -1238,7 +1244,7 @@ def run_scrape(
             # Step 1: Extract target listing spec (with one retry on degraded pages)
             logger.info(f"Extracting target: {listing_url}")
             extract_start = time.time()
-            target, warnings = extract_target_spec(client, listing_url)
+            target, warnings = extract_target_spec(client, listing_url, fail_on_unusable=True)
             extraction_warnings.extend(warnings)
             timings["extract_ms"] = round((time.time() - extract_start) * 1000)
 
@@ -1262,7 +1268,9 @@ def run_scrape(
                 time.sleep(2)
                 _spec_retry_attempted = True
                 _retry_start = time.time()
-                target_retry, retry_warnings = extract_target_spec(client, listing_url)
+                target_retry, retry_warnings = extract_target_spec(
+                    client, listing_url, fail_on_unusable=True
+                )
                 timings["extract_retry_ms"] = round((time.time() - _retry_start) * 1000)
                 extraction_warnings.extend(retry_warnings)
                 if not _is_spec_degraded(target_retry):
@@ -1864,7 +1872,7 @@ def run_benchmark_scrape(
             else:
                 spec_url = target_url or benchmark_url
                 logger.info(f"[benchmark] Extracting spec from: {spec_url}")
-                target, warnings = extract_target_spec(client, spec_url)
+                target, warnings = extract_target_spec(client, spec_url, fail_on_unusable=True)
                 extraction_warnings.extend(warnings)
 
                 # Degraded-page detection + one retry (mirrors run_scrape).
@@ -1880,7 +1888,9 @@ def run_benchmark_scrape(
                     )
                     time.sleep(2)
                     _bm_retry_attempted = True
-                    target_bm_retry, bm_retry_warnings = extract_target_spec(client, benchmark_url)
+                    target_bm_retry, bm_retry_warnings = extract_target_spec(
+                        client, benchmark_url, fail_on_unusable=True
+                    )
                     extraction_warnings.extend(bm_retry_warnings)
                     if not _is_spec_degraded(target_bm_retry):
                         target = target_bm_retry
