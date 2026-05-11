@@ -297,6 +297,8 @@
     <a href="#s34">34. 觀察資料與 ML 的關係</a>
     <a href="#s35">35. 現有限制與未來勾點</a>
     <a href="#s36">36. ML Runtime 與前端整合</a>
+    <a href="#s37">37. 本機一鍵 Nightly + ML 流程</a>
+    <a href="#s38">38. Nightly 資料品質與自動重訓</a>
   </nav>
 </aside>
 
@@ -2708,6 +2710,149 @@ CREATE INDEX idx_reports_lane_env_status_created
 </div>
 
 <div class="sources">來源：ml/data.py、ml/batch_pipeline.py、ml/full_pipeline.py、worker/main.py、src/app/api/reports/route.ts、src/app/api/listings/[id]/rerun/route.ts、src/app/api/internal/nightly/schedule/route.ts、src/app/api/reports/[id]/route.ts、src/app/api/r/[shareId]/route.ts、src/lib/mlInsights.ts、src/components/MlPricingStatus.tsx、src/components/report/MlInsightsCard.tsx、src/components/dashboard/RecommendationBanner.tsx</div>
+</section>
+
+<section id="s37">
+<h2>37. 本機一鍵 Nightly + ML 流程</h2>
+
+<p>本機端到端測試使用 <code>run_local_stack.cmd</code> 作為唯一入口。它不是正式部署程序，而是工程測試用的 orchestration wrapper：同時啟動前端、Chrome CDP、nightly worker、ML sidecar worker，並可直接排入一筆 nightly job。</p>
+
+<pre><code># repo root
+.\run_local_stack.cmd -ForceNightly
+
+# 指定其他 Airbnb room id
+.\run_local_stack.cmd -AirbnbRoomId 1234567890 -ForceNightly
+
+# 指定 saved_listings.id
+.\run_local_stack.cmd -ListingId &lt;saved_listing_uuid&gt; -ForceNightly</code></pre>
+
+<h3>啟動內容</h3>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>視窗 / 程序</th><th>命令或行為</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Chrome CDP</td><td><code>chrome.exe --remote-debugging-port=9222</code></td><td>提供已登入 Airbnb session 給 Playwright CDP scraper 使用。</td></tr>
+      <tr><td>Frontend</td><td><code>npm run dev</code></td><td>啟動 Next.js，本機 API route 會寫入 Supabase queue。</td></tr>
+      <tr><td>Nightly worker</td><td><code>WORKER_ENV=local</code>、<code>WORKER_LANE=nightly</code>、<code>python -m worker.main</code></td><td>只認領 local/nightly 的 <code>pricing_reports</code> 任務。</td></tr>
+      <tr><td>ML sidecar worker</td><td><code>python -m ml_sidecar.worker</code></td><td>輪詢既有 <code>pricing_reports.result_summary.mlForecast.status="queued"</code> payload，執行 retrain / forecast。</td></tr>
+      <tr><td>Data quality monitor</td><td><code>python -m ml_sidecar.data_quality --wait-ready</code></td><td>等待本次 nightly report ready 後檢查 observation ingest 與 ML feature matrix。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>預設測試目標</h3>
+<p>若未提供 <code>-ListingId</code> 或 <code>-AirbnbRoomId</code>，腳本預設排入 Airbnb room <code>1305899249107196055</code>。這是為了讓本機測試有穩定的預設入口，而不是每次都手動查 saved listing UUID。</p>
+
+<h3>可選參數</h3>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>參數</th><th>效果</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>-ForceNightly</code></td><td>在 <code>WORKER_TARGET_ENV=local</code> 時跳過 23 小時 dedup。僅能搭配 listing filter 或 Airbnb room id 使用。</td></tr>
+      <tr><td><code>-SkipDataQuality</code></td><td>不啟動資料品質監控視窗。</td></tr>
+      <tr><td><code>-SkipChrome</code></td><td>不自動開 Chrome CDP，適合已經手動開好瀏覽器 session 時使用。</td></tr>
+      <tr><td><code>-SkipSchedule</code></td><td>只開服務，不排 nightly job。</td></tr>
+      <tr><td><code>-FrontendPort</code></td><td>改變等待與呼叫本機 API 的 port，預設 <code>3000</code>。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout callout-current">
+  <strong>Current Behavior — PowerShell 本機命令</strong>
+  在 Windows PowerShell 中，repo root 的 <code>.cmd</code> 檔需要用 <code>.\run_local_stack.cmd</code> 執行。直接輸入 <code>run_local_stack.cmd</code> 會被 PowerShell command precedence 擋下。
+</div>
+
+<div class="sources">來源：scripts/run-local-stack.ps1、run_local_stack.cmd、src/app/api/internal/nightly/schedule/route.ts、worker/main.py、ml_sidecar/worker.py、ml_sidecar/data_quality.py</div>
+</section>
+
+<section id="s38">
+<h2>38. Nightly 資料品質與自動重訓</h2>
+
+<p>Nightly 完成後現在有兩個後處理路徑：資料品質檢查與 ML 自動重訓。兩者都不需要新增資料庫 table；資料品質寫成本機 artifact，ML queue 則寫在既有 <code>pricing_reports.result_summary.mlForecast</code> JSON payload 中。</p>
+
+<h3>Nightly 完成後的順序</h3>
+<pre><code>1. worker/main.py 完成 Airbnb scrape
+2. worker/core/db.py::complete_job() 將 pricing_reports.status 設為 ready
+3. complete_job() 呼叫 ingest_market_price_observations(report_id)
+4. complete_job() 寫入 result_summary.mlForecast.status = "queued"
+5. ml_sidecar.data_quality 等 report ready 後檢查 observation / feature matrix
+6. ml_sidecar.worker 掃到 queued ML payload，執行 batch_pipeline retrain / forecast
+7. ml_sidecar.worker 回寫 mlForecast.status = "ready" 或 "error"</code></pre>
+
+<h3>資料品質檢查產物</h3>
+<p>本機一鍵流程會將檢查結果固定輸出到 <code>ml_sidecar/reports/</code>：</p>
+
+<pre><code>ml_sidecar/reports/data_quality_latest.json
+ml_sidecar/reports/data_quality_issues_latest.csv</code></pre>
+
+<p><code>data_quality_latest.json</code> 是機器可讀的完整 manifest；<code>data_quality_issues_latest.csv</code> 是給工程師快速檢視的問題列表。若 CSV 只有 header，代表本次沒有產生 issue row。</p>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>檢查項目</th><th>失敗時代表的問題</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Report calendar vs observations</td><td><code>pricing_reports.result_calendar</code> 的日期沒有完整進入 <code>market_price_observations</code>。</td></tr>
+      <tr><td>Price parity</td><td>calendar 的 <code>baseDailyPrice</code> / effective price 與 observation table 的對應欄位不一致。</td></tr>
+      <tr><td>Raw required fields</td><td><code>saved_listing_id</code>、<code>observed_at</code>、<code>stay_date</code>、<code>days_until_stay</code> 等欄位缺失。</td></tr>
+      <tr><td>Training target</td><td>無法從 <code>effective_daily_price_refundable</code>、<code>effective_daily_price_non_refundable</code>、<code>base_daily_price</code> 或 <code>base_price</code> 找到正數 target。</td></tr>
+      <tr><td>Training dataframe</td><td>ML 訓練必要欄位如 <code>bedrooms</code>、<code>baths</code>、<code>accommodates</code>、<code>lat</code>、<code>lng</code>、<code>observed_market_price</code> 缺失或缺失率過高。</td></tr>
+      <tr><td>Feature matrix</td><td>模型 numeric feature 缺欄、存在 NaN 或 non-finite values。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>ML queue payload</h3>
+<p>不新增 queue table 的前提下，nightly worker 會在同一筆 ready report 上寫入：</p>
+
+<pre><code>{
+  "mlForecast": {
+    "id": "uuid",
+    "jobId": "uuid",
+    "reportId": "pricing_report_id",
+    "status": "queued",
+    "trainingScope": "global",
+    "forceRetrain": true,
+    "queuedBy": "nightly_worker",
+    "metrics": null,
+    "predictions": []
+  }
+}</code></pre>
+
+<p><code>ml_sidecar.worker</code> 以 service role 輪詢 <code>pricing_reports</code>，尋找 <code>status=ready</code> 且 <code>result_summary</code> 包含 <code>mlForecast.status="queued"</code> 的列。認領時會先改為 <code>running</code>，完成後回寫 <code>ready</code> 與 predictions。前端 listing detail page 看到 <code>queued</code> 或 <code>running</code> 時會每 5 秒重新讀取 <code>/api/listings/[id]/ml</code>，因此 worker 回寫後 UI 會自動更新。</p>
+
+<h3>環境變數</h3>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>變數</th><th>預設</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>NIGHTLY_QUEUE_ML_FORECAST</code></td><td><code>1</code></td><td>nightly 完成後是否自動寫入 ML queue payload。</td></tr>
+      <tr><td><code>NIGHTLY_ML_FORCE_RETRAIN</code></td><td><code>1</code></td><td>nightly 觸發的 ML 是否強制 retrain，以納入最新 observations。</td></tr>
+      <tr><td><code>NIGHTLY_ML_TRAINING_SCOPE</code></td><td><code>global</code></td><td>nightly 自動 ML 的訓練 scope，可設為 <code>global</code> 或 <code>listing_local</code>。</td></tr>
+      <tr><td><code>ML_SIDECAR_FORCE_RETRAIN</code></td><td>空字串</td><td>手動或 sidecar worker 層級強制 retrain。payload 的 <code>forceRetrain=true</code> 也會觸發 retrain。</td></tr>
+      <tr><td><code>ML_SIDECAR_POLL_SECONDS</code></td><td><code>5</code></td><td>ML sidecar worker 掃描 queued payload 的間隔。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout callout-risk">
+  <strong>Risk — 不新增資料表時的 queue tradeoff</strong>
+  目前 ML queue 使用 <code>pricing_reports.result_summary.mlForecast</code>，可滿足單一 ML sidecar worker 的分機部署。若未來同時跑多台 ML worker，可能出現兩台同時認領同一筆 JSON payload 的 race condition。正式水平擴展時，建議改為獨立 queue table 或 RPC claim function。
+</div>
+
+<div class="callout callout-current">
+  <strong>Current Behavior — 前後端分機可行</strong>
+  Frontend / Next.js 只寫 Supabase；scrape worker 與 ML sidecar worker 只輪詢 Supabase。三者不需要在同一台電腦，也不需要前端直接啟動 Python。部署時只需確保三邊使用同一組 Supabase URL 與 service-role 設定。
+</div>
+
+<div class="sources">來源：worker/core/db.py、worker/main.py、ml_sidecar/worker.py、ml_sidecar/data_quality.py、src/app/api/listings/[id]/ml/route.ts、src/app/dashboard/listings/[listingId]/page.tsx</div>
 </section>
 </main>
 </div>

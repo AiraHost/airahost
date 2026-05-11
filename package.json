@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:local-stack": "run_local_stack.cmd",
     "dev:webpack": "next dev --webpack",
     "build": "next build",
     "start": "next start",
@@ -14,6 +15,8 @@
     "test:e2e:public": "playwright test --project=chromium-public",
     "test:e2e:install": "playwright install chromium",
     "ml:sidecar": "python -m ml_sidecar.batch_pipeline",
+    "ml:worker": "run_ml_sidecar_worker.cmd",
+    "ml:data-quality": "run_ml_data_quality.cmd",
     "ml:batch": "run_ml_batch.cmd",
     "ml:backtest": "run_ml_backtest.cmd",
     "ml:backtest:time": "run_ml_backtest_time.cmd",

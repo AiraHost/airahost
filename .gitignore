@@ -35,6 +35,8 @@ yarn-error.log*
 
 # worker logs
 worker/logs/
+ml_sidecar/logs/
+.local-stack/
 __pycache__/
 *.pyc
 

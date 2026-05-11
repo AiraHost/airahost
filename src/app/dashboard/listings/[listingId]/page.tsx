@@ -116,6 +116,26 @@ export default function ListingHistoryPage() {
   const [pinnedCompSaving, setPinnedCompSaving] = useState(false);
   const [pinnedCompMsg, setPinnedCompMsg] = useState("");
 
+  const loadMlRun = useCallback(async () => {
+    const mlRes = await fetch(`/api/listings/${listingId}/ml`, {
+      cache: "no-store",
+    });
+    const mlData = await mlRes.json().catch(() => ({}));
+    if (!mlRes.ok) {
+      setMlError(
+        (mlData as { details?: string; error?: string }).details ??
+          (mlData as { error?: string }).error ??
+          "ML forecast is unavailable."
+      );
+      return null;
+    }
+
+    const run = (mlData as { run?: MlForecastRun | null }).run ?? null;
+    setMlRun(run);
+    setMlError(null);
+    return run;
+  }, [listingId]);
+
   const loadData = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -180,6 +200,18 @@ export default function ListingHistoryPage() {
     void loadData();
   }, [loadData]);
 
+  useEffect(() => {
+    if (mlRun?.status !== "queued" && mlRun?.status !== "running") {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      void loadMlRun();
+    }, 5000);
+
+    return () => window.clearInterval(interval);
+  }, [loadMlRun, mlRun?.status]);
+
   // Normalize report relation (can be array or object from Supabase join)
   function getReport(row: HistoryRow): ReportSnapshot | null {
     const r = row.pricing_reports;
@@ -216,6 +248,7 @@ export default function ListingHistoryPage() {
       }
 
       setMlRun((data as { run?: MlForecastRun | null }).run ?? null);
+      void loadMlRun();
     } catch (runError) {
       setMlError(
         runError instanceof Error

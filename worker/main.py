@@ -83,6 +83,14 @@ AUTO_APPLY_STALE_MINUTES = int(os.getenv("AUTO_APPLY_STALE_MINUTES", "15"))
 AUTO_APPLY_MAX_ATTEMPTS = int(os.getenv("AUTO_APPLY_MAX_ATTEMPTS", "3"))
 AUTO_APPLY_CDP_URL = os.getenv("AUTO_APPLY_CDP_URL", CDP_URL)
 
+NIGHTLY_QUEUE_ML_FORECAST = str(
+    os.getenv("NIGHTLY_QUEUE_ML_FORECAST", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+NIGHTLY_ML_TRAINING_SCOPE = os.getenv("NIGHTLY_ML_TRAINING_SCOPE", "global")
+NIGHTLY_ML_FORCE_RETRAIN = str(
+    os.getenv("NIGHTLY_ML_FORCE_RETRAIN", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ---------------------------------------------------------------------------
 # Logging — console + rotating file (logs/worker.log)
 # ---------------------------------------------------------------------------
@@ -1277,6 +1285,9 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 discount_policy=discount_policy if is_nightly else None,
                 # Sync the recomputed execution cache key to the report row.
                 cache_key=cache_key if is_nightly else None,
+                queue_ml_forecast=is_nightly and bool(job.get("listing_id")) and NIGHTLY_QUEUE_ML_FORECAST,
+                ml_training_scope=NIGHTLY_ML_TRAINING_SCOPE,
+                ml_force_retrain=NIGHTLY_ML_FORCE_RETRAIN,
             )
 
             # ── Alert evaluation — nightly only (cache-hit path) ─────────────
@@ -2060,6 +2071,9 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
             discount_policy=discount_policy if is_nightly else None,
             # Sync the recomputed execution cache key to the report row.
             cache_key=cache_key if is_nightly else None,
+            queue_ml_forecast=is_nightly and bool(job.get("listing_id")) and NIGHTLY_QUEUE_ML_FORECAST,
+            ml_training_scope=NIGHTLY_ML_TRAINING_SCOPE,
+            ml_force_retrain=NIGHTLY_ML_FORCE_RETRAIN,
         )
 
         # ── Alert evaluation — nightly only (fresh-scrape path) ──────────────

@@ -1,7 +1,3 @@
-import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -118,7 +114,7 @@ export interface MlForecastManifest {
 
 export interface MlForecastRun {
   id: string;
-  status: "running" | "ready" | "error";
+  status: "queued" | "running" | "ready" | "error";
   trainingScope: string | null;
   modelMode: string | null;
   nSamples: number | null;
@@ -269,7 +265,10 @@ export function parseMlForecastManifest(raw: unknown): MlForecastManifest {
 export function normalizeMlForecastRunRow(row: Record<string, unknown>): MlForecastRun {
   const statusValue = readString(row, "status");
   const status =
-    statusValue === "running" || statusValue === "ready" || statusValue === "error"
+    statusValue === "queued" ||
+    statusValue === "running" ||
+    statusValue === "ready" ||
+    statusValue === "error"
       ? statusValue
       : "error";
 
@@ -293,110 +292,3 @@ export function normalizeMlForecastRunRow(row: Record<string, unknown>): MlForec
   };
 }
 
-export async function executeMlSidecarForecast(params: {
-  savedListingId: string;
-  trainingScope: "global" | "listing_local";
-  runId: string;
-}): Promise<MlForecastManifest> {
-  const { savedListingId, trainingScope, runId } = params;
-  const configuredPythonBin = process.env.ML_SIDECAR_PYTHON_BIN?.trim();
-  const pythonCandidates = configuredPythonBin
-    ? [configuredPythonBin]
-    : ["python", "python3"];
-  const manifestPath = path.join(
-    process.cwd(),
-    "ml_sidecar",
-    "reports",
-    `manifest_${runId}.json`
-  );
-  const predictionsPath = path.join(
-    process.cwd(),
-    "ml_sidecar",
-    "reports",
-    `predictions_${runId}.csv`
-  );
-
-  const args = [
-    "-m",
-    "ml_sidecar.batch_pipeline",
-    "--saved-listing-id",
-    savedListingId,
-    "--training-scope",
-    trainingScope,
-    "--manifest-output",
-    manifestPath,
-    "--predictions-output",
-    predictionsPath,
-  ];
-
-  if ((process.env.ML_SIDECAR_FORCE_RETRAIN || "").trim() === "1") {
-    args.push("--retrain");
-  } else {
-    args.push("--reuse-model");
-  }
-
-  await new Promise<{ stdout: string; stderr: string }>(
-    (resolve, reject) => {
-      const attempt = (candidateIndex: number) => {
-        const pythonBin = pythonCandidates[candidateIndex];
-        const child = spawn(pythonBin, args, {
-          cwd: process.cwd(),
-          env: {
-            ...process.env,
-            PYTHONIOENCODING: "utf-8",
-          },
-        });
-
-        let stdout = "";
-        let stderr = "";
-
-        child.stdout.on("data", (chunk) => {
-          stdout += chunk.toString();
-        });
-        child.stderr.on("data", (chunk) => {
-          stderr += chunk.toString();
-        });
-        child.on("error", (error) => {
-          if (
-            !configuredPythonBin &&
-            (error as NodeJS.ErrnoException).code === "ENOENT" &&
-            candidateIndex < pythonCandidates.length - 1
-          ) {
-            attempt(candidateIndex + 1);
-            return;
-          }
-
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-            reject(
-              new Error(
-                `Unable to start ML sidecar Python executable "${pythonBin}". ` +
-                  "Install Python in the deployment environment or set ML_SIDECAR_PYTHON_BIN to the full python/python3 path."
-              )
-            );
-            return;
-          }
-
-          reject(error);
-        });
-        child.on("close", async (code) => {
-          if (code === 0) {
-            resolve({ stdout, stderr });
-            return;
-          }
-          reject(
-            new Error(
-              stderr.trim() ||
-                stdout.trim() ||
-                `ml_sidecar.batch_pipeline exited with code ${code}`
-            )
-          );
-        });
-      };
-
-      attempt(0);
-    }
-  );
-
-  const rawManifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  return parseMlForecastManifest(rawManifest);
-}
