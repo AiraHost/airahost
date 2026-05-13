@@ -266,6 +266,7 @@ function ComparableCard({
   onExclude,
   onPromote,
 }: ComparableCardProps) {
+  const [isHovered, setIsHovered] = useState(false);
   // Action icons require a stable numeric roomId â€” without one we can't write
   // a guaranteed-stable excludedComps entry, so the action would 400 at the
   // schema level.  Hide rather than letting the user hit a wall.
@@ -320,6 +321,8 @@ function ComparableCard({
       data-testid="comparable-card"
       data-state={isExiting ? "exiting" : "idle"}
       data-room-id={listingRoomId(listing) ?? ""}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       style={
         isExiting
           ? {
@@ -336,7 +339,9 @@ function ComparableCard({
       {/* Hover-reveal action icons (desktop only â€” md+) */}
       {showActions && (
         <div
-          className="pointer-events-none absolute right-3 top-3 hidden gap-1 opacity-0 transition-opacity duration-150 ease-out md:flex md:group-hover:opacity-100 md:group-focus-within:opacity-100"
+          className={`pointer-events-none absolute right-3 top-3 hidden gap-1 transition-opacity duration-150 ease-out md:flex ${
+            isHovered ? "opacity-100" : "opacity-0"
+          } group-focus-within:opacity-100`}
           aria-hidden="true"
         >
           <button

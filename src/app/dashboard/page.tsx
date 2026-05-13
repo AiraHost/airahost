@@ -810,14 +810,35 @@ export default function DashboardPage() {
 
   const handleRerunForExclusions = useCallback(async () => {
     if (!activeListingId) return;
+    const fallbackStart = customStart >= todayStr ? customStart : todayStr;
+    const fallbackEnd = customEnd >= fallbackStart ? customEnd : fallbackStart;
+    const startDate =
+      activeReport?.input_date_start && activeReport.input_date_start >= todayStr
+        ? activeReport.input_date_start
+        : fallbackStart;
+    const endDate =
+      activeReport?.input_date_end && activeReport.input_date_end >= startDate
+        ? activeReport.input_date_end
+        : fallbackEnd;
+
     // Flush any pending exclusions before kicking the rerun so the next
     // report includes them.
     await exclusionsManager.flushListing(activeListingId);
     const res = await fetch(`/api/listings/${activeListingId}/rerun`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dates: { startDate, endDate } }),
     });
     if (res.ok) await loadDashboardData();
-  }, [activeListingId, exclusionsManager, loadDashboardData]);
+  }, [
+    activeListingId,
+    activeReport,
+    customEnd,
+    customStart,
+    exclusionsManager,
+    loadDashboardData,
+    todayStr,
+  ]);
 
   // Auto-apply settings for the active listing — used to compute the preview
   // passed to ManualApplyPanel when the user applies from PricingHeatmap.

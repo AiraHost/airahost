@@ -36,8 +36,13 @@ export async function POST(
       );
     }
 
-    // Parse rerun body
-    const body = await req.json();
+    // Parse rerun body (dashboard "Re-run" sends an empty POST body)
+    let body: unknown = {};
+    try {
+      body = await req.json();
+    } catch {
+      body = {};
+    }
     const parsed = rerunListingSchema.safeParse(body);
 
     if (!parsed.success) {
