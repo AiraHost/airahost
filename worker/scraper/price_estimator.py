@@ -48,6 +48,7 @@ from worker.scraper.comp_collection import collect_search_comps
 from worker.scraper.day_query import (
     DAY_MAX_CARDS,
     DAY_SCROLL_ROUNDS,
+    MAP_RADIUS_CAP_KM,
     MAX_NIGHTS,
     MAX_SAMPLE_QUERIES,
     PER_DAY_MAX_RETRIES,
@@ -643,9 +644,24 @@ def _build_fixed_comp_pool(
     _page_offsets = [i * max(1, int(max_cards)) for i in range(_pages)]
     query_center_lat = float(target.lat) if isinstance(target.lat, (int, float)) else None
     query_center_lng = float(target.lng) if isinstance(target.lng, (int, float)) else None
-    map_radius_limit_km = 8.0  # ~5 miles
+    if query_center_lat is None or query_center_lng is None:
+        try:
+            from worker.core.geocode_details import geocode_address_details
+            geocoded = geocode_address_details(str(search_location), timeout=3)
+            if geocoded and geocoded.get("lat") is not None and geocoded.get("lng") is not None:
+                query_center_lat = float(geocoded["lat"])
+                query_center_lng = float(geocoded["lng"])
+                logger.info(
+                    "[fixed_pool] map center geocoded from search_location=%r -> (%.6f, %.6f)",
+                    search_location,
+                    query_center_lat,
+                    query_center_lng,
+                )
+        except Exception as exc:
+            logger.info(f"[fixed_pool] map center geocode skipped/failed: {exc}")
+    map_radius_limit_km = MAP_RADIUS_CAP_KM
     if isinstance(max_radius_km, (int, float)) and float(max_radius_km) > 0:
-        map_radius_limit_km = min(float(max_radius_km), 8.0)
+        map_radius_limit_km = min(float(max_radius_km), MAP_RADIUS_CAP_KM)
     one_night_comps, _one_qn = collect_search_comps(
         client,
         search_location,

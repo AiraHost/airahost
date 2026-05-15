@@ -57,7 +57,7 @@ DAY_MAX_CARDS = int(os.getenv("DAY_QUERY_MAX_CARDS", "30"))
 FIXED_COMP_DEEP_PAGES = int(os.getenv("FIXED_COMP_DEEP_PAGES", "3"))
 FIXED_COMP_DEEP_MIN_HITS = int(os.getenv("FIXED_COMP_DEEP_MIN_HITS", "4"))
 FIXED_COMP_MIN_PRICED = int(os.getenv("FIXED_COMP_MIN_PRICED", "4"))
-MAP_RADIUS_CAP_KM = 8.0  # ~5 miles
+MAP_RADIUS_CAP_KM = 5.0 * 1.609344  # exactly 5 miles
 DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "50"))
 DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "25"))
 DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "25"))
@@ -145,6 +145,36 @@ def _derive_canonical_search_location(target: ListingSpec) -> str:
     return str(target.location or "").strip()
 
 
+def _resolve_query_center(search_location: str, target: ListingSpec) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Resolve map-search center coordinates.
+
+    Priority:
+      1) Target listing coordinates (when available)
+      2) Best-effort geocode of canonical search location
+    """
+    if isinstance(target.lat, (int, float)) and isinstance(target.lng, (int, float)):
+        return float(target.lat), float(target.lng)
+    if not str(search_location or "").strip():
+        return None, None
+    try:
+        from worker.core.geocode_details import geocode_address_details
+        result = geocode_address_details(str(search_location), timeout=3)
+        if result and result.get("lat") is not None and result.get("lng") is not None:
+            lat = float(result["lat"])
+            lng = float(result["lng"])
+            logger.info(
+                "[day_query] map center geocoded from search_location=%r -> (%.6f, %.6f)",
+                search_location,
+                lat,
+                lng,
+            )
+            return lat, lng
+    except Exception as exc:
+        logger.info(f"[day_query] map center geocode skipped/failed: {exc}")
+    return None, None
+
+
 def _get_locked_search_location(client, target: ListingSpec) -> str:
     locked = getattr(client, "_locked_search_location", None)
     if isinstance(locked, str) and locked.strip():
@@ -184,8 +214,7 @@ def estimate_base_price_for_date(
 
     try:
         search_location = _get_locked_search_location(client, target) or target.location
-        query_center_lat = float(target.lat) if isinstance(target.lat, (int, float)) else None
-        query_center_lng = float(target.lng) if isinstance(target.lng, (int, float)) else None
+        query_center_lat, query_center_lng = _resolve_query_center(search_location, target)
         map_radius_limit_km = MAP_RADIUS_CAP_KM
         if isinstance(max_radius_km, (int, float)) and float(max_radius_km) > 0:
             map_radius_limit_km = min(float(max_radius_km), MAP_RADIUS_CAP_KM)

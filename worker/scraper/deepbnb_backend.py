@@ -335,6 +335,7 @@ class DeepBnbBackend:
                 str(merged_overrides.get("searchType") or "user_map_move"),
             )
         raw_params = self._raw_params_from_overrides(merged_overrides)
+        map_enabled = str(merged_overrides.get("searchByMap", "")).strip().lower() in ("true", "1")
         # Ensure required baseline params always exist.
         baseline = [
             {"filterName": "adults", "filterValues": [str(adults)]},

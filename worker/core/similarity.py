@@ -67,6 +67,7 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
       - baths:         2.0  (tolerance 1.5)
       - rating:        2.0  (tolerance 1.0)
       - reviews:       2.0  (log-scaled count similarity)
+      - address(city): 3.5  (city match = 1.0, else 0.0)
       - amenities:     1.5  (Jaccard overlap; auxiliary role)
 
     Property-type mismatch scores 0.0 (not 0.15) because the hard gate in
@@ -75,6 +76,15 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
     """
     score = 0.0
     weight_sum = 0.0
+
+    def norm_city(spec: ListingSpec) -> str:
+        city = (spec.city or "").strip().lower()
+        if city:
+            return city
+        location = (spec.location or "").strip()
+        if not location:
+            return ""
+        return location.split(",")[0].strip().lower()
 
     def add_num(t, c, w: float, tol: float):
         nonlocal score, weight_sum
@@ -133,6 +143,14 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
         score += overlap * 1.5
     else:
         score += 0.35 * 1.5
+
+    # Address/city: strict binary signal requested.
+    # City match gets full credit; all non-matches (including unknown) get zero.
+    weight_sum += 3.5
+    t_city = norm_city(target)
+    c_city = norm_city(cand)
+    if t_city and c_city and t_city == c_city:
+        score += 3.5
 
     if weight_sum <= 0:
         return 0.0

@@ -230,3 +230,27 @@ def test_collect_search_comps_default_retries_two_night_when_one_night_empty():
     assert qn == 2
     assert len(comps) == 1
     assert comps[0].url == "https://www.airbnb.ca/rooms/444"
+
+
+def test_collect_search_comps_enables_map_search_with_bounds_when_center_and_radius_provided():
+    client = _FakeClient()
+    _comps, _qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.ca",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=1,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+        page_offsets=[0],
+        center_lat=43.6532,
+        center_lng=-79.3832,
+        map_radius_km=5.0,
+    )
+
+    assert client.calls, "expected at least one search call"
+    first = client.calls[0]
+    assert first.get("searchByMap") is True
+    for k in ("neLat", "neLng", "swLat", "swLng"):
+        assert k in first
