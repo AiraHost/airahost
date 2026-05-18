@@ -197,10 +197,10 @@ if (-not $SkipSchedule -and ($AllNightly -or $ForceAllNightly -or $ListingId -or
     Write-Host "Starting data quality monitor for report(s): $($reportIds -join ', ')" -ForegroundColor Cyan
     Start-StackWindow `
       -Title "airahost data quality" `
-      -Command "python -m ml_sidecar.data_quality $reportArgs --wait-ready --wait-timeout-seconds 7200 --poll-seconds 20 --output `"$dqJson`" --issues-csv `"$dqCsv`"; python .\ml_sidecar\quality_report_html.py; Write-Host ''; Write-Host 'Data quality JSON: $dqJson'; Write-Host 'Issues CSV: $dqCsv'; Write-Host 'Quality HTML: $dqHtml'"
+      -Command "python -m ml_sidecar.data_quality $reportArgs --wait-ready --wait-timeout-seconds 7200 --poll-seconds 20 --output `"$dqJson`" --issues-csv `"$dqCsv`"; python .\ml_sidecar\quality_report_html.py --source supabase; Write-Host ''; Write-Host 'Data quality JSON: $dqJson'; Write-Host 'Issues CSV: $dqCsv'; Write-Host 'Quality HTML: $dqHtml'"
   } elseif ($SkipDataQuality -and $reportIds.Count -gt 0) {
-    Write-Host "Generating quality HTML from existing artifacts because -SkipDataQuality was set." -ForegroundColor Yellow
-    python .\ml_sidecar\quality_report_html.py
+    Write-Host "Generating quality HTML from Supabase nightly state because -SkipDataQuality was set." -ForegroundColor Yellow
+    python .\ml_sidecar\quality_report_html.py --source supabase
   } elseif (-not $SkipDataQuality) {
     Write-Host "No scheduled report id was returned, so data quality was not started." -ForegroundColor Yellow
   }

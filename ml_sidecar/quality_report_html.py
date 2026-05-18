@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from html import escape
@@ -11,9 +12,39 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 DEFAULT_REPORTS_DIR = PROJECT_ROOT / "ml_sidecar" / "reports"
 DEFAULT_OUTPUT = DEFAULT_REPORTS_DIR / "nightly_quality_report.html"
 SNAPSHOT_PREFIX = "nightly_quality_snapshot_"
+OBSERVATION_COLUMNS = (
+    "saved_listing_id",
+    "observed_at",
+    "stay_date",
+    "days_until_stay",
+    "input_mode",
+    "input_address",
+    "input_listing_url",
+    "listing_property_type",
+    "listing_bedrooms",
+    "listing_baths",
+    "listing_accommodates",
+    "listing_beds",
+    "country_code",
+    "listing_timezone",
+    "target_lat",
+    "target_lng",
+    "amenities",
+    "base_price",
+    "base_daily_price",
+    "price_after_time_adjustment",
+    "effective_daily_price_refundable",
+    "effective_daily_price_non_refundable",
+    "comps_used",
+    "is_weekend",
+    "flags",
+)
 
 
 def _utc_now() -> datetime:
@@ -62,6 +93,34 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result
+
+
+def _has_value(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, list) and not value:
+        return False
+    if isinstance(value, dict) and not value:
+        return False
+    return True
+
+
+def _is_positive_price(row: dict[str, Any]) -> bool:
+    for column in (
+        "effective_daily_price_refundable",
+        "effective_daily_price_non_refundable",
+        "base_daily_price",
+        "base_price",
+    ):
+        value = _safe_float(row.get(column))
+        if value is not None and value > 0:
+            return True
+    return False
+
+
+def _batched(values: list[str], size: int = 50):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
 
 
 def _format_dt(value: Any) -> str:
@@ -277,6 +336,311 @@ def _build_snapshot(reports_dir: Path) -> dict[str, Any]:
     }
 
 
+def _extract_airbnb_room_id(value: Any) -> str | None:
+    text = str(value or "")
+    marker = "/rooms/"
+    if marker not in text:
+        return None
+    tail = text.split(marker, 1)[1]
+    digits = []
+    for char in tail:
+        if char.isdigit():
+            digits.append(char)
+        else:
+            break
+    return "".join(digits) or None
+
+
+def _normalize_report_relation(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value if isinstance(value, dict) else None
+
+
+def _fetch_supabase_snapshot(limit: int = 2000) -> dict[str, Any]:
+    from ml_sidecar.supabase_client import get_client
+
+    client = get_client()
+    generated_at = _utc_now().isoformat()
+
+    listing_rows = (
+        client.table("saved_listings")
+        .select("id,name,input_address,input_attributes,target_lat,target_lng,listing_timezone,created_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    listings_by_id = {str(row.get("id")): row for row in listing_rows if row.get("id")}
+
+    link_rows = (
+        client.table("listing_reports")
+        .select(
+            "saved_listing_id,trigger,created_at,"
+            "pricing_reports:pricing_report_id("
+            "id,listing_id,status,job_lane,target_env,report_type,created_at,completed_at,"
+            "market_captured_at,error_message,result_calendar,result_summary,input_listing_url,input_address)"
+        )
+        .eq("trigger", "scheduled")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+    latest_any_by_listing: dict[str, dict[str, Any]] = {}
+    ready_by_listing: dict[str, list[dict[str, Any]]] = {}
+    all_report_ids: list[str] = []
+    for link in link_rows:
+        listing_id = str(link.get("saved_listing_id") or "")
+        report = _normalize_report_relation(link.get("pricing_reports"))
+        if not listing_id or not report:
+            continue
+        report = dict(report)
+        report["_link_created_at"] = link.get("created_at")
+        report["_saved_listing_id"] = listing_id
+        report_id = str(report.get("id") or "")
+        if report_id:
+            all_report_ids.append(report_id)
+        latest_any_by_listing.setdefault(listing_id, report)
+        if (
+            report.get("status") == "ready"
+            and (report.get("report_type") or "live_analysis") != "forecast_snapshot"
+        ):
+            ready_by_listing.setdefault(listing_id, []).append(report)
+
+    latest_ready_by_listing: dict[str, dict[str, Any]] = {}
+    previous_ready_by_listing: dict[str, dict[str, Any]] = {}
+    checked_report_ids: list[str] = []
+    previous_report_ids: list[str] = []
+    for listing_id, reports in ready_by_listing.items():
+        reports = sorted(
+            reports,
+            key=lambda row: str(row.get("completed_at") or row.get("created_at") or ""),
+            reverse=True,
+        )
+        if reports:
+            latest_ready_by_listing[listing_id] = reports[0]
+            checked_report_ids.append(str(reports[0].get("id")))
+        if len(reports) > 1:
+            previous_ready_by_listing[listing_id] = reports[1]
+            previous_report_ids.append(str(reports[1].get("id")))
+
+    observation_report_ids = sorted(set(checked_report_ids + previous_report_ids))
+    observations: list[dict[str, Any]] = []
+    if observation_report_ids:
+        columns = "pricing_report_id," + ",".join(OBSERVATION_COLUMNS)
+        for batch in _batched(observation_report_ids):
+            observations.extend(
+                client.table("market_price_observations")
+                .select(columns)
+                .in_("pricing_report_id", batch)
+                .execute()
+                .data
+                or []
+            )
+
+    obs_by_report: dict[str, list[dict[str, Any]]] = {}
+    for row in observations:
+        report_id = str(row.get("pricing_report_id") or "")
+        obs_by_report.setdefault(report_id, []).append(row)
+
+    def observation_profile(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        row_count = len(rows)
+        present_counts = {column: 0 for column in OBSERVATION_COLUMNS}
+        zero_counts = {column: 0 for column in OBSERVATION_COLUMNS}
+        for row in rows:
+            for column in OBSERVATION_COLUMNS:
+                value = row.get(column)
+                if _has_value(value):
+                    present_counts[column] += 1
+                numeric = _safe_float(value)
+                if numeric is not None and numeric == 0:
+                    zero_counts[column] += 1
+        return {
+            "row_count": row_count,
+            "present_counts": present_counts,
+            "zero_counts": zero_counts,
+            "available_fields": sorted([column for column, count in present_counts.items() if count > 0]),
+        }
+
+    def calendar_dates(report: dict[str, Any]) -> set[str]:
+        calendar = report.get("result_calendar") or []
+        if not isinstance(calendar, list):
+            return set()
+        return {
+            str(day.get("date"))
+            for day in calendar
+            if isinstance(day, dict) and day.get("date")
+        }
+
+    listing_quality: dict[str, dict[str, Any]] = {}
+    issue_rows: list[dict[str, str]] = []
+    total_new_observations = 0
+    total_missing_dates = 0
+    total_price_mismatches = 0
+    total_bad_coords = 0
+    total_bad_comps = 0
+    total_no_price = 0
+
+    eligible_listing_ids: list[str] = []
+    for listing_id, listing in listings_by_id.items():
+        attrs = listing.get("input_attributes") if isinstance(listing.get("input_attributes"), dict) else {}
+        latest = latest_ready_by_listing.get(listing_id)
+        previous = previous_ready_by_listing.get(listing_id)
+        latest_any = latest_any_by_listing.get(listing_id)
+        listing_url = (
+            attrs.get("listingUrl")
+            or attrs.get("listing_url")
+            or (latest_any or {}).get("input_listing_url")
+            or (latest or {}).get("input_listing_url")
+        )
+        is_eligible = bool((isinstance(listing_url, str) and "/rooms/" in listing_url) or latest_any)
+        if not is_eligible:
+            continue
+        eligible_listing_ids.append(listing_id)
+
+        latest_rows = (obs_by_report.get(str(latest.get("id"))) or []) if latest else []
+        previous_rows = (obs_by_report.get(str(previous.get("id"))) or []) if previous else []
+        latest_profile = observation_profile(latest_rows)
+        previous_profile = observation_profile(previous_rows)
+        latest_dates = {str(row.get("stay_date")) for row in latest_rows if row.get("stay_date")}
+        cal_dates = calendar_dates(latest or {})
+        missing_dates = sorted(cal_dates - latest_dates)
+        no_price = sum(1 for row in latest_rows if not _is_positive_price(row))
+        bad_coords = 0
+        bad_comps = 0
+        for row in latest_rows:
+            lat = _safe_float(row.get("target_lat"))
+            lng = _safe_float(row.get("target_lng"))
+            if lat is None or lng is None or not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                bad_coords += 1
+            comps_used = _safe_float(row.get("comps_used"))
+            if comps_used is None or comps_used <= 0:
+                bad_comps += 1
+
+        disappeared_fields = sorted(
+            set(previous_profile.get("available_fields") or [])
+            - set(latest_profile.get("available_fields") or [])
+        )
+        added_fields = sorted(
+            set(latest_profile.get("available_fields") or [])
+            - set(previous_profile.get("available_fields") or [])
+        )
+
+        status = "pass"
+        if not latest:
+            status = "error" if latest_any and latest_any.get("status") == "error" else "missing"
+        elif missing_dates or no_price:
+            status = "error"
+        elif bad_coords or bad_comps or disappeared_fields:
+            status = "warning"
+
+        total_new_observations += len(latest_rows)
+        total_missing_dates += len(missing_dates)
+        total_bad_coords += bad_coords
+        total_bad_comps += bad_comps
+        total_no_price += no_price
+
+        listing_quality[listing_id] = {
+            "listing_id": listing_id,
+            "listing_name": listing.get("name"),
+            "airbnb_room_id": _extract_airbnb_room_id(listing_url),
+            "listing_url": listing_url,
+            "eligible": is_eligible,
+            "status": status,
+            "latest_report_id": latest.get("id") if latest else None,
+            "latest_report_status": latest.get("status") if latest else latest_any.get("status") if latest_any else None,
+            "latest_report_completed_at": latest.get("completed_at") if latest else None,
+            "latest_report_error": latest_any.get("error_message") if latest_any else None,
+            "previous_report_id": previous.get("id") if previous else None,
+            "new_observation_count": len(latest_rows),
+            "previous_observation_count": len(previous_rows),
+            "observation_delta": len(latest_rows) - len(previous_rows) if previous else None,
+            "calendar_date_count": len(cal_dates),
+            "missing_observation_date_count": len(missing_dates),
+            "missing_dates_sample": missing_dates[:20],
+            "bad_coordinate_count": bad_coords,
+            "bad_comps_count": bad_comps,
+            "no_positive_price_count": no_price,
+            "available_fields": latest_profile.get("available_fields"),
+            "previous_available_fields": previous_profile.get("available_fields"),
+            "added_fields": added_fields,
+            "disappeared_fields": disappeared_fields,
+            "field_present_counts": latest_profile.get("present_counts"),
+            "field_zero_counts": latest_profile.get("zero_counts"),
+        }
+
+        if status in ("error", "warning", "missing"):
+            issue_rows.append(
+                {
+                    "severity": "error" if status in ("error", "missing") else "warning",
+                    "code": f"listing_{status}",
+                    "message": f"{listing.get('name') or listing_id} nightly quality is {status}",
+                    "context_json": json.dumps(
+                        {
+                            "listing_id": listing_id,
+                            "latest_report_id": listing_quality[listing_id]["latest_report_id"],
+                            "latest_report_status": listing_quality[listing_id]["latest_report_status"],
+                            "missing_dates": len(missing_dates),
+                            "bad_coords": bad_coords,
+                            "bad_comps": bad_comps,
+                            "disappeared_fields": disappeared_fields,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+
+    overall_status = "fail" if any(row["severity"] == "error" for row in issue_rows) else "pass"
+    metrics = {
+        "calendar_date_count": sum(int(row.get("calendar_date_count") or 0) for row in listing_quality.values()),
+        "missing_observation_date_count": total_missing_dates,
+        "extra_observation_date_count": 0,
+        "price_mismatch_count": total_price_mismatches,
+        "raw_invalid_coordinate_count": total_bad_coords,
+        "raw_nonpositive_comps_count": total_bad_comps,
+        "raw_no_positive_price_count": total_no_price,
+        "per_listing_supabase_quality": listing_quality,
+    }
+
+    return {
+        "snapshot_version": 2,
+        "source": "supabase",
+        "generated_at": generated_at,
+        "reports_dir": str(DEFAULT_REPORTS_DIR),
+        "data_quality": {
+            "generated_at": generated_at,
+            "status": overall_status,
+            "training_scope": "supabase_nightly",
+            "since_hours": None,
+            "checked_report_ids": checked_report_ids,
+            "listing_ids": sorted(eligible_listing_ids),
+            "new_observation_count": total_new_observations,
+            "training_row_count": None,
+            "feature_row_count": None,
+            "feature_column_count": None,
+            "baseline_row_count": sum(len(obs_by_report.get(report_id, [])) for report_id in previous_report_ids),
+            "issues": issue_rows,
+            "metrics": metrics,
+        },
+        "issues": issue_rows,
+        "metrics_latest": {},
+        "training_matrix": {"row_count": total_new_observations, "columns": list(OBSERVATION_COLUMNS), "column_count": len(OBSERVATION_COLUMNS)},
+        "training_by_listing": {},
+        "supabase_listing_quality": listing_quality,
+        "manifests": _latest_manifests(DEFAULT_REPORTS_DIR),
+        "field_sets": {
+            "data_quality_metric_fields": sorted(_json_leaf_keys(metrics)),
+            "training_matrix_columns": list(OBSERVATION_COLUMNS),
+            "metrics_latest_columns": [],
+            "issue_codes": sorted({row.get("code", "") for row in issue_rows if row.get("code")}),
+        },
+    }
+
+
 def _snapshot_paths(reports_dir: Path) -> list[Path]:
     return sorted(
         reports_dir.glob(f"{SNAPSHOT_PREFIX}*.json"),
@@ -350,6 +714,82 @@ def _render_issue_table(issues: list[dict[str, str]]) -> str:
 
 
 def _render_problem_listings(snapshot: dict[str, Any]) -> str:
+    supabase_quality = snapshot.get("supabase_listing_quality")
+    if isinstance(supabase_quality, dict) and supabase_quality:
+        rows = []
+        for listing_id, row in sorted(supabase_quality.items(), key=lambda item: str((item[1] or {}).get("listing_name") or item[0])):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "unknown")
+            if status == "pass":
+                continue
+            tone = "bad" if status in ("error", "missing") else "warn" if status == "warning" else "good"
+            reasons: list[str] = []
+            causes: list[str] = []
+            impacts: list[str] = []
+            if not row.get("latest_report_id"):
+                reasons.append("no ready nightly report found")
+                causes.append("scheduler did not create a ready report, or worker failed before ready")
+                impacts.append("dashboard has no fresh nightly data for this listing")
+            if row.get("latest_report_status") == "error":
+                reasons.append("latest scheduled nightly ended in error")
+                causes.append(str(row.get("latest_report_error") or "see pricing_reports.error_message"))
+                impacts.append("new observations were not generated")
+            if int(row.get("missing_observation_date_count") or 0):
+                reasons.append(f"{row.get('missing_observation_date_count')} calendar dates are missing observations")
+                causes.append("result_calendar did not fully ingest into market_price_observations")
+                impacts.append("nightly coverage is incomplete")
+            if int(row.get("bad_coordinate_count") or 0):
+                reasons.append(f"{row.get('bad_coordinate_count')} observations have missing or invalid coordinates")
+                causes.append("saved listing target_lat/target_lng or observation target_lat/target_lng is missing")
+                impacts.append("model location signal is weak")
+            if int(row.get("bad_comps_count") or 0):
+                reasons.append(f"{row.get('bad_comps_count')} observations have comps_used missing or <= 0")
+                causes.append("calendar day compsUsed did not reach market_price_observations")
+                impacts.append("model loses comparable support signal")
+            if int(row.get("no_positive_price_count") or 0):
+                reasons.append(f"{row.get('no_positive_price_count')} observations have no positive price")
+                causes.append("price source fields are empty or non-positive")
+                impacts.append("training target is invalid for those rows")
+            disappeared = row.get("disappeared_fields") if isinstance(row.get("disappeared_fields"), list) else []
+            if disappeared:
+                reasons.append("fields disappeared vs previous nightly: " + ", ".join(map(str, disappeared[:8])))
+                causes.append("latest observation rows stopped populating fields that existed in the previous nightly")
+                impacts.append("feature consistency changed between nightly runs")
+            if not reasons:
+                reasons.append("no listing-specific issue detected")
+                causes.append("n/a")
+                impacts.append("n/a")
+
+            rows.append(
+                "<tr>"
+                f"<td>{_badge(status, tone)}</td>"
+                f"<td>{_h(row.get('listing_name') or '')}<br><code>{_h(listing_id)}</code><br><span class=\"muted\">room {_h(row.get('airbnb_room_id') or 'n/a')}</span></td>"
+                f"<td><code>{_h(row.get('latest_report_id') or 'n/a')}</code><br><span class=\"muted\">{_h(_format_dt(row.get('latest_report_completed_at')))}</span></td>"
+                f"<td><code>{_h(row.get('previous_report_id') or 'n/a')}</code></td>"
+                f"<td>{_h(row.get('new_observation_count'))}</td>"
+                f"<td>{_h(row.get('previous_observation_count'))}</td>"
+                f"<td>{_h(row.get('observation_delta', 'n/a'))}</td>"
+                f"<td>{'<br>'.join(_h(reason) for reason in reasons)}</td>"
+                f"<td>{'<br>'.join(_h(cause) for cause in dict.fromkeys(causes))}</td>"
+                f"<td>{'<br>'.join(_h(impact) for impact in dict.fromkeys(impacts))}</td>"
+                f"<td>{_h(row.get('bad_coordinate_count'))}</td>"
+                f"<td>{_h(row.get('bad_comps_count'))}</td>"
+                f"<td>{_h(row.get('missing_observation_date_count'))}</td>"
+                f"<td>{_h(', '.join(map(str, disappeared[:10])) if disappeared else 'none')}</td>"
+                "</tr>"
+            )
+
+        if not rows:
+            return '<p class="empty">No problem listings detected.</p>'
+
+        return (
+            '<table><thead><tr><th>Status</th><th>Listing</th><th>Latest nightly</th><th>Previous nightly</th>'
+            '<th>New obs</th><th>Prev obs</th><th>Delta</th><th>Why flagged</th><th>Likely cause</th><th>Impact</th>'
+            '<th>Bad coords</th><th>Bad comps</th><th>Missing dates</th><th>Disappeared fields</th></tr></thead>'
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
     dq = snapshot.get("data_quality") if isinstance(snapshot.get("data_quality"), dict) else {}
     metrics = dq.get("metrics") if isinstance(dq.get("metrics"), dict) else {}
     per_listing = metrics.get("per_listing_observation_quality")
@@ -670,11 +1110,21 @@ def _render_html(snapshot: dict[str, Any], previous: dict[str, Any], snapshot_pa
         for severity, count in sorted(issue_counts.items())
     ) or '<span class="summary-chip">none</span>'
 
-    coverage_note = (
-        "This report reflects the data_quality scope. If nightly was forced for one listing, it is not a full portfolio coverage check yet."
-        if checked_report_ids
-        else "No checked_report_ids were found. Run data quality after nightly to populate this report."
-    )
+    source = str(snapshot.get("source") or "artifacts")
+    if source == "supabase":
+        coverage_note = (
+            "This report queries Supabase directly and compares each eligible listing's latest ready scheduled nightly with its previous ready scheduled nightly."
+        )
+        if not checked_report_ids:
+            coverage_note = (
+                "No ready scheduled nightly reports were found in Supabase for eligible listings. Check the Problem Listings table for missing, running, or failed jobs."
+            )
+    else:
+        coverage_note = (
+            "This report reflects the data_quality scope. If nightly was forced for one listing, it is not a full portfolio coverage check yet."
+            if checked_report_ids
+            else "No checked_report_ids were found. Run data quality after nightly to populate this report."
+        )
 
     css = """
     :root { color-scheme: light; --bg:#f6f7f9; --ink:#17202a; --muted:#64748b; --line:#dbe3ee; --panel:#ffffff; --good:#087f5b; --warn:#b7791f; --bad:#c92a2a; }
@@ -722,7 +1172,7 @@ def _render_html(snapshot: dict[str, Any], previous: dict[str, Any], snapshot_pa
 <body>
   <header>
     <h1>AiraHost Nightly Data Quality</h1>
-    <p>Generated {_h(_format_dt(snapshot.get("generated_at")))} from <code>{_h(snapshot.get("reports_dir"))}</code></p>
+    <p>Generated {_h(_format_dt(snapshot.get("generated_at")))} from <code>{_h(source)}</code> source</p>
     <p>{_badge(status, status_tone)} <span class="summary-chip">reports: {_h(len(checked_report_ids))}</span><span class="summary-chip">listings: {_h(len(listing_ids))}</span>{issue_summary}</p>
   </header>
   <main>
@@ -731,6 +1181,7 @@ def _render_html(snapshot: dict[str, Any], previous: dict[str, Any], snapshot_pa
       <div class="meta">
         <div><strong>Data quality generated</strong><br>{_h(_format_dt(dq.get("generated_at")))}</div>
         <div><strong>Training scope</strong><br>{_h(dq.get("training_scope", "n/a"))}</div>
+        <div><strong>Report source</strong><br>{_h(source)}</div>
         <div><strong>Since hours</strong><br>{_h(dq.get("since_hours", "n/a"))}</div>
         <div><strong>Snapshot</strong><br><code>{_h(snapshot_path.name if snapshot_path else "not written")}</code></div>
       </div>
@@ -774,9 +1225,11 @@ def generate_report(
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     output_path: Path = DEFAULT_OUTPUT,
     write_snapshot: bool = True,
+    source: str = "artifacts",
 ) -> tuple[Path, Path | None]:
     reports_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = _build_snapshot(reports_dir)
+    snapshot = _fetch_supabase_snapshot() if source == "supabase" else _build_snapshot(reports_dir)
+    snapshot["source"] = source
     snapshot_path = _write_snapshot(reports_dir, snapshot) if write_snapshot else None
     previous = _load_previous_snapshot(reports_dir, snapshot_path)
     html = _render_html(snapshot, previous, snapshot_path)
@@ -791,6 +1244,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reports-dir", default=str(DEFAULT_REPORTS_DIR))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--source",
+        choices=["artifacts", "supabase"],
+        default="artifacts",
+        help="Use local report artifacts or query Supabase nightly tables directly.",
+    )
     parser.add_argument("--no-snapshot", action="store_true", help="Do not write a historical snapshot JSON.")
     return parser.parse_args()
 
@@ -801,6 +1260,7 @@ def main() -> None:
         reports_dir=Path(args.reports_dir),
         output_path=Path(args.output),
         write_snapshot=not args.no_snapshot,
+        source=args.source,
     )
     print(f"Wrote HTML report: {output}")
     if snapshot:

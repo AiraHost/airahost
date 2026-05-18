@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -40,5 +41,14 @@ def get_client() -> Client:
         raise RuntimeError(
             "Missing SUPABASE URL or SUPABASE_SERVICE_ROLE_KEY for ml_sidecar."
         )
+
+    hostname = urlparse(url).hostname
+    if hostname:
+        for key_name in ("NO_PROXY", "no_proxy"):
+            existing = os.environ.get(key_name, "")
+            entries = [entry.strip() for entry in existing.split(",") if entry.strip()]
+            if hostname not in entries:
+                entries.append(hostname)
+                os.environ[key_name] = ",".join(entries)
 
     return create_client(url, key)

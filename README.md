@@ -65,7 +65,7 @@ Optional switches:
 
 Nightly report creation behavior:
 
-- `.\run_local_stack.cmd -ForceNightly -SkipDataQuality` creates a nightly report job, but skips the fresh data-quality run. It still regenerates the HTML report from whatever latest artifacts already exist.
+- `.\run_local_stack.cmd -ForceNightly -SkipDataQuality` creates a nightly report job, but skips the fresh data-quality run. It still regenerates the HTML report from Supabase nightly state.
 - `.\run_local_stack.cmd -ForceNightly -SkipChrome` creates a nightly report job and runs data quality after the report becomes `ready`. Use this when Chrome CDP is already running on `:9222`.
 - `.\run_local_stack.cmd -AllNightly` creates nightly report jobs for all eligible saved listings, subject to the normal dedup window.
 - `.\run_local_stack.cmd -ForceAllNightly` creates nightly report jobs for all eligible saved listings and bypasses the dedup window. This is local-only and can create many scrape jobs.
@@ -167,14 +167,18 @@ If the JSON status is `pass`, the latest nightly data is considered safe enough 
 
 ### One-page nightly quality report
 
-After a scheduled nightly report returns at least one `reportId`, the local stack also runs:
+Use this report when checking whether nightly actually produced fresh usable data for each listing.
+
+The local stack automatically generates the HTML report after a scheduled nightly report returns at least one `reportId`:
 
 ```powershell
-python .\ml_sidecar\quality_report_html.py
+python .\ml_sidecar\quality_report_html.py --source supabase
 ```
 
-The generated HTML report summarizes the scattered files in `ml_sidecar/reports`:
+The generated HTML report queries Supabase as the source of truth:
 
+- latest and previous scheduled nightly reports directly from Supabase
+- per-listing nightly coverage, errors, observation counts, and field changes
 - latest data-quality status and issue counts
 - checked report IDs and listing IDs
 - problem listings with bad coordinates, bad `comps_used`, missing dates, and price mismatches
@@ -183,13 +187,67 @@ The generated HTML report summarizes the scattered files in `ml_sidecar/reports`
 - field changes compared with the previous saved snapshot
 - recent ML manifest summaries
 
-Open:
+To check a nightly run:
+
+1. Run nightly normally, for example:
+
+```powershell
+.\run_local_stack.cmd -ForceNightly
+```
+
+2. For a full portfolio check, schedule all eligible listings instead:
+
+```powershell
+.\run_local_stack.cmd -AllNightly
+```
+
+Use this only when you intentionally want to bypass the dedup window and rerun every eligible listing:
+
+```powershell
+.\run_local_stack.cmd -ForceAllNightly
+```
+
+3. Open the generated report:
 
 ```text
 ml_sidecar/reports/nightly_quality_report.html
 ```
 
-Each run writes a `nightly_quality_snapshot_<timestamp>.json` file so the next run can show what changed versus the previous nightly. If `-SkipDataQuality` is used, the HTML is regenerated from existing latest artifacts and may not represent the newly scheduled report.
+4. Start with these sections:
+
+- `Run Scope`: confirms whether the report is reading from Supabase and how many listing/report IDs were checked.
+- `Latest vs Previous Snapshot`: shows total observation count changes versus the last generated snapshot.
+- `Problem Listings`: the main triage table. Check `Why flagged`, `Likely cause`, `Impact`, `New obs`, `Prev obs`, `Missing dates`, `Bad coords`, `Bad comps`, and `Disappeared fields`.
+- `Field Changes`: shows which observation/data-quality fields appeared or disappeared compared with the previous snapshot.
+
+Typical signals:
+
+- `New obs = 0` with `Missing dates > 0`: the latest ready nightly report did not ingest calendar rows into `market_price_observations`.
+- `Bad comps > 0`: `comps_used` is missing or non-positive in observation rows, so comparable support is weak.
+- `Bad coords > 0`: target latitude/longitude is missing or invalid in observation rows.
+- `Disappeared fields` is not `none`: a field that existed in the previous nightly is no longer being populated.
+
+To regenerate the report from the current Supabase nightly state at any time:
+
+```powershell
+python .\ml_sidecar\quality_report_html.py --source supabase
+```
+
+For a quick connection/schema smoke test without writing a comparison snapshot:
+
+```powershell
+python .\ml_sidecar\quality_report_html.py --source supabase --no-snapshot
+```
+
+Each normal run writes a `nightly_quality_snapshot_<timestamp>.json` file so the next run can show what changed versus the previous nightly. If `-SkipDataQuality` is used, the HTML still reads Supabase, but the separate `data_quality_latest.json` and CSV artifacts are not refreshed.
+
+Use the local artifact-only view only when debugging files already written under `ml_sidecar/reports`:
+
+```powershell
+python .\ml_sidecar\quality_report_html.py --source artifacts
+```
+
+If the report command fails with `WinError 10061`, check whether the shell has `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` pointing to a closed local proxy. The Supabase client adds the configured Supabase host to `NO_PROXY`, but a stale proxy setting can still explain why the worker can write nightly data while a manual report command cannot connect from the current shell.
 
 ## Nightly Automatic ML Retraining
 
