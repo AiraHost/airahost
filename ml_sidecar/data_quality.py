@@ -327,6 +327,7 @@ def _validate_report_ingestion(
     extra_dates_total = 0
     price_mismatch_total = 0
     calendar_date_total = 0
+    per_report: Dict[str, Dict[str, Any]] = {}
 
     if not reports:
         _add_issue(
@@ -348,8 +349,18 @@ def _validate_report_ingestion(
 
     for report in reports:
         report_id = str(report.get("id") or "")
+        listing_id = str(report.get("listing_id") or "")
         calendar = report.get("result_calendar") or []
         if not isinstance(calendar, list) or not calendar:
+            per_report[report_id] = {
+                "listing_id": listing_id,
+                "calendar_date_count": 0,
+                "observation_date_count": 0,
+                "missing_observation_date_count": 0,
+                "extra_observation_date_count": 0,
+                "price_mismatch_count": 0,
+                "status": "error",
+            }
             _add_issue(
                 issues,
                 "error",
@@ -372,6 +383,7 @@ def _validate_report_ingestion(
         extra_dates = sorted(observed_dates - calendar_dates)
         missing_dates_total += len(missing_dates)
         extra_dates_total += len(extra_dates)
+        report_price_mismatch_count = 0
 
         if missing_dates:
             _add_issue(
@@ -409,6 +421,7 @@ def _validate_report_ingestion(
                     continue
                 if expected is None or actual is None or abs(expected - actual) > price_tolerance:
                     price_mismatch_total += 1
+                    report_price_mismatch_count += 1
                     _add_issue(
                         issues,
                         "error",
@@ -422,11 +435,30 @@ def _validate_report_ingestion(
                         actual=actual,
                     )
 
+        per_report[report_id] = {
+            "listing_id": listing_id,
+            "calendar_date_count": len(calendar_dates),
+            "observation_date_count": len(observed_dates),
+            "missing_observation_date_count": len(missing_dates),
+            "extra_observation_date_count": len(extra_dates),
+            "price_mismatch_count": report_price_mismatch_count,
+            "missing_dates_sample": missing_dates[:20],
+            "extra_dates_sample": extra_dates[:20],
+            "status": (
+                "error"
+                if missing_dates or report_price_mismatch_count
+                else "warning"
+                if extra_dates
+                else "pass"
+            ),
+        }
+
     return {
         "calendar_date_count": calendar_date_total,
         "missing_observation_date_count": missing_dates_total,
         "extra_observation_date_count": extra_dates_total,
         "price_mismatch_count": price_mismatch_total,
+        "per_report_ingestion_quality": per_report,
     }
 
 
@@ -439,23 +471,49 @@ def _validate_raw_observations(
     no_positive_price = 0
     invalid_coordinates = 0
     nonpositive_comps = 0
+    per_listing: Dict[str, Dict[str, Any]] = {}
+
+    def listing_stats(row: Dict[str, Any]) -> Dict[str, Any]:
+        listing_id = str(row.get("saved_listing_id") or "unknown")
+        return per_listing.setdefault(
+            listing_id,
+            {
+                "observation_count": 0,
+                "missing_required": {column: 0 for column in RAW_REQUIRED_COLUMNS},
+                "no_positive_price_count": 0,
+                "invalid_coordinate_count": 0,
+                "nonpositive_comps_count": 0,
+                "report_ids": [],
+                "status": "pass",
+            },
+        )
 
     for row in observations:
+        stats = listing_stats(row)
+        stats["observation_count"] += 1
+        report_id = str(row.get("pricing_report_id") or "")
+        if report_id and report_id not in stats["report_ids"]:
+            stats["report_ids"].append(report_id)
+
         for column in RAW_REQUIRED_COLUMNS:
             if row.get(column) in (None, ""):
                 missing_required[column] += 1
+                stats["missing_required"][column] += 1
 
         if not any(_observation_price(row, column) is not None for column in PRICE_SOURCE_COLUMNS):
             no_positive_price += 1
+            stats["no_positive_price_count"] += 1
 
         lat = _safe_float(row.get("target_lat"))
         lng = _safe_float(row.get("target_lng"))
         if lat is None or lng is None or not (-90 <= lat <= 90 and -180 <= lng <= 180):
             invalid_coordinates += 1
+            stats["invalid_coordinate_count"] += 1
 
         comps_used = _safe_float(row.get("comps_used"))
         if comps_used is None or comps_used <= 0:
             nonpositive_comps += 1
+            stats["nonpositive_comps_count"] += 1
 
     for column, count in missing_required.items():
         if count:
@@ -493,11 +551,18 @@ def _validate_raw_observations(
             count=nonpositive_comps,
         )
 
+    for stats in per_listing.values():
+        if any(stats["missing_required"].values()) or stats["no_positive_price_count"]:
+            stats["status"] = "error"
+        elif stats["invalid_coordinate_count"] or stats["nonpositive_comps_count"]:
+            stats["status"] = "warning"
+
     return {
         "raw_missing_required": missing_required,
         "raw_no_positive_price_count": no_positive_price,
         "raw_invalid_coordinate_count": invalid_coordinates,
         "raw_nonpositive_comps_count": nonpositive_comps,
+        "per_listing_observation_quality": per_listing,
     }
 
 

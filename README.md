@@ -30,6 +30,9 @@ This starts:
 - ML sidecar worker
 - a data-quality monitor window
 - one forced nightly job for the default Airbnb room `1305899249107196055`
+- a one-page HTML quality report after data quality completes
+
+`-ForceNightly` uses the launcher's default Airbnb room target, so it force-runs only `1305899249107196055` unless you pass another `-AirbnbRoomId` or `-ListingId`.
 
 The default nightly target can be changed without editing code:
 
@@ -38,13 +41,37 @@ The default nightly target can be changed without editing code:
 .\run_local_stack.cmd -ListingId <saved_listing_uuid> -ForceNightly
 ```
 
+To force every eligible saved listing locally and bypass the 23-hour dedup window:
+
+```powershell
+.\run_local_stack.cmd -ForceAllNightly
+```
+
+To schedule every eligible saved listing without bypassing dedup:
+
+```powershell
+.\run_local_stack.cmd -AllNightly
+```
+
 Optional switches:
 
 ```powershell
 .\run_local_stack.cmd -ForceNightly -SkipDataQuality
 .\run_local_stack.cmd -ForceNightly -SkipChrome
+.\run_local_stack.cmd -AllNightly
+.\run_local_stack.cmd -ForceAllNightly
 .\run_local_stack.cmd -SkipSchedule
 ```
+
+Nightly report creation behavior:
+
+- `.\run_local_stack.cmd -ForceNightly -SkipDataQuality` creates a nightly report job, but skips the fresh data-quality run. It still regenerates the HTML report from whatever latest artifacts already exist.
+- `.\run_local_stack.cmd -ForceNightly -SkipChrome` creates a nightly report job and runs data quality after the report becomes `ready`. Use this when Chrome CDP is already running on `:9222`.
+- `.\run_local_stack.cmd -AllNightly` creates nightly report jobs for all eligible saved listings, subject to the normal dedup window.
+- `.\run_local_stack.cmd -ForceAllNightly` creates nightly report jobs for all eligible saved listings and bypasses the dedup window. This is local-only and can create many scrape jobs.
+- `.\run_local_stack.cmd -SkipSchedule` starts the services only. It does not call the nightly scheduler and does not create a new nightly report.
+
+For portfolio-wide coverage without forcing duplicates, use `-AllNightly`. A normal full schedule checks every eligible saved listing with a valid Airbnb room URL, subject to the normal dedup window. Use `-ForceAllNightly` only when you intentionally want all eligible listings rerun even if they already ran recently.
 
 PowerShell requires the `.\` prefix for local `.cmd` files. Use `.\run_local_stack.cmd`, not `run_local_stack.cmd`.
 
@@ -117,6 +144,8 @@ Outputs:
 ```text
 ml_sidecar/reports/data_quality_latest.json
 ml_sidecar/reports/data_quality_issues_latest.csv
+ml_sidecar/reports/nightly_quality_report.html
+ml_sidecar/reports/nightly_quality_snapshot_<timestamp>.json
 ```
 
 Open the issue CSV when a run looks suspicious:
@@ -135,6 +164,32 @@ The checker validates:
 - the feature matrix has no missing numeric features, NaN, or non-finite values
 
 If the JSON status is `pass`, the latest nightly data is considered safe enough for retraining. If it is `fail`, inspect the CSV before trusting the model output.
+
+### One-page nightly quality report
+
+After a scheduled nightly report returns at least one `reportId`, the local stack also runs:
+
+```powershell
+python .\ml_sidecar\quality_report_html.py
+```
+
+The generated HTML report summarizes the scattered files in `ml_sidecar/reports`:
+
+- latest data-quality status and issue counts
+- checked report IDs and listing IDs
+- problem listings with bad coordinates, bad `comps_used`, missing dates, and price mismatches
+- new observation count, calendar date count, missing dates, and price mismatches
+- training row count, feature column count, and per-column missing/zero rates
+- field changes compared with the previous saved snapshot
+- recent ML manifest summaries
+
+Open:
+
+```text
+ml_sidecar/reports/nightly_quality_report.html
+```
+
+Each run writes a `nightly_quality_snapshot_<timestamp>.json` file so the next run can show what changed versus the previous nightly. If `-SkipDataQuality` is used, the HTML is regenerated from existing latest artifacts and may not represent the newly scheduled report.
 
 ## Nightly Automatic ML Retraining
 
