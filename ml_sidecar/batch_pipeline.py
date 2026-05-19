@@ -31,6 +31,10 @@ from ml_sidecar.model import (
 )
 from ml_sidecar.supabase_client import get_client
 
+# Keep direct uses of XGBRegressor in this module compatible with sklearn
+# wrappers that expect the estimator type marker during load/save.
+XGBRegressor._estimator_type = "regressor"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = PROJECT_ROOT / "ml_sidecar" / "reports"
 

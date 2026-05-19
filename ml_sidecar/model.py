@@ -12,6 +12,10 @@ from xgboost import XGBRegressor
 
 from ml_sidecar.data import TARGET_COLUMN_NAME, _compute_date_features
 
+# XGBoost's sklearn wrapper may miss this marker with some sklearn/xgboost
+# combinations, which breaks save_model(). We only use the regressor wrapper here.
+XGBRegressor._estimator_type = "regressor"
+
 AMENITIES_LIST = [
     "wifi",
     "kitchen",
