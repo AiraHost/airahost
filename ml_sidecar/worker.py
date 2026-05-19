@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+import sklearn
+import xgboost
+from xgboost import XGBRegressor
 
 from ml_sidecar.batch_pipeline import execute_batch_workflow
 from ml_sidecar.data import normalize_training_scope
@@ -25,7 +28,7 @@ POLL_SECONDS = int(os.getenv("ML_SIDECAR_POLL_SECONDS", "5"))
 STALE_MINUTES = int(os.getenv("ML_SIDECAR_STALE_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("ML_SIDECAR_MAX_ATTEMPTS", "3"))
 DEFAULT_HORIZON = int(os.getenv("ML_SIDECAR_DEFAULT_HORIZON", "30"))
-WORKER_VERSION = os.getenv("ML_SIDECAR_WORKER_VERSION", "ml-sidecar-worker-0.1.0")
+WORKER_VERSION = os.getenv("ML_SIDECAR_WORKER_VERSION", "ml-sidecar-worker-0.1.1")
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -277,6 +280,12 @@ def main() -> None:
         "ML sidecar worker starting version=%s poll=%ss queue=pricing_reports.result_summary.mlForecast",
         WORKER_VERSION,
         POLL_SECONDS,
+    )
+    logger.info(
+        "ML runtime sklearn=%s xgboost=%s xgb_regressor_type=%s",
+        sklearn.__version__,
+        xgboost.__version__,
+        getattr(XGBRegressor, "_estimator_type", None),
     )
     client = get_client()
 
