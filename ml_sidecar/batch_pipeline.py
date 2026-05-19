@@ -547,6 +547,7 @@ def _load_or_train_model(
             if column != TARGET_COLUMN_NAME and not column.startswith("debug_")
         ]
         model = XGBRegressor()
+        model._estimator_type = "regressor"
         try:
             model.load_model(str(model_path))
             booster_feature_names = list(model.get_booster().feature_names or [])
@@ -568,6 +569,7 @@ def _load_or_train_model(
     start = time.time()
     model, feature_columns, importances, metrics = train_model(training_df)
     train_duration = time.time() - start
+    model._estimator_type = "regressor"
     model.save_model(str(model_path))
     return model, feature_columns, importances, metrics, train_duration, True, "trained_fresh"
 
