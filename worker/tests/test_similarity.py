@@ -41,7 +41,7 @@ def test_similarity_city_mismatch_gets_zero_address_weight():
 
     # All non-city features match perfectly.
     # Address(city) contributes 0.0 on mismatch with weight 3.5.
-    expected = 18.0 / 21.5
+    expected = 22.5 / 26.0
     assert similarity_score(target, cand) == pytest.approx(expected)
 
 
@@ -69,9 +69,22 @@ def test_similarity_amenity_weights_penalize_missing_beach_access_more_than_wifi
     target = _spec(amenities=["wifi", "kitchen", "beach_access"])
     missing_beach_access = _spec(amenities=["wifi", "kitchen"])
     missing_wifi = _spec(amenities=["kitchen", "beach_access"])
+    perfect = _spec(amenities=["wifi", "kitchen", "beach_access"])
 
     score_missing_beach = similarity_score(target, missing_beach_access)
     score_missing_wifi = similarity_score(target, missing_wifi)
+    score_perfect = similarity_score(target, perfect)
 
     assert score_missing_beach < score_missing_wifi
-    assert (score_missing_wifi - score_missing_beach) > 0.03
+    assert (score_missing_wifi - score_missing_beach) > 0.15
+    assert (score_perfect - score_missing_beach) > 0.20
+
+
+def test_similarity_missing_low_impact_amenity_has_tiny_effect():
+    target = _spec(amenities=["wifi", "kitchen", "beach_access"])
+    perfect = _spec(amenities=["wifi", "kitchen", "beach_access"])
+    missing_wifi = _spec(amenities=["kitchen", "beach_access"])
+
+    delta = similarity_score(target, perfect) - similarity_score(target, missing_wifi)
+    assert delta > 0.0
+    assert delta < 0.01

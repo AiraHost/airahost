@@ -28,10 +28,12 @@ Applied after filter tiers, before recommend_price().
 
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
 _AMENITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_AMENITY_SIMILARITY_WEIGHT: float = 6.0
 
 # Every amenity gets at least this baseline weight. We then override specific
 # amenities with larger weights where market pricing impact is typically higher.
-_AMENITY_BASE_WEIGHT: float = 1.0
+# Baseline is intentionally tiny so non-priority amenities barely move score.
+_AMENITY_BASE_WEIGHT: float = 0.05
 _AMENITY_ALIASES: Dict[str, str] = {
     "wi_fi": "wifi",
     "wireless_internet": "wifi",
@@ -57,28 +59,28 @@ _AMENITY_ALIASES: Dict[str, str] = {
     "ski_in_out": "ski_in_ski_out",
 }
 _AMENITY_WEIGHT_OVERRIDES: Dict[str, float] = {
-    # Premium location/value drivers.
-    "beach_access": 3.50,
-    "beachfront": 3.50,
-    "waterfront": 3.25,
-    "lake_access": 2.75,
-    "ski_in_ski_out": 2.50,
+    # Premium location/value drivers: these should dominate amenity matching.
+    "beach_access": 12.0,
+    "beachfront": 12.0,
+    "waterfront": 10.0,
+    "lake_access": 8.0,
+    "ski_in_ski_out": 8.0,
     # High-value leisure amenities.
-    "private_pool": 2.60,
-    "infinity_pool": 2.40,
-    "heated_pool": 2.20,
-    "pool": 2.00,
-    "private_hot_tub": 2.30,
-    "hot_tub": 1.90,
-    # Smaller pricing lift for widely expected but still meaningful amenities.
-    "guest_favorite": 1.60,
-    "ev_charger": 1.40,
-    "kitchen": 1.25,
-    "ac": 1.25,
-    "washer": 1.20,
-    "dryer": 1.20,
-    "free_parking": 1.15,
-    "pets_allowed": 1.15,
+    "private_pool": 7.0,
+    "infinity_pool": 6.0,
+    "heated_pool": 5.0,
+    "pool": 4.0,
+    "private_hot_tub": 6.0,
+    "hot_tub": 3.0,
+    # Keep common utilities relatively low-impact.
+    "guest_favorite": 2.0,
+    "ev_charger": 0.5,
+    "kitchen": 0.25,
+    "ac": 0.25,
+    "washer": 0.20,
+    "dryer": 0.20,
+    "free_parking": 0.15,
+    "pets_allowed": 0.15,
 }
 
 
@@ -158,7 +160,7 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
       - rating:        2.0  (tolerance 1.0)
       - reviews:       2.0  (log-scaled count similarity)
       - address(city): 3.5  (city match = 1.0, else 0.0)
-      - amenities:     1.5  (weighted Jaccard overlap; auxiliary role)
+      - amenities:     6.0  (weighted Jaccard overlap; premium-heavy)
 
     Property-type mismatch scores 0.0 (not 0.15) because the hard gate in
     filter_similar_candidates already blocks clear type conflicts; this
@@ -223,18 +225,18 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
     else:
         score += 0.35 * 3.0
 
-    # Amenity overlap: auxiliary signal (weight 1.5).
-    # Uses weighted overlap so premium amenities (for example beach access)
-    # affect similarity more than low-impact amenities.
+    # Amenity overlap: strong signal.
+    # Uses premium-heavy weighted overlap so high-value amenities
+    # (for example beach access) affect similarity far more than common ones.
     # If either side has no amenities, give partial credit rather than zero.
-    weight_sum += 1.5
+    weight_sum += _AMENITY_SIMILARITY_WEIGHT
     t_set = _normalize_amenity_set(list(target.amenities or []))
     c_set = _normalize_amenity_set(list(cand.amenities or []))
     if t_set and c_set:
         overlap = _weighted_amenity_overlap(t_set, c_set)
-        score += overlap * 1.5
+        score += overlap * _AMENITY_SIMILARITY_WEIGHT
     else:
-        score += 0.35 * 1.5
+        score += 0.35 * _AMENITY_SIMILARITY_WEIGHT
 
     # Address/city: strict binary signal requested.
     # City match gets full credit; all non-matches (including unknown) get zero.
