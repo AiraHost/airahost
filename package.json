@@ -14,6 +14,7 @@
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:public": "playwright test --project=chromium-public",
     "test:e2e:install": "playwright install chromium",
+    "worker:e2e:scraper": "python -m worker.e2e_scraper_smoke",
     "ml:sidecar": "python -m ml_sidecar.batch_pipeline",
     "ml:worker": "run_ml_sidecar_worker.cmd",
     "ml:data-quality": "run_ml_data_quality.cmd",

@@ -27,6 +27,96 @@ Applied after filter tiers, before recommend_price().
 # ── URL matching for preferred comparable ─────────────────────────
 
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
+_AMENITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Every amenity gets at least this baseline weight. We then override specific
+# amenities with larger weights where market pricing impact is typically higher.
+_AMENITY_BASE_WEIGHT: float = 1.0
+_AMENITY_ALIASES: Dict[str, str] = {
+    "wi_fi": "wifi",
+    "wireless_internet": "wifi",
+    "internet": "wifi",
+    "air_conditioning": "ac",
+    "central_air_conditioning": "ac",
+    "portable_air_conditioning": "ac",
+    "a_c": "ac",
+    "laundry": "washer",
+    "washing_machine": "washer",
+    "jacuzzi": "hot_tub",
+    "jacuzzi_tub": "hot_tub",
+    "free_parking_on_premises": "free_parking",
+    "parking_on_premises": "free_parking",
+    "allows_pets": "pets_allowed",
+    "pet_friendly": "pets_allowed",
+    "beach_view": "beach_access",
+    "lakefront": "lake_access",
+    "water_front": "waterfront",
+    "barbecue": "bbq",
+    "grill": "bbq",
+    "fitness": "gym",
+    "ski_in_out": "ski_in_ski_out",
+}
+_AMENITY_WEIGHT_OVERRIDES: Dict[str, float] = {
+    # Premium location/value drivers.
+    "beach_access": 3.50,
+    "beachfront": 3.50,
+    "waterfront": 3.25,
+    "lake_access": 2.75,
+    "ski_in_ski_out": 2.50,
+    # High-value leisure amenities.
+    "private_pool": 2.60,
+    "infinity_pool": 2.40,
+    "heated_pool": 2.20,
+    "pool": 2.00,
+    "private_hot_tub": 2.30,
+    "hot_tub": 1.90,
+    # Smaller pricing lift for widely expected but still meaningful amenities.
+    "guest_favorite": 1.60,
+    "ev_charger": 1.40,
+    "kitchen": 1.25,
+    "ac": 1.25,
+    "washer": 1.20,
+    "dryer": 1.20,
+    "free_parking": 1.15,
+    "pets_allowed": 1.15,
+}
+
+
+def _normalize_amenity_key(value: str) -> str:
+    tokens = _AMENITY_TOKEN_RE.findall(str(value or "").casefold())
+    if not tokens:
+        return ""
+    normalized = "_".join(tokens)
+    return _AMENITY_ALIASES.get(normalized, normalized)
+
+
+def _normalize_amenity_set(values: List[str]) -> set[str]:
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        key = _normalize_amenity_key(value)
+        if key:
+            normalized.add(key)
+    return normalized
+
+
+def _amenity_weight(amenity_key: str) -> float:
+    return _AMENITY_WEIGHT_OVERRIDES.get(amenity_key, _AMENITY_BASE_WEIGHT)
+
+
+def _weighted_amenity_overlap(target_set: set[str], cand_set: set[str]) -> float:
+    union = target_set | cand_set
+    if not union:
+        return 0.0
+
+    overlap = target_set & cand_set
+    overlap_weight = sum(_amenity_weight(name) for name in overlap)
+    union_weight = sum(_amenity_weight(name) for name in union)
+    if union_weight <= 0:
+        return 0.0
+
+    return max(0.0, min(1.0, overlap_weight / union_weight))
 
 
 def extract_airbnb_room_id(url: str) -> Optional[str]:
@@ -68,7 +158,7 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
       - rating:        2.0  (tolerance 1.0)
       - reviews:       2.0  (log-scaled count similarity)
       - address(city): 3.5  (city match = 1.0, else 0.0)
-      - amenities:     1.5  (Jaccard overlap; auxiliary role)
+      - amenities:     1.5  (weighted Jaccard overlap; auxiliary role)
 
     Property-type mismatch scores 0.0 (not 0.15) because the hard gate in
     filter_similar_candidates already blocks clear type conflicts; this
@@ -134,12 +224,14 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
         score += 0.35 * 3.0
 
     # Amenity overlap: auxiliary signal (weight 1.5).
+    # Uses weighted overlap so premium amenities (for example beach access)
+    # affect similarity more than low-impact amenities.
     # If either side has no amenities, give partial credit rather than zero.
     weight_sum += 1.5
-    t_set = set(target.amenities or [])
-    c_set = set(cand.amenities or [])
+    t_set = _normalize_amenity_set(list(target.amenities or []))
+    c_set = _normalize_amenity_set(list(cand.amenities or []))
     if t_set and c_set:
-        overlap = len(t_set & c_set) / max(1, len(t_set | c_set))
+        overlap = _weighted_amenity_overlap(t_set, c_set)
         score += overlap * 1.5
     else:
         score += 0.35 * 1.5

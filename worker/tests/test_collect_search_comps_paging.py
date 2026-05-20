@@ -152,8 +152,8 @@ def test_collect_search_comps_merges_offsets():
 
     urls = sorted([c.url for c in comps])
     assert qn == 1
-    assert "https://www.airbnb.ca/rooms/111" in urls
-    assert "https://www.airbnb.ca/rooms/222" in urls
+    assert "https://www.airbnb.com/rooms/111" in urls
+    assert "https://www.airbnb.com/rooms/222" in urls
 
 
 def test_collect_search_comps_can_enrich_baths_and_property_type_from_pdp():
@@ -229,7 +229,7 @@ def test_collect_search_comps_default_retries_two_night_when_one_night_empty():
     )
     assert qn == 2
     assert len(comps) == 1
-    assert comps[0].url == "https://www.airbnb.ca/rooms/444"
+    assert comps[0].url == "https://www.airbnb.com/rooms/444"
 
 
 def test_collect_search_comps_enables_map_search_with_bounds_when_center_and_radius_provided():

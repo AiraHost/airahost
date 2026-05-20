@@ -98,6 +98,24 @@ Press **Ctrl+C** to stop gracefully — the worker will finish the current job b
 
 ---
 
+### 6. Run scraper E2E smoke test (interactive + nightly)
+
+From repo root:
+
+```powershell
+python -m worker.e2e_scraper_smoke
+```
+
+Optional overrides:
+
+```powershell
+python -m worker.e2e_scraper_smoke --listing-url https://www.airbnb.ca/rooms/1408676238256636483 --nights 3
+```
+
+The command creates one synthetic interactive job and one synthetic nightly job,
+runs both through the real worker dispatcher, and exits non-zero when scraper
+health checks fail.
+
 ## Running as a Windows Service (24/7)
 
 ### Option A: NSSM (recommended)

@@ -232,7 +232,7 @@ def check_cdp_endpoint(cdp_url: str, timeout_seconds: float = 2.0) -> Tuple[bool
 
 
 _AIRBNB_HOST_RE = re.compile(
-    r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.com$", re.IGNORECASE
+    r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.(?:com|ca)$", re.IGNORECASE
 )
 _CANONICAL_AIRBNB_HOST = "www.airbnb.com"
 
@@ -241,8 +241,9 @@ def normalize_airbnb_url(url: str) -> str:
     """Normalize localized Airbnb domains to www.airbnb.com.
 
     Any host matching *.airbnb.com (e.g. zh-t.airbnb.com, zh.airbnb.com,
-    fr.airbnb.com) is rewritten to www.airbnb.com.  Path, query string, and
-    fragment are preserved verbatim.  Non-Airbnb URLs are returned unchanged.
+    fr.airbnb.com) or *.airbnb.ca is rewritten to www.airbnb.com.
+    Path, query string, and fragment are preserved verbatim.
+    Non-Airbnb URLs are returned unchanged.
     """
     if not url:
         return url

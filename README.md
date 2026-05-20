@@ -81,6 +81,22 @@ The worker scrapes Airbnb via Playwright CDP for real pricing data.
 
 See `worker/README.md` for 24/7 operation via NSSM.
 
+## Worker Scraper E2E Smoke Test
+
+Run one interactive and one nightly worker job end-to-end against the live scraper:
+
+```powershell
+npm run worker:e2e:scraper
+# or
+python -m worker.e2e_scraper_smoke
+```
+
+Notes:
+- Requires a running Chrome CDP session (`CDP_URL`, default `http://127.0.0.1:9222`)
+- Requires worker Supabase credentials (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`)
+- Default listing URL can be overridden with `WORKER_E2E_LISTING_URL`
+- The command exits non-zero when scraper health checks fail for either lane
+
 ## Setup ML Sidecar Worker
 
 ML forecasts are queued inside the existing `pricing_reports.result_summary`

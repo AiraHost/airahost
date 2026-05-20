@@ -18,7 +18,9 @@ class AirbnbClient:
 
     def __init__(self, config: dict):
         self.config = config
-        self.base_url = self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.ca").rstrip("/")
+        self.base_url = PlaywrightScraper._normalize_base_url(
+            self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.com")
+        )
         self.guest_favorite_only = bool(
             str(
                 self.config.get(

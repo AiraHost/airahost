@@ -37,6 +37,13 @@ class TestNormalizeAirbnbUrl:
         assert "checkout=2026-04-02" in result
         assert "adults=2" in result
 
+    def test_ca_host_rewritten(self):
+        url = "https://www.airbnb.ca/rooms/12345678?check_in=2026-04-01&check_out=2026-04-02"
+        result = normalize_airbnb_url(url)
+        assert result.startswith("https://www.airbnb.com/rooms/12345678")
+        assert "check_in=2026-04-01" in result
+        assert "check_out=2026-04-02" in result
+
     # ── Canonical host must pass through unchanged ─────────────────────────
 
     def test_www_host_unchanged(self):
@@ -111,6 +118,10 @@ class TestSafeDomainBase:
     def test_canonical_host_unchanged(self):
         from worker.scraper.target_extractor import safe_domain_base
         assert safe_domain_base("https://www.airbnb.com/rooms/1234") == "https://www.airbnb.com"
+
+    def test_ca_host_gives_canonical_origin(self):
+        from worker.scraper.target_extractor import safe_domain_base
+        assert safe_domain_base("https://www.airbnb.ca/rooms/1234") == "https://www.airbnb.com"
 
     def test_non_airbnb_host_preserved(self):
         from worker.scraper.target_extractor import safe_domain_base

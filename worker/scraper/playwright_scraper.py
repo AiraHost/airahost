@@ -25,10 +25,16 @@ class PlaywrightScraper:
     _tab_gate = None
     _tab_limit = 5
     _open_tab_count = 0
+    _CANONICAL_AIRBNB_HOST_RE = re.compile(
+        r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.com$",
+        re.IGNORECASE,
+    )
 
     def __init__(self, config: dict):
         self.config = config
-        self.base_url = self._normalize_base_url(self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.ca"))
+        self.base_url = self._normalize_base_url(self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.com"))
+        self.locale = str(self.config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA")
+        self.currency = str(self.config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "CAD")) or "CAD")
         self.session = requests.Session()
         self.captured_search_req = None
         self.captured_pdp_req = None
@@ -95,10 +101,32 @@ class PlaywrightScraper:
         try:
             parsed = urlparse(raw)
             if parsed.scheme in ("http", "https") and parsed.netloc:
+                host = str(parsed.hostname or "").strip().lower()
+                if re.fullmatch(r"(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.(?:com|ca)", host):
+                    return "https://www.airbnb.com"
                 return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         except Exception:
             pass
         return "https://www.airbnb.com"
+
+    @classmethod
+    def _is_canonical_airbnb_url(cls, raw_url: str) -> bool:
+        try:
+            host = str(urlparse(str(raw_url or "")).hostname or "").strip().lower()
+            return bool(host and cls._CANONICAL_AIRBNB_HOST_RE.fullmatch(host))
+        except Exception:
+            return False
+
+    def _build_pdp_listing_url(self, listing_id: str, checkin: str, checkout: str, adults: int) -> str:
+        params = {
+            "check_in": checkin,
+            "check_out": checkout,
+            "guests": adults,
+            "adults": adults,
+            "locale": self.locale,
+            "currency": self.currency,
+        }
+        return f"{self.base_url}/rooms/{listing_id}?{urlencode(params)}"
 
     @classmethod
     def _ensure_tab_gate(cls) -> None:
@@ -336,7 +364,24 @@ class PlaywrightScraper:
         required = ("url", "headers", "post_data")
         if not all(key in HARDCODED_STAYS_PDP_TEMPLATE for key in required):
             return False
-        self.captured_pdp_req = copy.deepcopy(HARDCODED_STAYS_PDP_TEMPLATE)
+        template = copy.deepcopy(HARDCODED_STAYS_PDP_TEMPLATE)
+        safe_base = self._normalize_base_url(self.base_url)
+        try:
+            raw_url = str(template.get("url") or "").strip()
+            if raw_url:
+                parsed = urlparse(raw_url)
+                query = f"?{parsed.query}" if parsed.query else ""
+                template["url"] = f"{safe_base}{parsed.path}{query}"
+            headers = template.get("headers")
+            if isinstance(headers, dict):
+                raw_referer = str(headers.get("referer") or "").strip()
+                if raw_referer:
+                    parsed_ref = urlparse(raw_referer)
+                    query_ref = f"?{parsed_ref.query}" if parsed_ref.query else ""
+                    headers["referer"] = f"{safe_base}{parsed_ref.path}{query_ref}"
+        except Exception:
+            pass
+        self.captured_pdp_req = template
         logger.info("Loaded hardcoded StaysPdpSections template.")
         return True
 
@@ -702,10 +747,13 @@ class PlaywrightScraper:
     return { extracted: null, candidates: [] };
   }
 
-  const preferred = candidates.filter(c => c.nightContext && !c.strikethrough).sort((a, b) => a.idx - b.idx);
-  const fallbackNonStrike = candidates.filter(c => !c.strikethrough).sort((a, b) => a.idx - b.idx);
-  const pool = preferred.length ? preferred : (fallbackNonStrike.length ? fallbackNonStrike : candidates.sort((a, b) => a.idx - b.idx));
-  const picked = pool[pool.length - 1];
+  const preferred = candidates
+    .filter(c => c.nightContext && !c.strikethrough)
+    .sort((a, b) => a.idx - b.idx);
+  if (!preferred.length) {
+    return { extracted: null, candidates: candidates.slice(0, 30), reason: 'no_nightly_context' };
+  }
+  const picked = preferred[preferred.length - 1];
   return {
     extracted: picked ? picked.priceText : null,
     candidates: candidates.slice(0, 30),
@@ -1299,6 +1347,7 @@ class PlaywrightScraper:
             terminal_reason: Optional[str] = None
             first_pdp_seen_at: Optional[float] = None
             challenged_at_nav: bool = False
+            noncanonical_pdp_host: bool = False
             response_tasks: set[asyncio.Task] = set()
 
             async def _handle_response(resp):
@@ -1343,9 +1392,11 @@ class PlaywrightScraper:
 
             page.on("response", _on_response)
 
-            listing_url = (
-                f"{self.base_url}/rooms/{listing_id}"
-                f"?check_in={checkin}&check_out={checkout}&guests={adults}&adults={adults}"
+            listing_url = self._build_pdp_listing_url(
+                listing_id=str(listing_id),
+                checkin=checkin,
+                checkout=checkout,
+                adults=adults,
             )
             logger.info("Playwright browser PDP navigate: %s", listing_url)
             nav = await self._navigate_and_capture_html(
@@ -1355,6 +1406,28 @@ class PlaywrightScraper:
                 timeout=35000,
                 label=f"pdp_{listing_id}",
             )
+            nav_final_url = str((nav or {}).get("final_url") or "")
+            if nav_final_url and not self._is_canonical_airbnb_url(nav_final_url):
+                logger.warning(
+                    "Playwright PDP redirected to non-canonical Airbnb host listing=%s final_url=%s; retrying canonical .com URL once",
+                    listing_id,
+                    nav_final_url,
+                )
+                nav = await self._navigate_and_capture_html(
+                    page,
+                    url=listing_url,
+                    wait_until="domcontentloaded",
+                    timeout=35000,
+                    label=f"pdp_{listing_id}_canonical_retry",
+                )
+                nav_final_url = str((nav or {}).get("final_url") or "")
+                if nav_final_url and not self._is_canonical_airbnb_url(nav_final_url):
+                    noncanonical_pdp_host = True
+                    logger.warning(
+                        "Playwright PDP still non-canonical after retry listing=%s final_url=%s; ignoring this host for nightly extraction",
+                        listing_id,
+                        nav_final_url,
+                    )
             logger.info(
                 "Playwright PDP nav result listing=%s final_url=%s status=%s html_len=%s",
                 listing_id,
@@ -1401,7 +1474,20 @@ class PlaywrightScraper:
             self._save_cached_state()
 
             has_api_price = bool(captured_data and self._pdp_booking_has_price(captured_data))
+            if noncanonical_pdp_host and has_api_price:
+                logger.warning(
+                    "Playwright PDP API price ignored due to non-canonical host listing=%s",
+                    listing_id,
+                )
+                has_api_price = False
+                captured_data = self._build_minimal_pdp_payload(None)
             if not has_api_price:
+                if noncanonical_pdp_host:
+                    logger.info(
+                        "Playwright PDP skipping DOM fallback on non-canonical host listing=%s",
+                        listing_id,
+                    )
+                    return (captured_status or 200), self._build_minimal_pdp_payload(None)
                 if captured_data is None:
                     logger.info(
                         "Playwright PDP API read missing listing=%s; switching to HTML read on same tab",

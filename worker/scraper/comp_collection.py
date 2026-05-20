@@ -30,7 +30,7 @@ def _build_debug_search_url(base_origin: str, overrides: Dict[str, Any]) -> str:
     """
     Build a human-readable Airbnb search URL for logging/diagnostics.
     """
-    base = str(base_origin or "https://www.airbnb.ca").rstrip("/")
+    base = safe_domain_base(str(base_origin or "https://www.airbnb.com")).rstrip("/")
     params: Dict[str, Any] = {}
     query = (
         overrides.get("query")
@@ -285,6 +285,7 @@ def collect_search_comps(
     prefer_two_night: bool = False,
     prefer_one_night: bool = False,
 ) -> Tuple[List[ListingSpec], int]:
+    base_origin = safe_domain_base(str(base_origin or "https://www.airbnb.com"))
     checkin_str = date_i.isoformat()
     base_offsets = page_offsets or [0]
     # Daily path usually calls with page_offsets=None (single-page).
