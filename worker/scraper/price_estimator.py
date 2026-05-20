@@ -350,6 +350,8 @@ def _build_daily_transparent_result(
         return f"{origin}/rooms/{m.group(2)}"
 
     comp_seen_dates: Dict[str, set[str]] = {}
+    pending_comp_price_by_date: Dict[str, Dict[str, float]] = {}
+    pending_comp_price_details: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for day_result in all_day_results:
         day_date = day_result.get("date")
@@ -385,6 +387,11 @@ def _build_daily_transparent_result(
                     "price_by_date_details": {},
                     "max_query_nights": qn,
                 }
+                if comp_id in pending_comp_price_by_date:
+                    comparable_index[comp_id]["price_by_date"].update(pending_comp_price_by_date[comp_id])
+                    comparable_index[comp_id]["price_by_date_details"].update(
+                        pending_comp_price_details.get(comp_id, {})
+                    )
             else:
                 item = comparable_index[comp_id]["item"]
                 for key in ("title", "propertyType", "location", "url"):
@@ -426,6 +433,10 @@ def _build_daily_transparent_result(
             _pool_url = str(pool_comp.get("url") or "").strip()
             _pool_title = str(pool_comp.get("title") or "").strip()
             if not _pool_url and not _pool_title:
+                if day_has_valid_sample and day_date and isinstance(price, (int, float)) and price > 0:
+                    _price_rounded = round(float(price), 2)
+                    pending_comp_price_by_date.setdefault(comp_id, {})[day_date] = _price_rounded
+                    pending_comp_price_details.setdefault(comp_id, {})[day_date] = {"price": _price_rounded}
                 continue
             if comp_id not in comparable_index:
                 comparable_index[comp_id] = {
@@ -443,6 +454,11 @@ def _build_daily_transparent_result(
                     "price_by_date_details": {},
                     "max_query_nights": int(pool_comp.get("queryNights") or 1),
                 }
+                if comp_id in pending_comp_price_by_date:
+                    comparable_index[comp_id]["price_by_date"].update(pending_comp_price_by_date[comp_id])
+                    comparable_index[comp_id]["price_by_date_details"].update(
+                        pending_comp_price_details.get(comp_id, {})
+                    )
             if day_has_valid_sample and day_date and isinstance(price, (int, float)) and price > 0:
                 _price_rounded = round(float(price), 2)
                 comparable_index[comp_id]["price_by_date"][day_date] = _price_rounded

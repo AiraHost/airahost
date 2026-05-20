@@ -2,6 +2,8 @@ param(
   [string]$ListingId = "",
   [string]$AirbnbRoomId = "1305899249107196055",
   [switch]$ForceNightly,
+  [switch]$AllNightly,
+  [switch]$ForceAllNightly,
   [switch]$SkipChrome,
   [switch]$SkipSchedule,
   [switch]$SkipDataQuality,
@@ -142,23 +144,33 @@ Start-StackWindow -Title "airahost nightly worker" -Command "`$env:WORKER_ENV='l
 Write-Host "Starting ML sidecar worker" -ForegroundColor Cyan
 Start-StackWindow -Title "airahost ml sidecar worker" -Command "python -m ml_sidecar.worker"
 
-if (-not $SkipSchedule -and ($ListingId -or $AirbnbRoomId)) {
+if (-not $SkipSchedule -and ($AllNightly -or $ForceAllNightly -or $ListingId -or $AirbnbRoomId)) {
   if (-not $internalSecret) {
     throw "INTERNAL_API_SECRET was not found in environment or .env files. Cannot schedule nightly."
+  }
+
+  if (($AllNightly -or $ForceAllNightly) -and $ListingId) {
+    throw "-AllNightly and -ForceAllNightly cannot be combined with -ListingId."
   }
 
   Write-Host "Waiting for frontend before scheduling nightly..." -ForegroundColor Cyan
   Wait-ForFrontend -Port $FrontendPort
 
   $body = @{}
-  if ($ListingId) {
+  if ($ForceAllNightly) {
+    $body.force = $true
+    $body.forceAll = $true
+    Write-Host "Scheduling forced nightly for all eligible saved listings" -ForegroundColor Cyan
+  } elseif ($AllNightly) {
+    Write-Host "Scheduling nightly for all eligible saved listings" -ForegroundColor Cyan
+  } elseif ($ListingId) {
     $body.listingId = $ListingId
     Write-Host "Scheduling nightly for saved listing $ListingId" -ForegroundColor Cyan
   } else {
     $body.airbnbRoomId = $AirbnbRoomId
     Write-Host "Scheduling nightly for Airbnb room $AirbnbRoomId" -ForegroundColor Cyan
   }
-  if ($ForceNightly) {
+  if ($ForceNightly -and -not $ForceAllNightly) {
     $body.force = $true
   }
 
@@ -181,10 +193,14 @@ if (-not $SkipSchedule -and ($ListingId -or $AirbnbRoomId)) {
     $reportArgs = ($reportIds | ForEach-Object { "--report-id `"$_`"" }) -join " "
     $dqJson = "ml_sidecar\reports\data_quality_latest.json"
     $dqCsv = "ml_sidecar\reports\data_quality_issues_latest.csv"
+    $dqHtml = "ml_sidecar\reports\nightly_quality_report.html"
     Write-Host "Starting data quality monitor for report(s): $($reportIds -join ', ')" -ForegroundColor Cyan
     Start-StackWindow `
       -Title "airahost data quality" `
-      -Command "python -m ml_sidecar.data_quality $reportArgs --wait-ready --wait-timeout-seconds 7200 --poll-seconds 20 --output `"$dqJson`" --issues-csv `"$dqCsv`"; Write-Host ''; Write-Host 'Data quality JSON: $dqJson'; Write-Host 'Issues CSV: $dqCsv'"
+      -Command "python -m ml_sidecar.data_quality $reportArgs --wait-ready --wait-timeout-seconds 7200 --poll-seconds 20 --output `"$dqJson`" --issues-csv `"$dqCsv`"; python .\ml_sidecar\quality_report_html.py --source supabase; Write-Host ''; Write-Host 'Data quality JSON: $dqJson'; Write-Host 'Issues CSV: $dqCsv'; Write-Host 'Quality HTML: $dqHtml'"
+  } elseif ($SkipDataQuality -and $reportIds.Count -gt 0) {
+    Write-Host "Generating quality HTML from Supabase nightly state because -SkipDataQuality was set." -ForegroundColor Yellow
+    python .\ml_sidecar\quality_report_html.py --source supabase
   } elseif (-not $SkipDataQuality) {
     Write-Host "No scheduled report id was returned, so data quality was not started." -ForegroundColor Yellow
   }

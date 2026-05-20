@@ -8,7 +8,10 @@ import { HowWeEstimated } from "@/components/report/HowWeEstimated";
 import { ComparableListingsSection } from "@/components/report/ComparableListingsSection";
 import { PricingHeatmap } from "@/components/dashboard/PricingHeatmap";
 import { getSupabaseBrowser } from "@/lib/supabase";
+import { normalizeMlForecastRunRow } from "@/lib/mlSidecar";
+import type { MlForecastRun } from "@/lib/mlSidecar";
 import type {
+  CalendarDay,
   PricingReport,
   TargetSpec,
   QueryCriteria,
@@ -347,6 +350,26 @@ interface ReportApplyResponse {
   nightsSimulatedSuccess?: number;
 }
 
+function formatPrice(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `$${Math.round(value).toLocaleString()}`
+    : "-";
+}
+
+function getCalendarSuggestedPrice(day: CalendarDay | null | undefined): number | null {
+  if (!day) return null;
+  const price = day.recommendedDailyPrice ?? day.basePrice;
+  return typeof price === "number" && Number.isFinite(price) ? price : null;
+}
+
+function getMlForecastFromSummary(summary: PricingReport["resultSummary"] | null | undefined): MlForecastRun | null {
+  const raw = (summary as (PricingReport["resultSummary"] & {
+    mlForecast?: Record<string, unknown> | null;
+  }) | null | undefined)?.mlForecast;
+  if (!raw) return null;
+  return normalizeMlForecastRunRow(raw);
+}
+
 function getFriendlyReportError(message: string | null | undefined) {
   if (!message) {
     return "We couldn't generate your pricing report. Please try again.";
@@ -398,12 +421,78 @@ export default function ResultsPage({
 
   // Date the user clicked on the heatmap (null = no selection).
   const [clickedDate, setClickedDate] = useState<string | null>(null);
+  const [mlWeightPct, setMlWeightPct] = useState(0);
+
+  function updateMlWeightPct(value: number) {
+    if (!Number.isFinite(value)) return;
+    setMlWeightPct(Math.min(100, Math.max(0, Math.round(value))));
+  }
 
   // Reset the clicked date whenever the report changes.
   const reportId = report?.id ?? null;
   useEffect(() => { setClickedDate(null); }, [reportId]);
 
   const snappedDate = clickedDate;
+
+  const mlForecastRun = useMemo(
+    () => getMlForecastFromSummary(report?.resultSummary),
+    [report?.resultSummary]
+  );
+
+  const mlPredictionsByDate = useMemo(() => {
+    const byDate = new Map<string, number>();
+    for (const prediction of mlForecastRun?.predictions ?? []) {
+      if (
+        typeof prediction.predictedPrice === "number" &&
+        Number.isFinite(prediction.predictedPrice)
+      ) {
+        byDate.set(prediction.date, prediction.predictedPrice);
+      }
+    }
+    return byDate;
+  }, [mlForecastRun]);
+
+  const mlWeight = mlWeightPct / 100;
+  const adjustedCalendar = useMemo(() => {
+    const calendar = report?.resultCalendar ?? [];
+    if (calendar.length === 0 || mlWeightPct === 0 || mlPredictionsByDate.size === 0) {
+      return calendar;
+    }
+
+    return calendar.map((day) => {
+      const suggestedPrice = getCalendarSuggestedPrice(day);
+      const mlPrice = mlPredictionsByDate.get(day.date);
+      if (
+        typeof suggestedPrice !== "number" ||
+        typeof mlPrice !== "number"
+      ) {
+        return day;
+      }
+      const adjustedPrice = Math.round(
+        suggestedPrice * (1 - mlWeight) + mlPrice * mlWeight
+      );
+      return {
+        ...day,
+        recommendedDailyPrice: adjustedPrice,
+      };
+    });
+  }, [report?.resultCalendar, mlPredictionsByDate, mlWeight, mlWeightPct]);
+
+  const priceBlendPreview = useMemo(() => {
+    const firstDay = report?.resultCalendar?.[0] ?? null;
+    const suggestedPrice = getCalendarSuggestedPrice(firstDay);
+    const mlPrice = firstDay ? mlPredictionsByDate.get(firstDay.date) ?? null : null;
+    const adjustedPrice =
+      typeof suggestedPrice === "number" && typeof mlPrice === "number"
+        ? Math.round(suggestedPrice * (1 - mlWeight) + mlPrice * mlWeight)
+        : suggestedPrice;
+    return {
+      date: firstDay?.date ?? null,
+      suggestedPrice,
+      mlPrice,
+      adjustedPrice,
+    };
+  }, [report?.resultCalendar, mlPredictionsByDate, mlWeight]);
 
   const contextualBenchmarkInfo = useMemo((): BenchmarkInfo | null => {
     return (report?.benchmarkInfo ?? report?.resultSummary?.benchmarkInfo ?? null) as BenchmarkInfo | null;
@@ -937,7 +1026,7 @@ export default function ResultsPage({
       {(report.resultCalendar ?? []).length > 0 && (
         <div className="mb-6 space-y-3">
           <PricingHeatmap
-            calendar={report.resultCalendar ?? []}
+            calendar={adjustedCalendar}
             selectable={
               isSignedIn === true &&
               autoApplyConfigured === true &&
@@ -949,6 +1038,85 @@ export default function ResultsPage({
             onFocusDate={(date) => setClickedDate(date)}
             focusedDate={clickedDate}
           />
+          {mlForecastRun && (
+            <div className="rounded-2xl border border-sky-100 bg-white px-4 py-4 sm:px-6">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-foreground/80">
+                    Calendar price blend
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-foreground/45">
+                    Adjusted price = suggested price x (1 - ML weight) + ML price x ML weight.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <span className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 font-medium text-foreground/55">
+                    Suggested {formatPrice(priceBlendPreview.suggestedPrice)}
+                  </span>
+                  <span className="rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 font-medium text-sky-700">
+                    ML {formatPrice(priceBlendPreview.mlPrice)}
+                  </span>
+                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700">
+                    Calendar {formatPrice(priceBlendPreview.adjustedPrice)}
+                  </span>
+                </div>
+              </div>
+
+              {mlPredictionsByDate.size > 0 ? (
+                <div className="mt-4">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <label
+                      htmlFor="ml-price-weight"
+                      className="text-xs font-semibold uppercase tracking-[0.14em] text-foreground/35"
+                    >
+                      ML weight
+                    </label>
+                    <label className="flex items-center gap-1.5 text-sm font-semibold text-foreground/70">
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={mlWeightPct}
+                        onChange={(event) => updateMlWeightPct(Number(event.target.value))}
+                        className="h-8 w-16 rounded-lg border border-gray-200 bg-gray-50 px-2 text-right text-sm font-semibold text-foreground/70 outline-none transition-colors focus:border-sky-300 focus:bg-white"
+                        aria-label="ML weight percentage"
+                      />
+                      <span>%</span>
+                    </label>
+                  </div>
+                  <input
+                    id="ml-price-weight"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value={mlWeightPct}
+                    onChange={(event) => updateMlWeightPct(Number(event.target.value))}
+                    className="h-2 w-full accent-sky-700"
+                  />
+                  <div className="mt-2 flex justify-between text-[11px] text-foreground/35">
+                    <span>Use suggested price</span>
+                    <span>Use ML price</span>
+                  </div>
+                  {priceBlendPreview.date && (
+                    <p className="mt-3 text-xs text-foreground/45">
+                      Previewing {priceBlendPreview.date}. Dates without an ML prediction keep the suggested price.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="mt-4 rounded-xl border border-sky-100 bg-sky-50/60 px-4 py-3">
+                  <p className="text-sm font-medium text-sky-800">
+                    ML forecast is {mlForecastRun.status}.
+                  </p>
+                  <p className="mt-1 text-xs text-sky-700/75">
+                    The slider will become available after the forecast writes daily predicted prices.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
           {(autoApplyError || autoApplySuccess) && (
             <div className="rounded-xl border border-gray-200 bg-white px-4 py-3">
               {autoApplyError && (

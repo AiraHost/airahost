@@ -31,6 +31,10 @@ from ml_sidecar.model import (
 )
 from ml_sidecar.supabase_client import get_client
 
+# Keep direct uses of XGBRegressor in this module compatible with sklearn
+# wrappers that expect the estimator type marker during load/save.
+XGBRegressor._estimator_type = "regressor"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = PROJECT_ROOT / "ml_sidecar" / "reports"
 
@@ -547,6 +551,7 @@ def _load_or_train_model(
             if column != TARGET_COLUMN_NAME and not column.startswith("debug_")
         ]
         model = XGBRegressor()
+        model._estimator_type = "regressor"
         try:
             model.load_model(str(model_path))
             booster_feature_names = list(model.get_booster().feature_names or [])
@@ -568,6 +573,7 @@ def _load_or_train_model(
     start = time.time()
     model, feature_columns, importances, metrics = train_model(training_df)
     train_duration = time.time() - start
+    model._estimator_type = "regressor"
     model.save_model(str(model_path))
     return model, feature_columns, importances, metrics, train_duration, True, "trained_fresh"
 

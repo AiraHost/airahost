@@ -133,6 +133,7 @@ export async function POST(req: NextRequest) {
   let filterIds: string[] | null = null; // null = schedule all (default)
   let filterAirbnbRoomId: string | null = null;
   let forceDedup = false;                 // bypass 23-hour dedup — local-only
+  let forceAllDedup = false;
   const rawBody = (await req.text()).trim();
 
   if (rawBody.length > 0) {
@@ -183,11 +184,25 @@ export async function POST(req: NextRequest) {
       }
 
       // ── force: true — local-dev dedup bypass ───────────────────────────────
+      if (b.forceAll === true && b.force !== true) {
+        return NextResponse.json(
+          { error: "forceAll:true requires force:true" },
+          { status: 400 }
+        );
+      }
+      if (b.forceAll === true && (filterIds !== null || filterAirbnbRoomId !== null)) {
+        return NextResponse.json(
+          { error: "forceAll:true cannot be combined with listingId, listingIds, or airbnbRoomId" },
+          { status: 400 }
+        );
+      }
+
       if (b.force === true) {
-        // Must have a listing filter — force on all listings is never allowed.
-        if (filterIds === null && filterAirbnbRoomId === null) {
+        forceAllDedup = b.forceAll === true;
+        // Must have a listing filter, or an explicit local all-listing force.
+        if (filterIds === null && filterAirbnbRoomId === null && !forceAllDedup) {
           return NextResponse.json(
-            { error: "force:true requires listingId, listingIds, or airbnbRoomId — cannot force-run all listings" },
+            { error: "force:true requires listingId, listingIds, airbnbRoomId, or forceAll:true" },
             { status: 400 }
           );
         }
@@ -226,7 +241,7 @@ export async function POST(req: NextRequest) {
     (filterIds ? ` filter=partial listingIds=${filterIds.join(",")}` : "") +
     (filterAirbnbRoomId ? ` filter=airbnbRoomId(${filterAirbnbRoomId})` : "") +
     (!isFiltered ? " filter=all" : "") +
-    (forceDedup ? " force=true (dedup bypassed)" : "")
+    (forceDedup ? ` force=true (dedup bypassed${forceAllDedup ? ", all eligible listings" : ""})` : "")
   );
 
   // ── Fetch listings (all, or filtered subset) ─────────────────────────────
