@@ -8,7 +8,7 @@ import random
 import re
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlparse
 
 import requests
@@ -612,6 +612,106 @@ class PlaywrightScraper:
             if ok and isinstance(cur, list):
                 return [x for x in cur if isinstance(x, dict)]
         return []
+
+    @staticmethod
+    def _extract_pdp_amenities_from_rendered_html(rendered_html: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse rendered PDP HTML and return data.node.pdpPresentation.amenities when present.
+
+        This is a fallback for cases where the captured StaysPdpSections response only
+        includes booking/policies blocks and omits AMENITIES_* sections.
+        """
+        if not isinstance(rendered_html, str) or not rendered_html.strip():
+            return None
+
+        script_blobs = re.findall(
+            r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+            rendered_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not script_blobs:
+            return None
+
+        for blob in script_blobs:
+            text = str(blob or "").strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                continue
+
+            stack: List[Any] = [parsed]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    amenities: Optional[Dict[str, Any]] = None
+                    data_node = cur.get("data")
+                    if isinstance(data_node, dict):
+                        node = data_node.get("node")
+                        if isinstance(node, dict):
+                            pdp_presentation = node.get("pdpPresentation")
+                            if isinstance(pdp_presentation, dict):
+                                raw_amenities = pdp_presentation.get("amenities")
+                                if isinstance(raw_amenities, dict):
+                                    amenities = raw_amenities
+                    if isinstance(amenities, dict):
+                        preview = amenities.get("previewAmenitiesGroups")
+                        see_all = amenities.get("seeAllAmenitiesGroups")
+                        if isinstance(preview, list) or isinstance(see_all, list):
+                            return amenities
+                    for value in cur.values():
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(cur, list):
+                    for value in cur:
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+
+        return None
+
+    @staticmethod
+    def _pdp_payload_has_amenity_groups(response_data: Dict[str, Any]) -> bool:
+        if not isinstance(response_data, dict):
+            return False
+
+        def _has_groups(node: Any) -> bool:
+            if isinstance(node, dict):
+                for key in ("previewAmenitiesGroups", "seeAllAmenitiesGroups", "amenityGroups"):
+                    value = node.get(key)
+                    if isinstance(value, list) and len(value) > 0:
+                        return True
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and _has_groups(value):
+                        return True
+            elif isinstance(node, list):
+                for value in node:
+                    if isinstance(value, (dict, list)) and _has_groups(value):
+                        return True
+            return False
+
+        return _has_groups(response_data)
+
+    @staticmethod
+    def _inject_pdp_presentation_amenities(
+        response_data: Dict[str, Any],
+        amenities_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(response_data, dict) or not isinstance(amenities_payload, dict):
+            return response_data
+
+        data_node = response_data.setdefault("data", {})
+        if not isinstance(data_node, dict):
+            return response_data
+        node = data_node.setdefault("node", {})
+        if not isinstance(node, dict):
+            return response_data
+        pdp_presentation = node.setdefault("pdpPresentation", {})
+        if not isinstance(pdp_presentation, dict):
+            return response_data
+
+        pdp_presentation["amenities"] = amenities_payload
+        return response_data
 
     @classmethod
     def _pdp_booking_has_price(cls, response_data: Dict[str, Any]) -> bool:
@@ -1406,6 +1506,7 @@ class PlaywrightScraper:
                 timeout=35000,
                 label=f"pdp_{listing_id}",
             )
+            rendered_html = str((nav or {}).get("html") or "")
             nav_final_url = str((nav or {}).get("final_url") or "")
             if nav_final_url and not self._is_canonical_airbnb_url(nav_final_url):
                 logger.warning(
@@ -1567,6 +1668,22 @@ class PlaywrightScraper:
                     listing_id,
                 )
                 return (captured_status or 200), self._build_minimal_pdp_payload(None)
+
+            # Amenities fallback: some challenge/degraded PDP responses include only
+            # booking + policy blocks (no amenity groups), while rendered HTML still
+            # carries amenities under data.node.pdpPresentation.amenities.
+            if not self._pdp_payload_has_amenity_groups(captured_data):
+                html_amenities = self._extract_pdp_amenities_from_rendered_html(rendered_html)
+                if isinstance(html_amenities, dict):
+                    self._inject_pdp_presentation_amenities(captured_data, html_amenities)
+                    preview_groups = html_amenities.get("previewAmenitiesGroups")
+                    see_all_groups = html_amenities.get("seeAllAmenitiesGroups")
+                    logger.info(
+                        "Playwright PDP amenities fallback injected listing=%s preview_groups=%s see_all_groups=%s",
+                        listing_id,
+                        len(preview_groups) if isinstance(preview_groups, list) else 0,
+                        len(see_all_groups) if isinstance(see_all_groups, list) else 0,
+                    )
             return (captured_status or 200), captured_data
         finally:
             await self._close_capped_page(page)
