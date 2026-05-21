@@ -16,16 +16,40 @@ export default function ResetPasswordPage() {
   const [sessionReady, setSessionReady] = useState<boolean | null>(null);
 
   useEffect(() => {
-    // The session is established by /auth/callback before redirecting here.
-    // If there's no session, the link was invalid or expired.
+    // Supports both direct recovery links and callback-based flows.
     const supabase = getSupabaseBrowser();
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    const init = async () => {
+      const url = new URL(window.location.href);
+      const code = url.searchParams.get("code");
+      const tokenHash = url.searchParams.get("token_hash");
+      const type = url.searchParams.get("type");
+
+      if (code) {
+        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code);
+        if (exchangeError) {
+          // Some recovery links arrive as ?code=... without type.
+          // In that case, code may actually be a recovery token hash.
+          await supabase.auth.verifyOtp({
+            token_hash: code,
+            type: "recovery",
+          });
+        }
+      } else if (tokenHash && type) {
+        await supabase.auth.verifyOtp({
+          token_hash: tokenHash,
+          type: type as "recovery",
+        });
+      }
+
+      const { data: { session } } = await supabase.auth.getSession();
       if (!session) {
         router.replace("/login?error=auth");
         return;
       }
       setSessionReady(true);
-    });
+    };
+
+    init();
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {

@@ -374,7 +374,6 @@ def _extract_target_spec_via_playwright_bridge(client: Any, listing_url: str) ->
     if not hasattr(client, "_get_playwright_scraper"):
         return None, ["Browser HTML extraction failed: missing Playwright scraper bridge on client"]
 
-    warnings: List[str] = []
     scraper = client._get_playwright_scraper()
     context = None
     page = None
@@ -402,6 +401,14 @@ def _extract_target_spec_via_playwright_bridge(client: Any, listing_url: str) ->
                 scraper._save_cached_state()
             except Exception:
                 pass
+        if page is not None:
+            try:
+                scraper._run_async(
+                    scraper._close_capped_page(page),
+                    op_name="target_extractor.close_capped_page",
+                )
+            except Exception:
+                pass
 
 
 def _human_pause_sync_page(page: Any, min_ms: int = 250, max_ms: int = 1200) -> None:
@@ -413,14 +420,6 @@ def _human_pause_sync_page(page: Any, min_ms: int = 250, max_ms: int = 1200) -> 
             time.sleep(timeout_ms / 1000.0)
         except Exception:
             pass
-        if page is not None:
-            try:
-                scraper._run_async(
-                    scraper._close_capped_page(page),
-                    op_name="target_extractor.close_capped_page",
-                )
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
