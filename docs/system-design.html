@@ -308,7 +308,7 @@
 <main class="main-content">
 
 <h1>AiraHost — 系統設計與定價架構</h1>
-<p style="color:var(--muted);font-size:.9rem;margin-bottom:0">內部工程參考文件 · 反映目前程式碼庫狀態 · 2026-04-21 更新</p>
+<p style="color:var(--muted);font-size:.9rem;margin-bottom:0">內部工程參考文件 · 反映目前程式碼庫狀態 · 2026-05-21 更新</p>
 
 <!-- Summary card -->
 <div class="summary-card">
@@ -690,7 +690,7 @@
   <tr><td>來源</td><td><code>POST /api/reports</code>、<code>/rerun</code></td><td><code>POST /api/internal/nightly/schedule</code></td></tr>
   <tr><td>日期範圍</td><td>使用者自訂（1–30 天）</td><td>固定 30 天：明天 → 明天 +29</td></tr>
   <tr><td>執行時的輸入</td><td>排隊時凍結（快照）</td><td>從 <code>saved_listings</code> 即時重讀</td></tr>
-  <tr><td>快取命中</td><td>是（24h TTL）</td><td>否（永遠 <code>force_rerun: true</code>）</td></tr>
+  <tr><td>快取命中</td><td>是（24h TTL）</td><td>可命中（先 live-reload 後重算 key；<code>force_rerun</code> 或 URL pre-cache bypass 時略過）</td></tr>
   <tr><td>爬取預算</td><td>最多 ~16 / 30 天取樣</td><td>分層：~14 天觀察，其餘插值</td></tr>
   <tr><td>儀表板看板</td><td>永遠不成為真實資料來源</td><td>status=ready 後成為看板資料</td></tr>
   <tr><td>出現於歷史記錄</td><td>是</td><td>是（透過 <code>recentReports</code>）</td></tr>
@@ -1328,7 +1328,7 @@ report_type ≠ "forecast_snapshot"</code></pre>
 <h2>17. 快取、重用與觀察說明</h2>
 
 <h3>快取（即時報表）</h3>
-<p>即時報表有 24 小時快取 TTL。若 24 小時內存在匹配 <code>cache_key</code> 且 <code>status=ready</code> 的 <code>pricing_reports</code> 列，API 可直接傳回而無需排入新任務（<code>core_version</code> = <code>cache-hit</code>）。夜間報表永遠略過快取（<code>result_core_debug</code> 中的 <code>force_rerun: true</code>）。</p>
+<p><code>pricing_cache</code> TTL 為 24 小時。Worker 執行時會以 <code>cache_key</code> 查詢快取；若命中，仍會重新擷取目標房源即時價格（live price 是時間敏感資料）。快取略過條件是 URL 模式的 pre-cache bypass（需先抓 target spec）或明確 <code>result_core_debug.force_rerun=true</code>。夜間任務不強制略過快取，但會先做 live-reload 再重算 cache key，確保查詢的是實際執行輸入。</p>
 
 <h3>Phase 6A — 觀察優先重用（僅條件模式）</h3>
 <p>爬取 Airbnb 前，Worker 檢查 <code>target_price_observations</code> 是否有涵蓋所請求日期視窗的最新資料。此機制僅在以下條件下啟用：</p>
@@ -1767,7 +1767,7 @@ claim_pricing_report(
 <h3>逾時任務回收</h3>
 <div class="callout callout-current">
   <strong>目前行為</strong>
-  若一個 <code>running</code> 任務的 <code>worker_heartbeat_at</code> 超過 15 分鐘沒有更新（Worker 崩潰），下一次 <code>claim_pricing_report()</code> 呼叫會自動認領並重試。<code>worker_attempts</code> 會遞增。達到 3 次嘗試後，任務狀態保持 <code>running</code> 但 Worker 不再處理（需手動介入或等待清理）。
+  若一個 <code>running</code> 任務的 <code>worker_heartbeat_at</code> 超過 15 分鐘沒有更新（Worker 崩潰），下一次 <code>claim_pricing_report()</code> 會自動回收並重試，且 <code>worker_attempts</code> 會遞增。主迴圈在認領後檢查嘗試次數：當 <code>attempts &gt; MAX_ATTEMPTS(3)</code> 時，會立即把該任務標記為 <code>error</code>（不是停留在 <code>running</code>）。
 </div>
 
 <h3>複合索引（支援佇列掃描）</h3>
@@ -1778,7 +1778,11 @@ CREATE INDEX idx_reports_lane_env_status_created
 -- 查詢模式：job_lane=? AND target_env=? AND status IN ('queued','running')
 -- 此索引使佇列掃描成為 Index Scan 而非 Seq Scan</code></pre>
 
-<div class="sources">來源：supabase/migrations/002、012、worker/main.py</div>
+<h3>Auto-Apply 佇列（<code>price_update_jobs</code>）</h3>
+<p>除了 <code>pricing_reports</code> 主佇列外，Worker 也會輪詢 <code>price_update_jobs</code>。當沒有可認領的 pricing 任務時，主迴圈會嘗試 <code>claim_price_update_job()</code>，將手動套用價格請求送進 Airbnb GraphQL 寫入（<code>assign_prices_calendar</code>）。</p>
+<p><code>price_update_jobs</code> 同樣使用 <code>queued/running/ready/error</code> + <code>worker_claim_token</code> + <code>worker_heartbeat_at</code>，並有獨立 stale reclaim 與 retry 上限（<code>AUTO_APPLY_MAX_ATTEMPTS</code>）。</p>
+
+<div class="sources">來源：supabase/migrations/002、012、021、worker/main.py、worker/auto_apply_worker.py、worker/core/auto_price_assignment.py</div>
 </section>
 
 <!-- ─────────────────────────────────────────────── -->
@@ -2082,7 +2086,10 @@ CREATE INDEX idx_reports_lane_env_status_created
 <h4>020 — Co-host 驗證狀態機</h4>
 <p>以六個狀態值的文字欄位 <code>auto_apply_cohost_status</code> 取代原本的布林值，明確區分「使用者說已完成」（user_confirmed）與「系統已確認」（verified）。<strong>只有</strong> <code>verified</code> 狀態才應解鎖 Auto-Apply 執行。舊版 <code>auto_apply_cohost_ready</code> 欄位保留一個周期以向後相容，並附有棄用 COMMENT，將在未來 migration 中刪除。</p>
 
-<div class="sources">來源：supabase/migrations/001–020（全部 migration 檔案）</div>
+<h4>021 — Auto-Apply 執行佇列（正式）</h4>
+<p>新增 <code>price_update_jobs</code> 與 <code>claim_price_update_job()</code>。這是獨立於 <code>pricing_reports</code> 的寫回佇列，供 Worker 將推薦日曆實際寫入 Airbnb。主 Worker 在 pricing queue 閒置時會順序處理此佇列。</p>
+
+<div class="sources">來源：supabase/migrations/001–021（全部 migration 檔案）</div>
 </section>
 
 <!-- ═══════════════════════════════════════════════════
@@ -2093,13 +2100,13 @@ CREATE INDEX idx_reports_lane_env_status_created
 <h2>26. ML 總覽</h2>
 
 <div class="callout callout-infer">
-  <strong>Inference — 目前 ML 已有兩層角色</strong>
-  <code>ml/</code> 仍然保留本地 batch / research pipeline，但現在也被 Worker runtime 直接 import。也就是說，同一套模型同時服務兩個場景：本地 full pipeline 產出驗證 artifact；正式 <code>live_analysis</code> report 在 ready 前可選擇套用 ML overlay，覆寫 <code>recommendedDailyPrice</code>。
+  <strong>Inference — 目前 ML 是「側車推論」而非主定價引擎</strong>
+  正式定價仍由 market-engine 產生並寫入 <code>recommendedDailyPrice</code>。ML 透過 sidecar 以非同步方式處理，狀態與預測寫回 <code>pricing_reports.result_summary.mlForecast</code>，不直接覆寫主價格欄位。
 </div>
 
 <div class="callout callout-current">
-  <strong>Current Behavior — ML 已能進入正式 report</strong>
-  主線上線價格欄位仍是 <code>CalendarDay.recommendedDailyPrice</code>，但 Worker 會在 fresh path 與 cache-hit path 嘗試套用 ML overlay。成功時會同步寫入 <code>summary.mlPricing</code>，並把 <code>coreVersion</code> 補上 <code>+ml</code>；失敗時則保留 market-engine 價格。
+  <strong>Current Behavior — Nightly 會自動排入 ML queue</strong>
+  Nightly report 在 <code>complete_job()</code> 後可自動寫入 <code>mlForecast.status="queued"</code>（受 <code>NIGHTLY_QUEUE_ML_FORECAST</code> 控制）。<code>ml_sidecar.worker</code> 輪詢 queued payload，完成後寫回 <code>ready</code> / <code>error</code> 與預測結果。
 </div>
 
 <div class="diagram-box">
@@ -2117,12 +2124,12 @@ CREATE INDEX idx_reports_lane_env_status_created
         <tr>
           <td>觸發方式</td>
           <td>使用者按鈕 / 夜間 Worker 排程</td>
-          <td>手動執行腳本 / npm run ml:*</td>
+          <td>nightly 完成後自動 queue（<code>mlForecast.status=queued</code>）或手動執行腳本</td>
         </tr>
         <tr>
           <td>語言 / runtime</td>
           <td>Python Worker（<code>worker/main.py</code>）</td>
-          <td>Python ML scripts（<code>ml/</code>）</td>
+          <td>Python ML sidecar（<code>ml_sidecar/worker.py</code>）+ 批次腳本</td>
         </tr>
         <tr>
           <td>核心演算法</td>
@@ -2132,149 +2139,83 @@ CREATE INDEX idx_reports_lane_env_status_created
         <tr>
           <td>輸出目的地</td>
           <td><code>pricing_reports</code>（Supabase）→ 儀表板顯示</td>
-          <td><code>ml/reports/*.csv / .json</code>（本地檔案）</td>
+          <td><code>pricing_reports.result_summary.mlForecast</code>（queue + 結果）與 <code>ml_sidecar/reports/*</code>（本地 artifact）</td>
         </tr>
         <tr>
           <td>結果是否進儀表板</td>
           <td><span class="badge badge-green">是</span></td>
-          <td><span class="badge badge-gray">否（目前）</span></td>
+          <td><span class="badge badge-blue">部分是</span>（透過 listing ML API 顯示狀態與預測）</td>
         </tr>
         <tr>
           <td>驗證方式</td>
           <td>定性審查 + 回測比較</td>
-          <td>TimeSeriesSplit CV + holdout backtest + 時間切分回測</td>
+          <td>TimeSeriesSplit / KFold CV + data quality 檢查</td>
         </tr>
         <tr>
           <td>主要定位</td>
           <td>上線產品</td>
-          <td>預測研究 / 批次分析 / 未來整合基礎</td>
+          <td>nightly 自動重訓 / 預測側車 + 批次研究驗證</td>
         </tr>
       </tbody>
     </table>
   </div>
 </div>
 
-<p>ML pipeline 由以下四支腳本組成（詳見後續各節）：</p>
+<p>目前 runtime 入口為 <code>ml_sidecar.worker</code>（讀寫 <code>mlForecast</code> payload）。批次研究與離線分析仍可用既有 ML 腳本流程（詳見後續各節）。</p>
 <ul>
-  <li><code>ml/batch_pipeline.py</code> — 推薦入口，一鍵完成訓練 + 預測 + 產物輸出</li>
-  <li><code>ml/run_forecast.py</code> — 較低階腳本，適合 debug 單一訓練步驟</li>
-  <li><code>ml/backtest.py</code> — holdout 回測 + 時間切分回測</li>
-  <li><code>ml/compare_predictions.py</code> — 比較兩個日期預測差異的驅動因子</li>
+  <li><code>ml_sidecar/worker.py</code> — 佇列 worker（<code>queued → running → ready|error</code>）</li>
+  <li><code>ml_sidecar/batch_pipeline.py</code> — 訓練 + 30 天預測 + manifest 產物</li>
+  <li><code>ml_sidecar/data_quality.py</code> — nightly 後資料品質檢查</li>
+  <li><code>ml_sidecar/model.py</code> — 模型訓練、CV、推論與 guardrail 核心邏輯</li>
 </ul>
 
-<div class="sources">來源：ml/README.md, ml/batch_pipeline.py, ml/run_forecast.py, worker/main.py</div>
+<div class="sources">來源：worker/main.py、worker/core/db.py、ml_sidecar/worker.py、ml_sidecar/data_quality.py</div>
 </section>
 
 <section id="s27">
 <h2>27. ML 輸入與資料來源</h2>
 
-<p>ML pipeline 透過 <code>ml/supabase_client.py</code> 以 service-role key 連線 Supabase，完整讀取訓練所需資料。讀取不受 RLS 限制。</p>
-
-<div class="callout callout-current">
-  <strong>Current Behavior — 兩條資料讀取路徑</strong>
-  <code>ml/data.py::fetch_training_dataset()</code> 實作了兩條路徑（優先順序如下）。只要正規化路徑的閘門通過，就不走 legacy fallback。
-</div>
+<p><code>ml_sidecar</code> 透過 service-role key 讀取 Supabase。正式訓練資料來源是 <code>market_price_observations</code>，並以 <code>saved_listings</code> 做欄位補全（property_type、結構欄位、座標、amenities）。</p>
 
 <div class="table-wrap">
   <table>
     <thead>
-      <tr><th>路徑</th><th>條件</th><th>資料表</th><th>row_source 標籤</th></tr>
+      <tr><th>來源</th><th>用途</th><th>備註</th></tr>
     </thead>
     <tbody>
-      <tr>
-        <td><strong>1. 正規化路徑</strong>（優先）</td>
-        <td>target rows ≥ 7、unique stay_dates ≥ 7、comp rows ≥ 30（三者同時滿足）</td>
-        <td><code>target_price_observations</code><br><code>market_comp_observations</code><br>（comp 元資料從 <code>comparable_pool_entries</code> enrichment）</td>
-        <td><code>target_observation</code><br><code>market_comp_observation</code></td>
-      </tr>
-      <tr>
-        <td><strong>2. Legacy fallback</strong></td>
-        <td>正規化閘門未通過，或無 saved_listing_id</td>
-        <td><code>comparable_pool_entries</code>（地理半徑 ~8 km 過濾）<br><code>pricing_reports.result_calendar</code>（最新報表 30 天行事曆）</td>
-        <td><code>pool_snapshot</code><br><code>report_calendar</code></td>
-      </tr>
+      <tr><td><code>market_price_observations</code></td><td>主要訓練樣本</td><td>每列為觀察到的市場價格；<code>row_source=market_price_observation</code></td></tr>
+      <tr><td><code>saved_listings</code></td><td>特徵補全</td><td>當 observation 欄位缺值時回退至 listing 結構與 amenities</td></tr>
+      <tr><td><code>pricing_reports.result_summary.mlForecast</code></td><td>ML 任務佇列 + 結果回寫</td><td>sidecar worker 輪詢 <code>queued</code> 狀態</td></tr>
     </tbody>
   </table>
 </div>
 
-<div class="callout callout-risk">
-  <strong>Risk — 閘門閥值</strong>
-  正規化路徑閘門定義在 <code>ml/data.py</code> 頂端：<br>
-  <code>_MIN_NORMALIZED_TARGET_ROWS = 7</code><br>
-  <code>_MIN_NORMALIZED_UNIQUE_DATES = 7</code><br>
-  <code>_MIN_NORMALIZED_COMP_ROWS = 30</code><br>
-  新房源觀察資料不足時會自動退回 legacy 路徑，訓練品質較弱。
+<div class="callout callout-current">
+  <strong>Current Behavior — 訓練 scope 只有兩種</strong>
+  <code>trainingScope</code> 僅支援 <code>global</code> 與 <code>listing_local</code>（<code>ml_sidecar/data.py</code>）。global 讀全域觀察資料，listing_local 僅讀單一 saved listing。
 </div>
 
-<div class="callout callout-reserved">
-  <strong>Reserved / Future — benchmark 訊號尚未整合</strong>
-  <code>benchmark_price_observations</code> 表已存在（Phase 5A），但目前<em>未</em>作為訓練特徵加入。原因：單純 scalar benchmark 會引起 leakage；正確做法是按 stay_date join，此項延後至 Phase 5B+/5C。見 <code>ml/data.py</code> 中的 TODO 註解。
-</div>
-
-<div class="sources">來源：ml/data.py, ml/supabase_client.py, supabase/migrations/016_observation_tables.sql</div>
+<div class="sources">來源：ml_sidecar/data.py、ml_sidecar/supabase_client.py、ml_sidecar/worker.py、worker/core/db.py</div>
 </section>
 
 <section id="s28">
 <h2>28. 訓練資料集建構</h2>
 
-<p><code>_fetch_normalized_training_rows()</code> 是正規化路徑的核心，建立兩類訓練行：</p>
+<p><code>ml_sidecar/data.py::fetch_training_dataset()</code> 會把 <code>market_price_observations</code> 轉成訓練 DataFrame。流程如下：</p>
+<ol>
+  <li>拉取 observation rows（依 <code>observed_at DESC</code>，可限制全域或單 listing scope）。</li>
+  <li>以 <code>_pick_target_price()</code> 選定訓練目標值：<code>effective_daily_price_refundable → effective_daily_price_non_refundable → base_daily_price → base_price</code>（第一個正值）。</li>
+  <li>解析 <code>stay_date</code> 與 <code>observed_at</code>，計算 <code>lead_time</code>、週期性時間特徵與假日旗標。</li>
+  <li>結構欄位（bedrooms/baths/accommodates/beds/property_type）優先用 observation，缺值時回退 <code>saved_listings.input_attributes</code>。</li>
+  <li>amenities 先 canonical normalize（去重與別名合併）再進特徵工程。</li>
+</ol>
 
-<div class="diagram-box">
-  <div class="diagram-title">正規化路徑資料建構流程</div>
-  <svg width="100%" viewBox="0 0 700 260" font-family="system-ui,sans-serif" font-size="12">
-    <!-- Stage boxes -->
-    <rect x="10" y="30" width="120" height="50" rx="6" fill="#eef4ff" stroke="#4a80d4" stroke-width="1.5"/>
-    <text x="70" y="52" text-anchor="middle" font-weight="700" fill="#1d5fad">① 拉取</text>
-    <text x="70" y="68" text-anchor="middle" fill="#1d5fad" font-size="11">target_price_obs</text>
-
-    <rect x="160" y="30" width="120" height="50" rx="6" fill="#eef4ff" stroke="#4a80d4" stroke-width="1.5"/>
-    <text x="220" y="52" text-anchor="middle" font-weight="700" fill="#1d5fad">② 拉取</text>
-    <text x="220" y="68" text-anchor="middle" fill="#1d5fad" font-size="11">market_comp_obs</text>
-
-    <rect x="310" y="30" width="120" height="50" rx="6" fill="#fdf6e3" stroke="#c47f1a" stroke-width="1.5"/>
-    <text x="370" y="52" text-anchor="middle" font-weight="700" fill="#92600a">③ 閘門檢查</text>
-    <text x="370" y="68" text-anchor="middle" fill="#92600a" font-size="11">三條件同時通過</text>
-
-    <rect x="460" y="30" width="120" height="50" rx="6" fill="#edf7f1" stroke="#2d9956" stroke-width="1.5"/>
-    <text x="520" y="52" text-anchor="middle" font-weight="700" fill="#1a6b3a">④ Pool enrichment</text>
-    <text x="520" y="68" text-anchor="middle" fill="#1a6b3a" font-size="11">comparable_pool_entries</text>
-
-    <!-- Gate fail box -->
-    <rect x="310" y="130" width="160" height="40" rx="6" fill="#f5f0fb" stroke="#8b52c9" stroke-width="1.5"/>
-    <text x="390" y="148" text-anchor="middle" font-weight="700" fill="#5b2d91" font-size="11">閘門失敗 → legacy fallback</text>
-    <text x="390" y="162" text-anchor="middle" fill="#5b2d91" font-size="10">pool_snapshot + report_calendar</text>
-
-    <!-- Output box -->
-    <rect x="200" y="200" width="300" height="50" rx="6" fill="#f3f3f0" stroke="#aaa" stroke-width="1.5"/>
-    <text x="350" y="222" text-anchor="middle" font-weight="700" fill="#1a1a18">訓練 DataFrame</text>
-    <text x="350" y="240" text-anchor="middle" fill="#6b6b65" font-size="11">target_observation + market_comp_observation rows</text>
-
-    <!-- Arrows -->
-    <line x1="130" y1="55" x2="158" y2="55" stroke="#aaa" stroke-width="1.5" marker-end="url(#arr)"/>
-    <line x1="280" y1="55" x2="308" y2="55" stroke="#aaa" stroke-width="1.5" marker-end="url(#arr)"/>
-    <line x1="430" y1="55" x2="458" y2="55" stroke="#aaa" stroke-width="1.5" marker-end="url(#arr)"/>
-    <line x1="370" y1="80" x2="370" y2="128" stroke="#c47f1a" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr-amber)"/>
-    <line x1="520" y1="80" x2="350" y2="198" stroke="#2d9956" stroke-width="1.5" marker-end="url(#arr-green)"/>
-
-    <defs>
-      <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L8,3 z" fill="#aaa"/>
-      </marker>
-      <marker id="arr-amber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L8,3 z" fill="#c47f1a"/>
-      </marker>
-      <marker id="arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L8,3 z" fill="#2d9956"/>
-      </marker>
-    </defs>
-  </svg>
+<div class="callout callout-current">
+  <strong>Current Behavior — 單一路徑</strong>
+  目前已無舊版 normalized-vs-legacy 雙路徑閘門；訓練資料統一來自 <code>market_price_observations</code>。
 </div>
 
-<p>每一筆訓練行都會加上 <strong>時間特徵</strong>（由 <code>_compute_date_features(stay_dt, obs_dt)</code> 統一計算），確保訓練路徑與推論路徑使用完全相同的特徵邏輯。</p>
-
-<p><strong>Legacy fallback 的 source weight 差異：</strong><code>report_calendar</code> 行的 <code>similarity_score</code> 雖設為 5.0，但在 <code>train_model()</code> 中 source weight 設為 0.5，使其有效梯度約為 pool_snapshot 的一半，避免單一報表的 30 天行事曆主導訓練。</p>
-
-<div class="sources">來源：ml/data.py（_fetch_normalized_training_rows, fetch_training_dataset）</div>
+<div class="sources">來源：ml_sidecar/data.py（fetch_training_dataset, _pick_target_price, _compute_date_features）</div>
 </section>
 
 <section id="s29">
@@ -2408,7 +2349,7 @@ CREATE INDEX idx_reports_lane_env_status_created
     <text x="610" y="92" text-anchor="middle" font-weight="700" fill="#1a6b3a">30 天預測</text>
     <text x="610" y="107" text-anchor="middle" fill="#1a6b3a" font-size="11">forecast_prices()</text>
     <text x="610" y="122" text-anchor="middle" fill="#1a6b3a" font-size="11">guardrail ±30%</text>
-    <text x="610" y="137" text-anchor="middle" fill="#1a6b3a" font-size="11">→ ml/reports/*.csv</text>
+    <text x="610" y="137" text-anchor="middle" fill="#1a6b3a" font-size="11">→ ml_sidecar/reports/*.csv</text>
 
     <!-- Arrows -->
     <line x1="120" y1="100" x2="143" y2="100" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrML)"/>
@@ -2426,20 +2367,20 @@ CREATE INDEX idx_reports_lane_env_status_created
 
 <h3>推論細節</h3>
 <ul>
-  <li><code>batch_pipeline.py</code> 是推薦的端對端入口（也可呼叫 <code>execute_batch_workflow()</code> 函式）</li>
-  <li><code>run_forecast.py</code> 是較低階的 debug 腳本，支援更多 CLI 旗標（<code>--dump-training-csv</code>、<code>--save-model</code> 等）</li>
+  <li><code>ml_sidecar/batch_pipeline.py</code> 是端對端入口（<code>execute_batch_workflow()</code>）</li>
+  <li><code>ml_sidecar/worker.py</code> 是 runtime 入口，負責認領 queued payload 並執行 sidecar 推論</li>
   <li>推論時，每個未來日期都會對目標房源建構一筆特徵向量（包含 <code>_compute_date_features(current_date, start_date)</code>），再由 XGBoost 預測</li>
   <li>Forecast guardrail：以 ±30% 的 7 天滾動中位數為上下界，平滑極端波動。原始值（<code>predicted_price_raw</code>）與修剪後值（<code>predicted_price</code>）都會保留，<code>guardrail_applied</code> 旗標標記哪些天被修剪</li>
-  <li>ML 推論結果不寫回 <code>pricing_reports</code>，只輸出至本地 <code>ml/reports/</code></li>
+  <li>sidecar worker 模式會把推論結果與狀態寫回 <code>pricing_reports.result_summary.mlForecast</code>；批次腳本模式則輸出本地 artifact</li>
 </ul>
 
-<div class="sources">來源：ml/batch_pipeline.py, ml/run_forecast.py, ml/model.py（forecast_prices, _apply_forecast_guardrail）</div>
+<div class="sources">來源：ml_sidecar/batch_pipeline.py、ml_sidecar/worker.py、ml_sidecar/model.py（forecast_prices, _apply_forecast_guardrail）</div>
 </section>
 
 <section id="s32">
 <h2>32. ML 輸出與產物</h2>
 
-<p>每次執行 <code>ml/batch_pipeline.py</code> 後，輸出至 <code>ml/reports/</code>：</p>
+<p>每次執行 <code>ml_sidecar/batch_pipeline.py</code> 後，輸出至 <code>ml_sidecar/reports/</code>：</p>
 
 <div class="table-wrap">
   <table>
@@ -2449,160 +2390,68 @@ CREATE INDEX idx_reports_lane_env_status_created
     <tbody>
       <tr><td><code>predictions.csv</code></td><td>未來 30 天建議價格（含 guardrail 前後值、is_weekend、is_holiday）</td></tr>
       <tr><td><code>metrics_latest.csv</code></td><td>最新訓練指標（MAE、MAPE、Q2、R2、CV strategy）</td></tr>
-      <tr><td><code>training_data_dump.csv</code></td><td>原始訓練資料（特徵工程前，供人工審查）</td></tr>
       <tr><td><code>training_matrix.csv</code></td><td>特徵工程後的完整訓練矩陣（含 one-hot 展開欄位）</td></tr>
       <tr><td><code>feature_descriptions.csv</code></td><td>每個特徵欄位的文字說明</td></tr>
-      <tr><td><code>feature_importance.csv</code></td><td>全域 feature importance 摘要（weight-based）</td></tr>
-      <tr><td><code>feature_importance_detailed.csv</code></td><td>importance / gain / cover / weight / total_gain / total_cover 六種指標</td></tr>
-      <tr><td><code>model_tree_dump.txt</code></td><td>每棵樹的 split 規則（供 debug）</td></tr>
-      <tr><td><code>prediction_explanations.csv</code></td><td>每天預測的 top feature drivers（log1p 空間的 contribution）</td></tr>
-      <tr><td><code>prediction_feature_contributions.csv</code></td><td>每天所有特徵的完整 contribution 長表</td></tr>
-      <tr><td><code>batch_pipeline_result.json</code></td><td>前端 / API 消費的 manifest（listing_id、metrics、artifacts 路徑等）</td></tr>
       <tr><td><code>saved_model.json</code></td><td>序列化的 XGBoost 模型（可重用不重訓）</td></tr>
-      <tr><td><code>metrics_history.csv</code></td><td>每次訓練的歷史指標累積紀錄</td></tr>
+      <tr><td><code>latest_manifest.json</code></td><td>本次執行摘要（scope、metrics、predictions、artifact 路徑）</td></tr>
+      <tr><td><code>data_quality_latest.json</code><br><code>data_quality_issues_latest.csv</code></td><td>nightly 完成後的資料品質檢查輸出（由 <code>ml_sidecar/data_quality.py</code> 產生）</td></tr>
     </tbody>
   </table>
 </div>
 
-<div class="callout callout-infer">
-  <strong>Inference — contribution 說明</strong>
-  <code>prediction_explanations.csv</code> 的 contribution 值在 <strong>log1p(price) 空間</strong>，正值表示推高價格、負值表示壓低價格。<code>contribution_multiplier = exp(contribution_log)</code> 可作為相對乘數閱讀。
-</div>
-
 <div class="callout callout-current">
   <strong>Current Behavior — 前端整合已分成兩層</strong>
-  Worker 正式 report 只會把當次 runtime metadata 寫進 <code>summary.mlPricing</code>；較完整的 batch / backtest 驗證則仍寫在 <code>full_pipeline_result.json</code>、<code>backtest_*.csv</code> 等本地 artifact，並透過 API route 讀進 share report page 的 <code>MlInsightsCard</code>。
+  正式 report 目前使用 <code>summary.mlForecast</code> 承載 queue / running / ready / error 與 predictions。較完整的 batch / backtest 驗證仍寫在本地 artifact，兩者定位不同：前者服務產品 runtime 狀態，後者服務工程驗證。
 </div>
 
-<div class="sources">來源：ml/README.md（第 6、10 節）, ml/batch_pipeline.py</div>
+<div class="sources">來源：ml_sidecar/batch_pipeline.py、ml_sidecar/data_quality.py、ml_sidecar/worker.py</div>
 </section>
 
 <section id="s33">
 <h2>33. 回測與評估</h2>
 
-<p><code>ml/backtest.py</code> 提供兩種回測模式，<code>ml/compare_predictions.py</code> 提供日期間差異分析。</p>
+<p>目前 repo 內正式可重現的評估輸出來自 <code>ml_sidecar/model.py::train_model()</code> 的交叉驗證與 <code>ml_sidecar/data_quality.py</code> 的資料品質檢查。</p>
 
-<div class="table-wrap">
-  <table>
-    <thead>
-      <tr><th>模式</th><th>指令</th><th>方法</th><th>評估目的</th><th>信號強度</th></tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>holdout_comp</strong></td>
-        <td><code>.\run_ml_backtest.cmd</code></td>
-        <td>從訓練資料移除一間競品房，用剩餘資料訓練，預測被移除房的未來價格</td>
-        <td>測試模型對未見房源的泛化能力</td>
-        <td><span class="badge badge-amber">中等</span></td>
-      </tr>
-      <tr>
-        <td><strong>time split</strong></td>
-        <td><code>.\run_ml_backtest_time.cmd</code></td>
-        <td>以較早期資料訓練，用最近 N 天的 <code>observed_at_date</code> 作為驗證集</td>
-        <td>更接近真實上線情境的時間感知評估</td>
-        <td><span class="badge badge-green">較強</span></td>
-      </tr>
-    </tbody>
-  </table>
-</div>
-
-<h3>回測主要指標</h3>
+<h3>主要評估指標</h3>
 <div class="table-wrap">
   <table>
     <thead><tr><th>指標</th><th>說明</th><th>判斷閾值</th></tr></thead>
     <tbody>
-      <tr><td><code>mape_pct</code></td><td>平均絕對百分比誤差（最重要）</td><td>&lt;10 很好、10–15 可接受、15–20 偏弱、≥20 需調整</td></tr>
-      <tr><td><code>mean_signed_pct_error_pct</code></td><td>看模型整體偏高估還是偏低估</td><td>接近 0 為佳</td></tr>
-      <tr><td><code>within_10_pct_ratio</code></td><td>預測落在 ±10% 誤差內的比例</td><td>越高越好</td></tr>
-      <tr><td><code>within_20_pct_ratio</code></td><td>預測落在 ±20% 誤差內的比例</td><td>越高越好</td></tr>
+      <tr><td><code>mae</code> / <code>mae_std</code></td><td>絕對誤差平均值與跨 fold 波動</td><td>越低越好</td></tr>
+      <tr><td><code>mape</code></td><td>平均絕對百分比誤差</td><td>越低越好</td></tr>
+      <tr><td><code>q2</code> / <code>r2</code> / <code>r2_std</code></td><td>交叉驗證與整體擬合解釋力</td><td>越高越好，且 <code>r2_std</code> 不宜過大</td></tr>
+      <tr><td><code>ae_p50/p80/p95</code></td><td>絕對誤差分位數（中位/80/95）</td><td>用於判斷尾端風險</td></tr>
+      <tr><td><code>ape_p50/p80/p95</code></td><td>相對誤差分位數</td><td>用於設定可信區間與信心帶</td></tr>
+      <tr><td><code>cv_strategy</code></td><td><code>TimeSeriesSplit</code> 或 <code>KFold-chronological</code></td><td>資料日期多樣性不足時會降級為 KFold</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>日期比較分析</h3>
-<p><code>ml/compare_predictions.py</code> 比較同一房源的兩個未來日期預測差異，輸出：</p>
-<ul>
-  <li><code>prediction_date_comparison_summary.csv</code> — 兩天的預測價格與價差比例</li>
-  <li><code>prediction_date_comparison_drivers.csv</code> — 兩天之間每個 feature 的 contribution 差分（說明「為什麼週六比週一貴 $30」）</li>
-</ul>
+<div class="callout callout-current">
+  <strong>Current Behavior — 目前無獨立 backtest 腳本</strong>
+  過往文件中的 <code>ml/backtest.py</code> / <code>ml/compare_predictions.py</code> 不在目前 repo。現行評估以 sidecar 的 CV 指標 + data quality 檢查為主。
+</div>
 
-<div class="sources">來源：ml/backtest.py, ml/compare_predictions.py, ml/README.md（第 8、9 節）</div>
+<div class="sources">來源：ml_sidecar/model.py、ml_sidecar/batch_pipeline.py、ml_sidecar/data_quality.py</div>
 </section>
 
 <section id="s34">
 <h2>34. Worker 觀察資料與 ML 的關係</h2>
 
-<p>Worker 的夜間 pipeline 是 ML 訓練資料的<strong>主要生產者</strong>。兩者的資料流向如下：</p>
+<p>目前 ML sidecar 的訓練資料主來源是 <code>market_price_observations</code>，而不是 <code>target_price_observations</code> / <code>market_comp_observations</code>。資料流如下：</p>
 
-<div class="diagram-box">
-  <div class="diagram-title">Worker 觀察資料 → ML 訓練資料流向</div>
-  <svg width="100%" viewBox="0 0 700 230" font-family="system-ui,sans-serif" font-size="12">
-    <!-- Worker -->
-    <rect x="10" y="20" width="160" height="70" rx="6" fill="#f5f0fb" stroke="#8b52c9" stroke-width="1.5"/>
-    <text x="90" y="42" text-anchor="middle" font-weight="700" fill="#5b2d91">Worker Nightly Job</text>
-    <text x="90" y="58" text-anchor="middle" fill="#5b2d91" font-size="11">live_analysis pipeline</text>
-    <text x="90" y="73" text-anchor="middle" fill="#5b2d91" font-size="11">worker/core/observations.py</text>
+<ol>
+  <li>Worker 完成報表後，<code>complete_job()</code> 會呼叫 <code>ingest_market_price_observations(report_id)</code>。</li>
+  <li>該 RPC 將報表日曆/摘要正規化寫入 <code>market_price_observations</code>。</li>
+  <li><code>ml_sidecar/data.py::fetch_training_dataset()</code> 從 <code>market_price_observations</code> 讀取訓練列，並以 <code>saved_listings</code> 補全特徵。</li>
+</ol>
 
-    <!-- Observation tables -->
-    <rect x="210" y="10" width="200" height="40" rx="6" fill="#edf7f1" stroke="#2d9956" stroke-width="1.5"/>
-    <text x="310" y="28" text-anchor="middle" font-weight="700" fill="#1a6b3a" font-size="11">target_price_observations</text>
-    <text x="310" y="43" text-anchor="middle" fill="#1a6b3a" font-size="10">market median per stay_date</text>
-
-    <rect x="210" y="60" width="200" height="40" rx="6" fill="#edf7f1" stroke="#2d9956" stroke-width="1.5"/>
-    <text x="310" y="78" text-anchor="middle" font-weight="700" fill="#1a6b3a" font-size="11">market_comp_observations</text>
-    <text x="310" y="93" text-anchor="middle" fill="#1a6b3a" font-size="10">per-comp nightly price per stay_date</text>
-
-    <rect x="210" y="110" width="200" height="40" rx="6" fill="#eef4ff" stroke="#4a80d4" stroke-width="1.5"/>
-    <text x="310" y="128" text-anchor="middle" font-weight="700" fill="#1d5fad" font-size="11">benchmark_price_observations</text>
-    <text x="310" y="143" text-anchor="middle" fill="#1d5fad" font-size="10">benchmark vs market（Phase 5A）</text>
-
-    <!-- ML -->
-    <rect x="450" y="50" width="160" height="60" rx="6" fill="#fdf6e3" stroke="#c47f1a" stroke-width="1.5"/>
-    <text x="530" y="72" text-anchor="middle" font-weight="700" fill="#92600a">ML Pipeline</text>
-    <text x="530" y="88" text-anchor="middle" fill="#92600a" font-size="11">ml/data.py</text>
-    <text x="530" y="103" text-anchor="middle" fill="#92600a" font-size="11">fetch_training_dataset()</text>
-
-    <!-- Deferred label -->
-    <text x="390" y="136" text-anchor="middle" fill="#1d5fad" font-size="10" font-style="italic">（尚未 join 至訓練特徵）</text>
-
-    <!-- Arrows -->
-    <line x1="170" y1="40"  x2="208" y2="28"  stroke="#8b52c9" stroke-width="1.5" marker-end="url(#arrML2)"/>
-    <line x1="170" y1="55"  x2="208" y2="78"  stroke="#8b52c9" stroke-width="1.5" marker-end="url(#arrML2)"/>
-    <line x1="170" y1="70"  x2="208" y2="128" stroke="#4a80d4" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrML3)"/>
-    <line x1="410" y1="30"  x2="448" y2="66"  stroke="#2d9956" stroke-width="1.5" marker-end="url(#arrML2)"/>
-    <line x1="410" y1="80"  x2="448" y2="83"  stroke="#2d9956" stroke-width="1.5" marker-end="url(#arrML2)"/>
-    <line x1="410" y1="130" x2="448" y2="100" stroke="#4a80d4" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrML3)"/>
-
-    <!-- Observation reuse note -->
-    <rect x="10" y="170" width="620" height="50" rx="6" fill="#f3f3f0" stroke="#ccc" stroke-width="1"/>
-    <text x="320" y="191" text-anchor="middle" font-weight="700" fill="#1a1a18" font-size="11">📌 觀察資料的雙重用途</text>
-    <text x="320" y="207" text-anchor="middle" fill="#6b6b65" font-size="10">① 夜間 alert 評估（即時性，D0–D3 優先）  ② ML 訓練資料積累（長期歷史廣度）</text>
-    <text x="320" y="220" text-anchor="middle" fill="#6b6b65" font-size="10">兩者共享同一張觀察表，寫入時間點依 nightly_strategy.py 的分層採樣計畫決定</text>
-
-    <defs>
-      <marker id="arrML2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L8,3 z" fill="#8b52c9"/>
-      </marker>
-      <marker id="arrML3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L8,3 z" fill="#4a80d4"/>
-      </marker>
-    </defs>
-  </svg>
+<div class="callout callout-current">
+  <strong>Current Behavior — 觀察表有兩條用途線</strong>
+  <code>target_price_observations</code> / <code>market_comp_observations</code> 目前主要服務互動式 reuse 與排程監測；ML 訓練主線則使用 <code>market_price_observations</code>。
 </div>
 
-<h3>夜間爬取策略與 ML 資料積累</h3>
-<p><code>worker/core/nightly_strategy.py</code> 將 30 天預報窗口切分為四個 tier，並以不同頻率採樣：</p>
-<ul>
-  <li><strong>near_term (D0–D3)</strong>：每晚觀察，為 alert 評估提供最高鮮度</li>
-  <li><strong>medium (D4–D10)</strong>：每隔 TIER2_STEP 夜觀察</li>
-  <li><strong>far (D11–D21)</strong>：更低頻率</li>
-  <li><strong>sparse (D22–D30)</strong>：僅觀察端點</li>
-</ul>
-<p>這個設計同時服務兩個目標：最小化 Airbnb 請求量，同時在不同日期跨度積累 ML 所需的時間序列多樣性。</p>
-
-<p><code>worker/core/observation_reuse.py</code> 讓互動式報表能重用最近的夜間觀察，避免重複爬取。ML 則直接讀取觀察表，不經過 reuse 快取。</p>
-
-<div class="sources">來源：worker/core/observations.py, worker/core/nightly_strategy.py, worker/core/observation_reuse.py, ml/data.py</div>
+<div class="sources">來源：worker/core/db.py、worker/core/observations.py、worker/core/observation_reuse.py、ml_sidecar/data.py</div>
 </section>
 
 <section id="s35">
@@ -2612,12 +2461,12 @@ CREATE INDEX idx_reports_lane_env_status_created
 
 <div class="callout callout-risk">
   <strong>Risk — 新房源冷啟動問題</strong>
-  正規化路徑需要至少 7 天 × 3 表的觀察資料，才能通過閘門。新加入的房源觀察資料不足時，會退回 legacy fallback（pool_snapshot），訓練品質較低，特別是時間序列特徵的有效性受限。
+  若 <code>market_price_observations</code> 歷史太短，<code>listing_local</code> scope 很容易樣本不足，CV 會降級或模型穩定性變差。新房源通常要先累積數輪 nightly 才會有較可信的 ML 訊號。
 </div>
 
 <div class="callout callout-risk">
   <strong>Risk — runtime metadata 與本地 validation 仍是兩層</strong>
-  正式 report 目前只會帶當次執行的 <code>summary.mlPricing</code>；較完整的 batch / holdout / time-split 驗證仍是本地 <code>ml/reports/</code> artifact。也就是說，badge 顯示的是這次 report 有沒有套到 ML，<strong>不等於</strong> 所有畫面都能共享同一份完整驗證 manifest。
+  正式 report 目前只會帶當次執行的 <code>summary.mlForecast</code>（runtime queue / status / predictions）；較完整的 batch / holdout / time-split 驗證仍是本地 artifact。也就是說，runtime 狀態可即時查，完整研究報告仍不在同一份資料面。
 </div>
 
 <div class="callout callout-risk">
@@ -2626,8 +2475,8 @@ CREATE INDEX idx_reports_lane_env_status_created
 </div>
 
 <div class="callout callout-risk">
-  <strong>Risk — benchmark_price_observations 尚未作為訓練特徵</strong>
-  Phase 5A 寫入的 benchmark 觀察資料因 leakage 風險（scalar per report 不能直接對應到 comp 行），暫未加入特徵集。Phase 5B+/5C 需設計 stay_date join 方能正確整合。
+  <strong>Risk — benchmark 觀察資料尚未進入 sidecar 特徵</strong>
+  目前 sidecar 訓練主要讀 <code>market_price_observations</code>。benchmark 相關觀察表尚未納入現行特徵矩陣，若要整合需先定義穩定的按日對齊與防 leakage 規則。
 </div>
 
 <h3>未來保留勾點</h3>
@@ -2639,22 +2488,22 @@ CREATE INDEX idx_reports_lane_env_status_created
 
 <div class="callout callout-reserved">
   <strong>Reserved / Future — validation manifest 資料庫化</strong>
-  較合理的下一步不是再做一套新的 pricing contract，而是把 <code>full_pipeline_result.json</code> 類型的 validation manifest 寫入資料庫或共享 artifact storage。這樣 <code>MlInsightsCard</code> 就不需要只依賴本地工作目錄，也能讓所有 report 讀到一致的驗證快照。
+  把 <code>ml_sidecar/reports/latest_manifest.json</code> 類型的驗證摘要持久化到 DB/物件儲存，能避免目前只靠本機 artifact 的可見性限制，並讓跨環境 UI 讀到一致版本。
 </div>
 
 <div class="callout callout-reserved">
-  <strong>Reserved / Future — benchmark 特徵整合（Phase 5B+/5C）</strong>
-  按 stay_date 將 <code>benchmark_price_observations</code> join 至 <code>market_comp_observations</code> 訓練行，讓每筆訓練樣本都能帶有時間對齊的 benchmark_price 特徵。join 點在 <code>ml/data.py::_fetch_normalized_training_rows()</code> 中有 TODO 標記。
+  <strong>Reserved / Future — JSON payload queue 正式化</strong>
+  現在 <code>summary.mlForecast</code> 既是 queue 也是結果容器。若 sidecar 需要水平擴展，多 worker 並行下建議升級為獨立 queue table + RPC claim，以降低競態風險。
 </div>
 
-<div class="sources">來源：ml/data.py, ml/model.py, worker/core/nightly_strategy.py, worker/core/report_policy.py, docs/report-contract.md</div>
+<div class="sources">來源：ml_sidecar/data.py、ml_sidecar/model.py、ml_sidecar/batch_pipeline.py、ml_sidecar/worker.py、worker/core/report_policy.py</div>
 </section>
 
 
 <section id="s36">
 <h2>36. ML Runtime 與前端整合</h2>
 
-<p>這一輪改動不是單純把模型訓練起來，而是把「可重訓的本地 pipeline」、「Worker runtime 套用」、「API payload 補強」與「前端來源提示」接成同一條可驗證路徑。核心原則有兩個：正式 UI 合約不改，仍然只讀 <code>recommendedDailyPrice</code>；ML 是否真的生效，則由 <code>summary.mlPricing</code> 與 <code>coreVersion += "+ml"</code> 額外標記。</p>
+<p>目前正式 runtime 走「market-engine 主價格 + ML sidecar 非同步預測」雙軌。正式 UI 價格欄位仍只讀 <code>recommendedDailyPrice</code>；ML runtime 狀態則由 <code>summary.mlForecast</code> 提供，不覆寫主定價欄位。</p>
 
 <div class="table-wrap">
   <table>
@@ -2662,11 +2511,11 @@ CREATE INDEX idx_reports_lane_env_status_created
       <tr><th>階段</th><th>本次主要改動</th><th>目的</th></tr>
     </thead>
     <tbody>
-      <tr><td>訓練資料重整</td><td><code>ml/data.py</code> 先走 normalized observation tables，預設改成 <code>global</code> scope，gate 不過才退回 <code>pool_snapshot</code> / <code>report_calendar</code></td><td>讓模型先學市場共識，同時保留冷啟動 fallback</td></tr>
-      <tr><td>本地驗證 pipeline</td><td><code>ml/batch_pipeline.py</code> 與 <code>ml/full_pipeline.py</code> 統一輸出 <code>saved_model.json</code>、<code>metrics_latest.csv</code>、<code>prediction_explanations.csv</code>、<code>full_pipeline_result.json</code></td><td>把訓練、batch forecast、holdout backtest、time-split backtest 收斂成可重現 artifact</td></tr>
-      <tr><td>Worker runtime overlay</td><td><code>worker/main.py</code> 新增 <code>_should_apply_ml_pricing()</code>、<code>_run_ml_pricing_forecast()</code>、<code>_apply_ml_pricing_overlay()</code>，fresh path 與 cache-hit path 都會在寫回前嘗試覆寫價格</td><td>讓正式 report 的價格可以直接來自 ML，而不是只停留在離線驗證</td></tr>
-      <tr><td>API 橋接</td><td><code>/api/reports/[id]</code> 與 <code>/api/r/[shareId]</code> 在原 report payload 上附加 <code>listingId</code> 與 <code>mlInsights</code></td><td>讓前端同時拿到 runtime 來源 metadata 與本地 validation snapshot</td></tr>
-      <tr><td>前端呈現</td><td><code>MlPricingStatus</code>、<code>MlInsightsCard</code>、dashboard banner、listing history page、share report page 都接上 <code>mlPricing</code> / <code>mlInsights</code></td><td>把「模型有沒有套上」與「本地驗證分數」變成使用者可見資訊</td></tr>
+      <tr><td>Nightly queue 寫入</td><td><code>worker/core/db.py::complete_job()</code> 可在 nightly 完成後寫入 <code>summary.mlForecast.status="queued"</code></td><td>不新增新 queue table 也可啟動 sidecar 流程</td></tr>
+      <tr><td>Sidecar 認領與執行</td><td><code>ml_sidecar.worker</code> 輪詢 <code>pricing_reports.result_summary.mlForecast</code>，狀態 <code>queued → running → ready|error</code></td><td>將重訓/推論與主 Worker 解耦，失敗不影響主 report ready</td></tr>
+      <tr><td>結果回寫</td><td>sidecar 將 metrics / predictions 回寫到 <code>summary.mlForecast</code></td><td>前端可讀到同一筆 report 的 ML 進度與產物</td></tr>
+      <tr><td>前端讀取</td><td><code>/api/listings/[id]/ml</code> 與 listing detail page 對 queued/running 狀態做輪詢更新</td><td>使用者可看到 ML 任務狀態與完成結果</td></tr>
+      <tr><td>資料品質檢查</td><td><code>ml_sidecar.data_quality</code> 產出 <code>ml_sidecar/reports/data_quality_*.{json,csv}</code></td><td>在夜間流程後快速驗證 observation ingest 與 feature matrix 品質</td></tr>
     </tbody>
   </table>
 </div>
@@ -2678,38 +2527,38 @@ CREATE INDEX idx_reports_lane_env_status_created
       <tr><th>入口 / 畫面</th><th>實際行為</th><th>這次整合意義</th></tr>
     </thead>
     <tbody>
-      <tr><td><code>POST /api/reports</code></td><td>full create flow 會先依 <code>listingUrl</code> 或地址嘗試 match 既有 <code>saved_listing</code>；成功時新 report 直接帶 <code>listing_id</code></td><td>custom report 更容易接到同一份本地 ML validation snapshot</td></tr>
-      <tr><td><code>POST /api/listings/[id]/rerun</code></td><td>即使 cache 已存在也照樣排進 Worker，因為 rerun 需要 live-price capture 與 ML overlay</td><td>避免使用者按 rerun 卻只拿到舊 cache、沒有新的 ML metadata</td></tr>
-      <tr><td><code>POST /api/internal/nightly/schedule</code></td><td>每天為有 Airbnb URL 的 saved listing 建 30 天 scheduled report，交給同一個 Worker pipeline</td><td>nightly report 與 manual / rerun report 走同一套 ML overlay 規則</td></tr>
-      <tr><td><code>/dashboard</code> / listing history</td><td>board 優先選 nightly ready；若沒有才 fallback 到最新 ready manual / rerun，並標示 <code>Nightly</code> / <code>Custom</code> / <code>Rerun</code></td><td>使用者即使剛跑完 custom analysis，也能立刻看到完整價格板與 ML badge</td></tr>
-      <tr><td><code>/r/[shareId]</code></td><td>顯示完整 <code>MlPricingStatus</code>；若 <code>report.listingId</code> 與本地 manifest 的 <code>saved_listing_id</code> 相符，再顯示 <code>MlInsightsCard</code></td><td>把正式 report 與本地驗證結果放在同一頁對照</td></tr>
+      <tr><td><code>POST /api/internal/nightly/schedule</code></td><td>建立 nightly 報表並交由 nightly lane Worker 執行</td><td>夜間報表完成後可自動排入 ML sidecar queue</td></tr>
+      <tr><td><code>worker/main.py</code>（nightly complete）</td><td>當 <code>NIGHTLY_QUEUE_ML_FORECAST=1</code> 且有 <code>listing_id</code> 時，寫入 <code>mlForecast.queued</code></td><td>把 ML 執行觸發點固定在主 report 完成後</td></tr>
+      <tr><td><code>python -m ml_sidecar.worker</code></td><td>認領 queued payload，執行 retrain/forecast，回寫 <code>ready|error</code></td><td>不阻塞主 Worker，且可獨立部署擴縮</td></tr>
+      <tr><td><code>/api/listings/[id]/ml</code></td><td>回傳最新 <code>summary.mlForecast</code>；前端在 queued/running 時每 5 秒輪詢</td><td>讓 ML 狀態在 UI 上可即時追蹤</td></tr>
+      <tr><td><code>/dashboard/listings/[listingId]</code></td><td>顯示 ML queue 狀態、錯誤或預測結果；主價格仍讀 <code>recommendedDailyPrice</code></td><td>保持主定價合約穩定，同時暴露 ML runtime 資訊</td></tr>
     </tbody>
   </table>
 </div>
 
-<pre><code>1. 本地先跑 ml.full_pipeline 更新 saved_model.json 與 full_pipeline_result.json
-2. 使用者從 /dashboard、/dashboard/listings/[listingId] 或 nightly scheduler 建立新 report
-3. Worker 先產出 market-engine summary + calendar，再視條件套用 ML overlay
-4. 成功時覆寫 recommendedDailyPrice，並寫入 summary.mlPricing 與 coreVersion +ml
-5. Report API 把 report + mlInsights 一起回傳給前端
-6. 前端用 MlPricingStatus 告訴使用者「這次價格是不是 ML」，用 MlInsightsCard 顯示本地驗證快照</code></pre>
+<pre><code>1. 本地可先跑 ml_sidecar.batch_pipeline 產生 saved_model.json 與 latest_manifest.json
+2. nightly scheduler 建立 scheduled report（job_lane=nightly）
+3. Worker 完成主定價報表並寫入 pricing_reports（status=ready）
+4. complete_job() 視設定寫入 summary.mlForecast.status="queued"
+5. ml_sidecar.worker 認領並執行訓練/推論，回寫 ready 或 error 與 predictions
+6. 前端透過 /api/listings/[id]/ml 輪詢並顯示 ML runtime 狀態</code></pre>
 
 <div class="callout callout-current">
-  <strong>Current Behavior — 正式欄位合約刻意不變</strong>
-  不論價格最後來自 market-engine 還是 ML，前端正式價格一律仍讀 <code>recommendedDailyPrice</code>。這樣 dashboard、share report 與 listing history 不需要分叉成兩套 pricing contract。
+  <strong>Current Behavior — 正式價格欄位不被 sidecar 覆寫</strong>
+  ML sidecar 不修改 <code>recommendedDailyPrice</code>；它只在 <code>summary.mlForecast</code> 寫入狀態/預測。正式定價合約維持單一路徑。
 </div>
 
 <div class="callout callout-infer">
-  <strong>Inference — 未綁 saved listing 的 custom report 也能套 ML</strong>
-  若 report row 還沒有 <code>listing_id</code>，Worker 仍會用 <code>input_attributes</code> + <code>input_address</code> 建 pseudo target 跑全域模型。這種 report 仍可能出現 ML badge；只是 <code>MlInsightsCard</code> 仍取決於 <code>saved_listing_id</code> 是否能對上本地 manifest。
+  <strong>Inference — listing 綁定是 sidecar queue 的關鍵</strong>
+  nightly queue ML 需要 <code>listing_id</code>。未綁定 saved listing 的報表通常不會進入 nightly ML queue 流程。
 </div>
 
 <div class="callout callout-risk">
-  <strong>Risk — 正式 runtime 仍採 fail-open</strong>
-  只要 overlay 任一段失敗，Worker 就會保留原本的 market-engine 價格並把 <code>mlPricing.applied</code> 寫成 <code>false</code>。這是為了避免 ML 失敗把整份 report 一起打壞。
+  <strong>Risk — JSON payload queue 的擴展性</strong>
+  目前 queue 直接放在 <code>pricing_reports.result_summary.mlForecast</code>，單 sidecar worker 足夠；若未來水平擴展到多個 sidecar，需改為獨立 queue table 或 RPC claim 以避免並行認領競態。
 </div>
 
-<div class="sources">來源：ml/data.py、ml/batch_pipeline.py、ml/full_pipeline.py、worker/main.py、src/app/api/reports/route.ts、src/app/api/listings/[id]/rerun/route.ts、src/app/api/internal/nightly/schedule/route.ts、src/app/api/reports/[id]/route.ts、src/app/api/r/[shareId]/route.ts、src/lib/mlInsights.ts、src/components/MlPricingStatus.tsx、src/components/report/MlInsightsCard.tsx、src/components/dashboard/RecommendationBanner.tsx</div>
+<div class="sources">來源：worker/main.py、worker/core/db.py、ml_sidecar/worker.py、ml_sidecar/data_quality.py、src/app/api/listings/[id]/ml/route.ts、src/app/dashboard/listings/[listingId]/page.tsx</div>
 </section>
 
 <section id="s37">
