@@ -258,7 +258,15 @@ class PlaywrightScraper:
             self._release_tab_slot()
 
     @staticmethod
+    async def _human_action_pause(page, min_ms: int = 250, max_ms: int = 1200) -> None:
+        try:
+            await page.wait_for_timeout(int(random.uniform(min_ms, max_ms)))
+        except Exception:
+            pass
+
+    @staticmethod
     async def _goto_with_logging(page, url: str, *, wait_until: str, timeout: int, label: str):
+        await PlaywrightScraper._human_action_pause(page)
         logger.info(
             "Playwright goto[%s] request_url=%s wait_until=%s thread=%s",
             label,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime as dt
@@ -336,6 +337,7 @@ class _AsyncPageSyncAdapter:
         self._page = page
 
     def goto(self, url: str, **kwargs: Any) -> Any:
+        self.wait_for_timeout(int(random.uniform(250, 1200)))
         return self._scraper._run_async(
             self._page.goto(url, **kwargs),
             op_name="target_extractor.page.goto",
@@ -400,6 +402,17 @@ def _extract_target_spec_via_playwright_bridge(client: Any, listing_url: str) ->
                 scraper._save_cached_state()
             except Exception:
                 pass
+
+
+def _human_pause_sync_page(page: Any, min_ms: int = 250, max_ms: int = 1200) -> None:
+    timeout_ms = int(random.uniform(min_ms, max_ms))
+    try:
+        page.wait_for_timeout(timeout_ms)
+    except Exception:
+        try:
+            time.sleep(timeout_ms / 1000.0)
+        except Exception:
+            pass
         if page is not None:
             try:
                 scraper._run_async(
@@ -613,6 +626,7 @@ def extract_target_spec(
     page = client
     warnings: List[str] = []
 
+    _human_pause_sync_page(page)
     page.goto(listing_url, wait_until="domcontentloaded")
     page.wait_for_timeout(800)
 
@@ -968,6 +982,7 @@ def extract_listing_page_title(page, listing_url: str) -> Tuple[str, List[str]]:
     title = ""
 
     try:
+        _human_pause_sync_page(page)
         page.goto(listing_url, wait_until="domcontentloaded")
         page.wait_for_timeout(600)
     except Exception as exc:
@@ -1450,6 +1465,7 @@ def extract_nightly_price_from_listing_page(
     # Navigate with one retry on transient failure
     for attempt in range(2):
         try:
+            _human_pause_sync_page(page)
             page.goto(url_with_dates, wait_until="domcontentloaded", timeout=15000)
             break
         except Exception as exc:

@@ -2330,6 +2330,38 @@ def main():
                 f"(job_lane={job.get('job_lane', '?')}, target_env={job.get('target_env', '?')}, "
                 f"worker_env={WORKER_ENV}, worker_lane={WORKER_LANE}, attempt={attempts})"
             )
+            if str(job.get("job_lane") or "").strip().lower() == "nightly":
+                claimed_at_raw = str(job.get("worker_claimed_at") or "").strip()
+                claim_date = (
+                    db_helpers.utc_date_from_iso(claimed_at_raw)
+                    or datetime.now(timezone.utc).date().isoformat()
+                )
+                try:
+                    queued_nightly = db_helpers.list_queued_nightly_jobs(client, WORKER_ENV)
+                    logger.info(
+                        f"[{report_id}] nightly queue snapshot: queued_count={len(queued_nightly)} claim_date={claim_date}"
+                    )
+                    older_start_rows = []
+                    for row in queued_nightly:
+                        start_date = str(row.get("input_date_start") or "").strip()
+                        if start_date and start_date < claim_date:
+                            older_start_rows.append(row)
+                    if older_start_rows:
+                        logger.warning(
+                            f"[{report_id}] queued nightly tasks with input_date_start earlier than claim_date={claim_date}: "
+                            f"count={len(older_start_rows)}"
+                        )
+                        for row in older_start_rows:
+                            logger.warning(
+                                "[nightly_queued_older_start] id=%s input_date_start=%s created_at=%s worker_claimed_at=%s target_env=%s",
+                                row.get("id"),
+                                row.get("input_date_start"),
+                                row.get("created_at"),
+                                row.get("worker_claimed_at"),
+                                row.get("target_env"),
+                            )
+                except Exception as nightly_diag_exc:
+                    logger.warning(f"[{report_id}] nightly queue diagnostics failed: {nightly_diag_exc}")
 
             if attempts > MAX_ATTEMPTS:
                 logger.warning(f"[{report_id}] Exceeded max attempts ({attempts}), marking error")

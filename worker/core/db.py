@@ -11,8 +11,9 @@ import importlib
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("worker.core.db")
 
@@ -109,6 +110,40 @@ def claim_job(client: Client, worker_token: uuid.UUID, stale_minutes: int, targe
     if rows and len(rows) > 0:
         return rows[0]
     return None
+
+
+def list_queued_nightly_jobs(client: Client, target_env: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Return queued nightly pricing_reports for the given target_env (oldest first).
+    """
+    result = (
+        client.table("pricing_reports")
+        .select("id,input_date_start,created_at,worker_claimed_at,status,job_lane,target_env")
+        .eq("status", "queued")
+        .eq("job_lane", "nightly")
+        .eq("target_env", target_env)
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return list(result.data or [])
+
+
+def utc_date_from_iso(raw_ts: Optional[str]) -> Optional[str]:
+    if not raw_ts:
+        return None
+    try:
+        text = str(raw_ts).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date().isoformat()
+    except Exception:
+        return None
 
 
 def heartbeat(client: Client, report_id: str, worker_token: uuid.UUID) -> bool:
