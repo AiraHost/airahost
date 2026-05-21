@@ -133,11 +133,12 @@ class PlaywrightScraper:
         with cls._tab_gate_lock:
             if cls._tab_gate is not None:
                 return
-            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "5")
+            # Memory-safe default on Windows hosts. Can still be overridden by env.
+            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "2")
             try:
                 parsed_limit = int(str(raw_limit).strip())
             except Exception:
-                parsed_limit = 5
+                parsed_limit = 2
             # Hard safety ceiling: never allow more than 5 concurrent tabs.
             cls._tab_limit = max(1, min(parsed_limit, 5))
             cls._tab_gate = threading.BoundedSemaphore(cls._tab_limit)

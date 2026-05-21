@@ -66,11 +66,12 @@ WORKER_LANE = os.getenv("WORKER_LANE", "interactive")
 MAX_SCROLL_ROUNDS = int(os.getenv("MAX_SCROLL_ROUNDS", "12"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "80"))
 RATE_LIMIT_SECONDS = float(os.getenv("SCRAPE_RATE_LIMIT_SECONDS", "1.0"))
-DAY_QUERY_MAX_WORKERS = max(1, min(int(os.getenv("DAY_QUERY_MAX_WORKERS", "2")), MAX_SCRAPER_WORKERS))
+# Memory-safe defaults: keep fan-out conservative unless explicitly overridden.
+DAY_QUERY_MAX_WORKERS = max(1, min(int(os.getenv("DAY_QUERY_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS))
 BENCHMARK_DAY_QUERY_MAX_WORKERS = max(
-    1, min(int(os.getenv("BENCHMARK_DAY_QUERY_MAX_WORKERS", "2")), MAX_SCRAPER_WORKERS)
+    1, min(int(os.getenv("BENCHMARK_DAY_QUERY_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS)
 )
-FIXED_POOL_MAX_WORKERS = max(1, min(int(os.getenv("FIXED_POOL_MAX_WORKERS", "3")), MAX_SCRAPER_WORKERS))
+FIXED_POOL_MAX_WORKERS = max(1, min(int(os.getenv("FIXED_POOL_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS))
 AIRBNB_DISABLE_MAP_SEARCH = bool(
     str(os.getenv("AIRBNB_DISABLE_MAP_SEARCH", "0")).strip().lower() in ("1", "true", "yes", "on")
 )
@@ -161,6 +162,38 @@ def _run_heartbeat(
                 break
         except Exception as exc:
             logger.error(f"Heartbeat error for {report_id}: {exc}")
+
+
+def _exception_chain_messages(exc: BaseException) -> str:
+    """Flatten exception + cause/context chain into one lowercase string."""
+    parts: List[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        try:
+            parts.append(str(cur))
+        except Exception:
+            pass
+        nxt = cur.__cause__ or cur.__context__
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return " | ".join(parts).lower()
+
+
+def _is_windows_paging_file_error(exc: BaseException) -> bool:
+    """
+    Detect Windows virtual-memory exhaustion symptoms (WinError 1455).
+    Typical markers:
+      - WinError 1455
+      - 'paging file is too small'
+      - OSError errno 22 with Win32 payload 1455 in chained messages
+    """
+    msg = _exception_chain_messages(exc)
+    return (
+        "winerror 1455" in msg
+        or "paging file is too small" in msg
+        or ("oserror(22" in msg and "1455" in msg)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1334,12 +1367,30 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
 
         def _fail(error_msg: str, detail: str = "") -> None:
             """Mark job as error — no mock fallback."""
+            effective_msg = error_msg
+            debug_error = detail or error_msg
+
+            # Convert host-memory crashes into an explicit actionable error.
+            # This avoids opaque "service busy" failures when WinError 1455 occurs.
+            if detail:
+                low = str(detail).lower()
+                if (
+                    "winerror 1455" in low
+                    or "paging file is too small" in low
+                    or ("oserror(22" in low and "1455" in low)
+                ):
+                    effective_msg = (
+                        "Worker host is under memory pressure (Windows virtual memory exhausted). "
+                        "Please increase page file size and retry."
+                    )
+                    debug_error = "host_memory_pressure_winerror_1455"
+
             logger.warning(f"[{report_id}] Failing: {detail or error_msg}")
             db_helpers.fail_job(
                 client, report_id, worker_token,
-                error_message=error_msg,
+                error_message=effective_msg,
                 debug={
-                    "error": detail or error_msg,
+                    "error": debug_error,
                     "worker_host": socket.gethostname(),
                     "worker_version": WORKER_VERSION,
                     "total_ms": round((time.time() - start_time) * 1000),
@@ -2250,13 +2301,21 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         elapsed_ms = round((time.time() - start_time) * 1000)
         error_msg = f"Processing failed: {str(exc)[:200]}"
         logger.error(f"[{report_id}] {error_msg}")
+        is_mem_pressure = _is_windows_paging_file_error(exc)
 
         try:
+            user_error = (
+                "Worker host is under memory pressure (Windows virtual memory exhausted). "
+                "Please increase page file size and retry."
+                if is_mem_pressure
+                else "We encountered an issue processing your report. Please try again."
+            )
+            debug_error = "host_memory_pressure_winerror_1455" if is_mem_pressure else str(exc)
             db_helpers.fail_job(
                 client, report_id, worker_token,
-                error_message="We encountered an issue processing your report. Please try again.",
+                error_message=user_error,
                 debug={
-                    "error": str(exc),
+                    "error": debug_error,
                     "worker_host": socket.gethostname(),
                     "worker_version": WORKER_VERSION,
                     "total_ms": elapsed_ms,
