@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,10 @@ from urllib.parse import urlencode
 
 from worker.core.similarity import comp_urls_match
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
+from worker.scraper.browser_runtime import (
+    build_warmed_browser_client_pool,
+    close_browser_client_pool,
+)
 from worker.scraper.parsers import (
     parse_pdp_response,
     parse_search_listing_context,
@@ -194,15 +199,43 @@ def _enrich_comps_baths_and_property_type_from_pdp(
     if attempted == 0:
         return
 
-    def _fetch(item: Tuple[int, ListingSpec, str]) -> Tuple[int, Optional[float], str, List[str]]:
-        idx, _comp, lid = item
+    max_workers = max(1, min(int(os.getenv("PDP_DETAIL_MAX_WORKERS", str(MAX_SCRAPER_WORKERS))), MAX_SCRAPER_WORKERS))
+    effective_workers = min(max_workers, attempted)
+
+    use_pool = hasattr(client, "config") and isinstance(getattr(client, "config", None), dict)
+    if use_pool:
+        browser_pool = build_warmed_browser_client_pool(
+            base_config=dict(client.config),  # type: ignore[attr-defined]
+            requested_size=effective_workers,
+            pool_name="comp_pdp_enrichment",
+        )
+        browser_locks = [threading.Lock() for _ in browser_pool]
+    else:
+        browser_pool = [client]
+        browser_locks = [threading.Lock()]
+
+    work_args: List[Dict[str, Any]] = []
+    for i, item in enumerate(work_items):
+        work_args.append(
+            {
+                "item": item,
+                "browser_slot": i % len(browser_pool),
+            }
+        )
+
+    def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[float], str, List[str]]:
+        idx, _comp, lid = query_arg["item"]
+        browser_slot = int(query_arg["browser_slot"])
+        slot_client = browser_pool[browser_slot]
+        slot_lock = browser_locks[browser_slot]
         try:
-            pdp_data = client.get_listing_details(
-                lid,
-                checkin=checkin,
-                checkout=checkout,
-                adults=adults,
-            )
+            with slot_lock:
+                pdp_data = slot_client.get_listing_details(
+                    lid,
+                    checkin=checkin,
+                    checkout=checkout,
+                    adults=adults,
+                )
             parsed = parse_pdp_response(
                 pdp_data,
                 lid,
@@ -218,45 +251,49 @@ def _enrich_comps_baths_and_property_type_from_pdp(
         except Exception:
             return idx, None, "", []
 
-    max_workers = max(1, min(int(os.getenv("PDP_DETAIL_MAX_WORKERS", str(MAX_SCRAPER_WORKERS))), MAX_SCRAPER_WORKERS))
     updated = 0
     amenities_populated = 0
-    with ThreadPoolExecutor(max_workers=min(max_workers, attempted)) as ex:
-        futures = [ex.submit(_fetch, item) for item in work_items]
-        for f in as_completed(futures):
-            idx, b_val, p_val, amenities = f.result()
-            comp = comps[idx]
-            changed = False
-            if isinstance(b_val, (int, float)):
-                if comp.baths != float(b_val):
-                    comp.baths = float(b_val)
-                    changed = True
-            if p_val:
-                if comp.property_type != p_val:
-                    comp.property_type = p_val
-                    changed = True
-            if amenities:
-                existing = set(str(a).strip() for a in (comp.amenities or []) if str(a).strip())
-                merged = list(comp.amenities or [])
-                for amenity in amenities:
-                    if amenity not in existing:
-                        merged.append(amenity)
-                        existing.add(amenity)
-                if merged != list(comp.amenities or []):
-                    comp.amenities = merged
-                    changed = True
-                if comp.amenities:
-                    amenities_populated += 1
-            if changed:
-                updated += 1
+    try:
+        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
+            futures = [ex.submit(_fetch, query_arg) for query_arg in work_args]
+            for f in as_completed(futures):
+                idx, b_val, p_val, amenities = f.result()
+                comp = comps[idx]
+                changed = False
+                if isinstance(b_val, (int, float)):
+                    if comp.baths != float(b_val):
+                        comp.baths = float(b_val)
+                        changed = True
+                if p_val:
+                    if comp.property_type != p_val:
+                        comp.property_type = p_val
+                        changed = True
+                if amenities:
+                    existing = set(str(a).strip() for a in (comp.amenities or []) if str(a).strip())
+                    merged = list(comp.amenities or [])
+                    for amenity in amenities:
+                        if amenity not in existing:
+                            merged.append(amenity)
+                            existing.add(amenity)
+                    if merged != list(comp.amenities or []):
+                        comp.amenities = merged
+                        changed = True
+                    if comp.amenities:
+                        amenities_populated += 1
+                if changed:
+                    updated += 1
+    finally:
+        if use_pool:
+            close_browser_client_pool(browser_pool)  # type: ignore[arg-type]
 
     if attempted:
         logger.info(
-            "[comp_collection] PDP enrichment attempted=%s updated=%s amenities_populated=%s workers=%s",
+            "[comp_collection] PDP enrichment attempted=%s updated=%s amenities_populated=%s workers=%s browsers=%s",
             attempted,
             updated,
             amenities_populated,
             max_workers,
+            len(browser_pool),
         )
 
 

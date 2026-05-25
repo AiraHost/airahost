@@ -188,28 +188,57 @@ def _repair_suspicious_comparable_titles(
         limit,
     )
 
-    def _fetch_title(item_url: str):
-        spec, title_warnings = extract_target_spec(client, item_url)
+    use_pool = hasattr(client, "config") and isinstance(getattr(client, "config", None), dict)
+    if use_pool:
+        repair_pool, repair_locks = _build_browser_pool(
+            base_config=dict(client.config),  # type: ignore[attr-defined]
+            requested_workers=worker_count,
+            total_tasks=len(candidates),
+            pool_name="comp_title_repair",
+        )
+    else:
+        repair_pool = [client]
+        repair_locks = [threading.Lock()]
+
+    query_args = [
+        {"item_url": url, "browser_slot": i % len(repair_pool)}
+        for i, (_item, url) in enumerate(candidates)
+    ]
+
+    def _fetch_title(query_arg: Dict[str, Any]):
+        item_url = str(query_arg["item_url"])
+        browser_slot = int(query_arg["browser_slot"])
+        slot_client = repair_pool[browser_slot]
+        slot_lock = repair_locks[browser_slot]
+        with slot_lock:
+            spec, title_warnings = extract_target_spec(slot_client, item_url)
         return item_url, spec, title_warnings
 
     repaired = 0
-    with ThreadPoolExecutor(max_workers=worker_count) as ex:
-        future_map = {ex.submit(_fetch_title, url): (item, url) for item, url in candidates}
-        for future in as_completed(future_map):
-            item, url = future_map[future]
-            try:
-                _, spec, title_warnings = future.result()
-            except Exception as exc:
-                extraction_warnings.append(f"Comparable title repair failed for {url}: {exc}")
-                continue
-            extraction_warnings.extend(title_warnings)
-            if repaired >= limit:
-                continue
-            resolved_title = spec.title
-            if resolved_title and not _title_looks_suspicious(resolved_title):
-                item["title"] = resolved_title
-                repaired += 1
-                logger.info(f"[comp_title] repaired title for {url} -> {resolved_title!r}")
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            future_map = {
+                ex.submit(_fetch_title, query_arg): (item, url)
+                for (item, url), query_arg in zip(candidates, query_args)
+            }
+            for future in as_completed(future_map):
+                item, url = future_map[future]
+                try:
+                    _, spec, title_warnings = future.result()
+                except Exception as exc:
+                    extraction_warnings.append(f"Comparable title repair failed for {url}: {exc}")
+                    continue
+                extraction_warnings.extend(title_warnings)
+                if repaired >= limit:
+                    continue
+                resolved_title = spec.title
+                if resolved_title and not _title_looks_suspicious(resolved_title):
+                    item["title"] = resolved_title
+                    repaired += 1
+                    logger.info(f"[comp_title] repaired title for {url} -> {resolved_title!r}")
+    finally:
+        if use_pool:
+            close_browser_client_pool(repair_pool)  # type: ignore[arg-type]
 
 
 def _repair_incomplete_comparable_specs(
@@ -248,50 +277,79 @@ def _repair_incomplete_comparable_specs(
         limit,
     )
 
-    def _fetch_spec(item_url: str):
-        spec, warnings = extract_target_spec(client, item_url)
+    use_pool = hasattr(client, "config") and isinstance(getattr(client, "config", None), dict)
+    if use_pool:
+        repair_pool, repair_locks = _build_browser_pool(
+            base_config=dict(client.config),  # type: ignore[attr-defined]
+            requested_workers=worker_count,
+            total_tasks=len(candidates),
+            pool_name="comp_spec_repair",
+        )
+    else:
+        repair_pool = [client]
+        repair_locks = [threading.Lock()]
+
+    query_args = [
+        {"item_url": url, "browser_slot": i % len(repair_pool)}
+        for i, (_item, url) in enumerate(candidates)
+    ]
+
+    def _fetch_spec(query_arg: Dict[str, Any]):
+        item_url = str(query_arg["item_url"])
+        browser_slot = int(query_arg["browser_slot"])
+        slot_client = repair_pool[browser_slot]
+        slot_lock = repair_locks[browser_slot]
+        with slot_lock:
+            spec, warnings = extract_target_spec(slot_client, item_url)
         return item_url, spec, warnings
 
     repaired = 0
-    with ThreadPoolExecutor(max_workers=worker_count) as ex:
-        future_map = {ex.submit(_fetch_spec, url): (item, url) for item, url in candidates}
-        for future in as_completed(future_map):
-            item, url = future_map[future]
-            try:
-                _, spec, warnings = future.result()
-            except Exception as exc:
-                extraction_warnings.append(f"Comparable spec repair failed for {url}: {exc}")
-                continue
-            extraction_warnings.extend(warnings)
-            if repaired >= limit:
-                continue
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            future_map = {
+                ex.submit(_fetch_spec, query_arg): (item, url)
+                for (item, url), query_arg in zip(candidates, query_args)
+            }
+            for future in as_completed(future_map):
+                item, url = future_map[future]
+                try:
+                    _, spec, warnings = future.result()
+                except Exception as exc:
+                    extraction_warnings.append(f"Comparable spec repair failed for {url}: {exc}")
+                    continue
+                extraction_warnings.extend(warnings)
+                if repaired >= limit:
+                    continue
 
-            if spec.title and _title_looks_suspicious(str(item.get("title") or "")):
-                item["title"] = spec.title
-            if spec.property_type:
-                item["propertyType"] = spec.property_type
-            if isinstance(spec.accommodates, (int, float)):
-                item["accommodates"] = int(spec.accommodates)
-            if isinstance(spec.bedrooms, (int, float)):
-                item["bedrooms"] = int(spec.bedrooms)
-            if isinstance(spec.baths, (int, float)):
-                item["baths"] = round(float(spec.baths), 1)
-            if spec.location:
-                item["location"] = spec.location
-            if isinstance(spec.rating, (int, float)) and item.get("rating") is None:
-                item["rating"] = round(float(spec.rating), 2)
-            if isinstance(spec.reviews, (int, float)) and item.get("reviews") is None:
-                item["reviews"] = int(spec.reviews)
+                if spec.title and _title_looks_suspicious(str(item.get("title") or "")):
+                    item["title"] = spec.title
+                if spec.property_type:
+                    item["propertyType"] = spec.property_type
+                if isinstance(spec.accommodates, (int, float)):
+                    item["accommodates"] = int(spec.accommodates)
+                if isinstance(spec.bedrooms, (int, float)):
+                    item["bedrooms"] = int(spec.bedrooms)
+                if isinstance(spec.baths, (int, float)):
+                    item["baths"] = round(float(spec.baths), 1)
+                if spec.location:
+                    item["location"] = spec.location
+                if isinstance(spec.rating, (int, float)) and item.get("rating") is None:
+                    item["rating"] = round(float(spec.rating), 2)
+                if isinstance(spec.reviews, (int, float)) and item.get("reviews") is None:
+                    item["reviews"] = int(spec.reviews)
 
-            repaired += 1
-            logger.info(
-                "[comp_spec] repaired %s -> accommodates=%s bedrooms=%s baths=%s location=%r",
-                url,
-                item.get("accommodates"),
-                item.get("bedrooms"),
-                item.get("baths"),
-                item.get("location"),
-            )
+                repaired += 1
+                logger.info(
+                    "[comp_spec] repaired %s -> accommodates=%s bedrooms=%s baths=%s location=%r",
+                    url,
+                    item.get("accommodates"),
+                    item.get("bedrooms"),
+                    item.get("baths"),
+                    item.get("location"),
+                )
+    finally:
+        if use_pool:
+            close_browser_client_pool(repair_pool)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
