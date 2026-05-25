@@ -24,6 +24,7 @@ import re
 import statistics
 import time
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime as dt, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -40,6 +41,10 @@ from worker.core.similarity import (
     similarity_score,
 )
 from worker.scraper.airbnb_client import AirbnbClient
+from worker.scraper.browser_runtime import (
+    build_warmed_browser_client_pool,
+    close_browser_client_pool,
+)
 from worker.scraper.parsers import (
     parse_search_listing_context,
     parse_search_response,
@@ -79,6 +84,22 @@ def _bounded_workers(env_name: str, default: int = 2) -> int:
     except (TypeError, ValueError):
         value = int(default)
     return max(1, min(value, MAX_SCRAPER_WORKERS))
+
+
+def _build_browser_pool(
+    *,
+    base_config: Dict[str, Any],
+    requested_workers: int,
+    total_tasks: int,
+    pool_name: str,
+) -> Tuple[List[AirbnbClient], List[threading.Lock]]:
+    desired_size = max(1, min(int(requested_workers), int(total_tasks) if total_tasks > 0 else 1))
+    pool = build_warmed_browser_client_pool(
+        base_config=base_config,
+        requested_size=desired_size,
+        pool_name=pool_name,
+    )
+    return pool, [threading.Lock() for _ in pool]
 
 
 def _title_looks_suspicious(title: str) -> bool:
@@ -1570,25 +1591,49 @@ def run_scrape(
             query_criteria["reportRanking"] = "per_day_top_k"
             query_criteria["perDayTopK"] = max(1, int(top_k))
 
-            def _run_day_query(night_idx: int) -> DayResult:
+            day_loop_start = time.time()
+            _day_query_workers = _bounded_workers("DAY_QUERY_MAX_WORKERS", 5)
+            _day_query_pool, _day_query_locks = _build_browser_pool(
+                base_config=client.config,
+                requested_workers=_day_query_workers,
+                total_tasks=len(sample_indices),
+                pool_name="day_query",
+            )
+            _day_query_workers = len(_day_query_pool)
+            _day_query_args = [
+                {"night_idx": night_idx, "browser_slot": i % _day_query_workers}
+                for i, night_idx in enumerate(sample_indices)
+            ]
+            logger.info(
+                f"[day_query] concurrent execution: workers={_day_query_workers}, "
+                f"browsers={_day_query_workers}, dates={len(sample_indices)}, "
+                f"rate_limit_seconds={rate_limit_seconds}"
+            )
+
+            def _run_day_query(query_arg: Dict[str, int]) -> DayResult:
+                night_idx = int(query_arg["night_idx"])
+                browser_slot = int(query_arg["browser_slot"])
+                day_client = _day_query_pool[browser_slot]
+                day_lock = _day_query_locks[browser_slot]
                 date_i = all_nights[night_idx]
                 result: Optional[DayResult] = None
                 for attempt in range(1, PER_DAY_MAX_RETRIES + 1):
                     time.sleep(rate_limit_seconds)
-                    result = estimate_base_price_for_date(
-                        client,
-                        target,
-                        base_origin,
-                        date_i,
-                        effective_adults,
-                        max_scroll_rounds=_eff_scroll_rounds,
-                        max_cards=_eff_max_cards,
-                        rate_limit_seconds=rate_limit_seconds,
-                        top_k=top_k,
-                        preferred_comps=preferred_comps,
-                        excluded_room_ids=excluded_room_ids,
-                        max_radius_km=_effective_radius,
-                    )
+                    with day_lock:
+                        result = estimate_base_price_for_date(
+                            day_client,
+                            target,
+                            base_origin,
+                            date_i,
+                            effective_adults,
+                            max_scroll_rounds=_eff_scroll_rounds,
+                            max_cards=_eff_max_cards,
+                            rate_limit_seconds=rate_limit_seconds,
+                            top_k=top_k,
+                            preferred_comps=preferred_comps,
+                            excluded_room_ids=excluded_room_ids,
+                            max_radius_km=_effective_radius,
+                        )
                     if result.median_price is not None:
                         break
                     if attempt < PER_DAY_MAX_RETRIES:
@@ -1603,21 +1648,18 @@ def run_scrape(
                     )
                 return result
 
-            day_loop_start = time.time()
-            _day_query_workers = _bounded_workers("DAY_QUERY_MAX_WORKERS", 5)
-            logger.info(
-                f"[day_query] concurrent execution: workers={_day_query_workers}, "
-                f"dates={len(sample_indices)}, rate_limit_seconds={rate_limit_seconds}"
-            )
-            sampled_results, _runner_state = execute_day_queries_concurrently(
-                query_func=_run_day_query,
-                args_list=sample_indices,
-                max_workers=_day_query_workers,
-                early_stop_threshold=_early_stop_threshold,
-                progress_callback=progress_callback,
-            )
+            try:
+                sampled_results, _runner_state = execute_day_queries_concurrently(
+                    query_func=_run_day_query,
+                    args_list=_day_query_args,
+                    max_workers=_day_query_workers,
+                    early_stop_threshold=_early_stop_threshold,
+                    progress_callback=progress_callback,
+                )
+            finally:
+                close_browser_client_pool(_day_query_pool)
             _queried_night_indices = [
-                sample_indices[i] for i in _runner_state.completed_indices
+                int(_day_query_args[i]["night_idx"]) for i in _runner_state.completed_indices
             ]
             _consecutive_empty_peak = _runner_state.consecutive_empty_peak
             _early_stop_triggered = _runner_state.early_stop_triggered
@@ -2103,41 +2145,62 @@ def run_benchmark_scrape(
             # Step 2: Benchmark day-by-day queries
             from worker.core.benchmark import BENCHMARK_TOP_K
             sampled_results: List[BenchmarkDayResult] = []
-            def _run_benchmark_day_query(night_idx: int) -> BenchmarkDayResult:
-                date_i = all_nights[night_idx]
-                time.sleep(rate_limit_seconds)
-                return estimate_benchmark_price_for_date(
-                    client,
-                    target,
-                    benchmark_url,
-                    base_origin,
-                    date_i,
-                    effective_adults,
-                    secondary_benchmark_urls=secondary_benchmark_urls or [],
-                    benchmark_target_similarity=bm_target_similarity,
-                    max_scroll_rounds=_bm_eff_scroll_rounds,
-                    max_cards=_bm_eff_max_cards,
-                    rate_limit_seconds=rate_limit_seconds,
-                    top_k=BENCHMARK_TOP_K,
-                    max_radius_km=_effective_radius,
-                    excluded_room_ids=excluded_room_ids,
-                )
-
             day_loop_start = time.time()
             _bm_day_query_workers = _bounded_workers("BENCHMARK_DAY_QUERY_MAX_WORKERS", 5)
+            _bm_day_query_pool, _bm_day_query_locks = _build_browser_pool(
+                base_config=client.config,
+                requested_workers=_bm_day_query_workers,
+                total_tasks=len(sample_indices),
+                pool_name="benchmark_day_query",
+            )
+            _bm_day_query_workers = len(_bm_day_query_pool)
+            _bm_day_query_args = [
+                {"night_idx": night_idx, "browser_slot": i % _bm_day_query_workers}
+                for i, night_idx in enumerate(sample_indices)
+            ]
             logger.info(
                 f"[benchmark/day_query] concurrent execution: workers={_bm_day_query_workers}, "
-                f"dates={len(sample_indices)}, rate_limit_seconds={rate_limit_seconds}"
+                f"browsers={_bm_day_query_workers}, dates={len(sample_indices)}, "
+                f"rate_limit_seconds={rate_limit_seconds}"
             )
-            sampled_results, _bm_runner_state = execute_day_queries_concurrently(
-                query_func=_run_benchmark_day_query,
-                args_list=sample_indices,
-                max_workers=_bm_day_query_workers,
-                early_stop_threshold=_bm_early_stop_threshold,
-                progress_callback=progress_callback,
-            )
+
+            def _run_benchmark_day_query(query_arg: Dict[str, int]) -> BenchmarkDayResult:
+                night_idx = int(query_arg["night_idx"])
+                browser_slot = int(query_arg["browser_slot"])
+                day_client = _bm_day_query_pool[browser_slot]
+                day_lock = _bm_day_query_locks[browser_slot]
+                date_i = all_nights[night_idx]
+                time.sleep(rate_limit_seconds)
+                with day_lock:
+                    return estimate_benchmark_price_for_date(
+                        day_client,
+                        target,
+                        benchmark_url,
+                        base_origin,
+                        date_i,
+                        effective_adults,
+                        secondary_benchmark_urls=secondary_benchmark_urls or [],
+                        benchmark_target_similarity=bm_target_similarity,
+                        max_scroll_rounds=_bm_eff_scroll_rounds,
+                        max_cards=_bm_eff_max_cards,
+                        rate_limit_seconds=rate_limit_seconds,
+                        top_k=BENCHMARK_TOP_K,
+                        max_radius_km=_effective_radius,
+                        excluded_room_ids=excluded_room_ids,
+                    )
+
+            try:
+                sampled_results, _bm_runner_state = execute_day_queries_concurrently(
+                    query_func=_run_benchmark_day_query,
+                    args_list=_bm_day_query_args,
+                    max_workers=_bm_day_query_workers,
+                    early_stop_threshold=_bm_early_stop_threshold,
+                    progress_callback=progress_callback,
+                )
+            finally:
+                close_browser_client_pool(_bm_day_query_pool)
             _bm_queried_night_indices = [
-                sample_indices[i] for i in _bm_runner_state.completed_indices
+                int(_bm_day_query_args[i]["night_idx"]) for i in _bm_runner_state.completed_indices
             ]
             _bm_consecutive_empty_peak = _bm_runner_state.consecutive_empty_peak
             _bm_early_stop_triggered = _bm_runner_state.early_stop_triggered

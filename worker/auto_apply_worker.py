@@ -186,6 +186,7 @@ def main() -> None:
         STALE_MINUTES,
         CDP_URL,
     )
+
     client = db_helpers.get_client()
 
     backoff = POLL_SECONDS

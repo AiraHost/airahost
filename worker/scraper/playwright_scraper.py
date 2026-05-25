@@ -1249,6 +1249,12 @@ class PlaywrightScraper:
             self._runtime_owner_tid = None
             self._loop_ready.clear()
 
+    def ensure_browser_ready(self) -> None:
+        async def _warm() -> None:
+            await self._get_thread_context()
+
+        self._run_async(_warm(), op_name="ensure_browser_ready")
+
     def __del__(self):
         try:
             self.close_browser()

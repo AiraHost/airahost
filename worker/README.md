@@ -262,6 +262,7 @@ The `worker/logs/` directory is created automatically on first run.
 | `SUPABASE_URL` | (required) | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | (required) | Service role key for DB access |
 | `CDP_URL` | `http://127.0.0.1:9222` | Chrome DevTools Protocol URL |
+| `CDP_URLS` | (optional) | Comma-separated CDP URLs used for up to 3 browser slots (falls back to `CDP_URL`) |
 | `WORKER_POLL_SECONDS` | `5` | Seconds between queue polls |
 | `WORKER_STALE_MINUTES` | `15` | Minutes before a running job is considered stale |
 | `WORKER_MAX_ATTEMPTS` | `3` | Max retry attempts per report |
@@ -271,9 +272,9 @@ The `worker/logs/` directory is created automatically on first run.
 | `MAX_SCROLL_ROUNDS` | `12` | Max scroll iterations when collecting comps |
 | `MAX_CARDS` | `80` | Max comparable listings to collect |
 | `SCRAPE_RATE_LIMIT_SECONDS` | `1.0` | Sleep between external requests |
-| `DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for day-by-day scrape queries (min 1, max 8) |
-| `BENCHMARK_DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for benchmark-first day queries (min 1, max 8) |
-| `FIXED_POOL_MAX_WORKERS` | `3` | Parallel workers for fixed-pool setup anchor searches (min 1, max 8) |
+| `DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for day-by-day scrape queries (min 1, max 3) |
+| `BENCHMARK_DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for benchmark-first day queries (min 1, max 3) |
+| `FIXED_POOL_MAX_WORKERS` | `3` | Parallel workers for fixed-pool setup anchor searches (min 1, max 3) |
 | `FIXED_POOL_PAGES` | `6` | Search pages scanned per fixed-pool anchor before ranking by similarity |
 | `FIXED_POOL_PER_ANCHOR` | `15` | Top-N most similar comps kept per fixed-pool anchor |
 | `FIXED_POOL_GLOBAL_LIMIT` | `15` | Final fixed compset cap; higher-similarity comps replace the current lowest |

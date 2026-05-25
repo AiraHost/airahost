@@ -66,6 +66,25 @@ class AirbnbClient:
     def refresh_session(self, force_capture: bool = False, bypass_cooldown: bool = False):
         return self._get_playwright_scraper().refresh_session(force_capture=force_capture, bypass_cooldown=bypass_cooldown)
 
+    @property
+    def cdp_url(self) -> str:
+        raw = self.config.get("CDP_URL")
+        if raw is None:
+            raw = os.getenv("CDP_URL", "http://127.0.0.1:9222")
+        value = str(raw or "").strip()
+        return value or "http://127.0.0.1:9222"
+
+    def ensure_browser_ready(self) -> None:
+        self._get_playwright_scraper().ensure_browser_ready()
+
+    def close_browser(self) -> None:
+        if self._playwright_scraper is None:
+            return
+        try:
+            self._playwright_scraper.close_browser()
+        except Exception:
+            pass
+
     def fork(self) -> "AirbnbClient":
         clone = AirbnbClient.__new__(AirbnbClient)
         clone.config = dict(self.config)
@@ -73,6 +92,7 @@ class AirbnbClient:
         clone.guest_favorite_only = self.guest_favorite_only
         clone._playwright_scraper = self._playwright_scraper.fork() if self._playwright_scraper is not None else None
         clone._deepbnb_session = requests.Session()
+        clone._deepbnb_disabled_for_task = self._deepbnb_disabled_for_task
         if clone._playwright_scraper is not None:
             for cookie in clone._playwright_scraper.session.cookies:
                 clone._deepbnb_session.cookies.set(

@@ -8,7 +8,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-MAX_SCRAPER_WORKERS = 5
+MAX_SCRAPER_WORKERS = 3
 
 
 @dataclass

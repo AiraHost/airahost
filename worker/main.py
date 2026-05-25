@@ -647,42 +647,59 @@ def _capture_user_listing_prices_for_range(
     """
     from datetime import datetime as _dt, timedelta as _td
     from worker.core.concurrent_runner import execute_day_queries_concurrently
-    from worker.scraper.airbnb_client import AirbnbClient
+    from worker.scraper.browser_runtime import (
+        build_warmed_browser_client_pool,
+        close_browser_client_pool,
+    )
     from worker.scraper.target_extractor import capture_target_live_price
 
     start = _dt.strptime(start_date, "%Y-%m-%d")
     end = _dt.strptime(end_date, "%Y-%m-%d")
     total_days = max(1, (end - start).days)
     nights = max(1, int(minimum_booking_nights or 1))
-    def _capture_for_index(i: int) -> Dict[str, Any]:
+    worker_count = DAY_QUERY_MAX_WORKERS
+    browser_pool = build_warmed_browser_client_pool(
+        base_config={
+            "CHECKIN": start_date,
+            "CHECKOUT": end_date,
+            "ADULTS": 1,
+            "USE_DEEPBNB_BACKEND": False,
+            "CDP_URL": CDP_URL,
+        },
+        requested_size=max(1, min(worker_count, total_days)),
+        pool_name="self_price_capture",
+    )
+    browser_locks = [threading.Lock() for _ in browser_pool]
+    browser_count = len(browser_pool)
+    query_args = [
+        {"day_index": i, "browser_slot": i % browser_count}
+        for i in range(total_days)
+    ]
+
+    def _capture_for_index(query_arg: Dict[str, int]) -> Dict[str, Any]:
+        i = int(query_arg["day_index"])
+        browser_slot = int(query_arg["browser_slot"])
+        playwright_live_client = browser_pool[browser_slot]
+        day_lock = browser_locks[browser_slot]
         checkin_dt = start + _td(days=i)
         checkin = checkin_dt.strftime("%Y-%m-%d")
         checkout = (checkin_dt + _td(days=nights)).strftime("%Y-%m-%d")
         logger.info(
             f"[{report_id}] [self_price_capture] day_start "
-            f"index={i} checkin={checkin} checkout={checkout} nights={nights}"
+            f"index={i} browser_slot={browser_slot} checkin={checkin} checkout={checkout} nights={nights}"
         )
         time.sleep(RATE_LIMIT_SECONDS)
-        # Strict isolation: never reuse Playwright client/scraper objects across
-        # user-listing day captures.
-        playwright_live_client = AirbnbClient(
-            {
-                "CHECKIN": start_date,
-                "CHECKOUT": end_date,
-                "ADULTS": 1,
-                "USE_DEEPBNB_BACKEND": False,
-            }
-        )
         try:
-            live = capture_target_live_price(
-                listing_url=listing_url,
-                checkin=checkin,
-                checkout=checkout,
-                cdp_url=CDP_URL,
-                cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
-                client=playwright_live_client,
-                allow_retry_matrix=False,
-            )
+            with day_lock:
+                live = capture_target_live_price(
+                    listing_url=listing_url,
+                    checkin=checkin,
+                    checkout=checkout,
+                    cdp_url=playwright_live_client.cdp_url,
+                    cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
+                    client=playwright_live_client,
+                    allow_retry_matrix=False,
+                )
             logger.info(
                 f"[{report_id}] [self_price_capture] day_result_raw "
                 f"date={checkin} status={live.get('livePriceStatus')} "
@@ -700,11 +717,6 @@ def _capture_user_listing_prices_for_range(
                 "livePriceStatus": "scrape_failed",
                 "livePriceStatusReason": str(exc)[:300],
             }
-        finally:
-            try:
-                playwright_live_client._get_playwright_scraper().close_browser()  # type: ignore[attr-defined]
-            except Exception:
-                pass
 
         obs = live.get("observedListingPrice")
         price = round(float(obs)) if isinstance(obs, (int, float)) and obs > 0 else None
@@ -722,19 +734,21 @@ def _capture_user_listing_prices_for_range(
             "captured_at": live.get("observedListingPriceCapturedAt"),
         }
 
-    # Use the exact same max-worker setting as daily comps/deepbnb day-query pool.
-    worker_count = DAY_QUERY_MAX_WORKERS
     logger.info(
         f"[{report_id}] user-listing daily capture phase start "
-        f"(after daily-query phase complete): workers={worker_count}, dates={total_days}"
+        f"(after daily-query phase complete): workers={worker_count}, "
+        f"browsers={browser_count}, dates={total_days}"
     )
-    rows, _state = execute_day_queries_concurrently(
-        query_func=_capture_for_index,
-        args_list=list(range(total_days)),
-        max_workers=worker_count,
-        early_stop_threshold=None,
-        progress_callback=None,
-    )
+    try:
+        rows, _state = execute_day_queries_concurrently(
+            query_func=_capture_for_index,
+            args_list=query_args,
+            max_workers=min(worker_count, browser_count),
+            early_stop_threshold=None,
+            progress_callback=None,
+        )
+    finally:
+        close_browser_client_pool(browser_pool)
 
     price_by_date: Dict[str, int] = {}
     first_day_row: Optional[Dict[str, Any]] = None
