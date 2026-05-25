@@ -676,9 +676,9 @@ def _capture_user_listing_prices_for_range(
         for i in range(total_days)
     ]
 
-    def _capture_for_index(query_arg: Dict[str, int]) -> Dict[str, Any]:
-        i = int(query_arg["day_index"])
-        browser_slot = int(query_arg["browser_slot"])
+    def _capture_for_index(*, day_index: int, browser_slot: int) -> Dict[str, Any]:
+        i = int(day_index)
+        browser_slot = int(browser_slot)
         playwright_live_client = browser_pool[browser_slot]
         day_lock = browser_locks[browser_slot]
         checkin_dt = start + _td(days=i)

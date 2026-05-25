@@ -1668,9 +1668,9 @@ def run_scrape(
                 f"rate_limit_seconds={rate_limit_seconds}"
             )
 
-            def _run_day_query(query_arg: Dict[str, int]) -> DayResult:
-                night_idx = int(query_arg["night_idx"])
-                browser_slot = int(query_arg["browser_slot"])
+            def _run_day_query(*, night_idx: int, browser_slot: int) -> DayResult:
+                night_idx = int(night_idx)
+                browser_slot = int(browser_slot)
                 day_client = _day_query_pool[browser_slot]
                 day_lock = _day_query_locks[browser_slot]
                 date_i = all_nights[night_idx]
@@ -2222,9 +2222,9 @@ def run_benchmark_scrape(
                 f"rate_limit_seconds={rate_limit_seconds}"
             )
 
-            def _run_benchmark_day_query(query_arg: Dict[str, int]) -> BenchmarkDayResult:
-                night_idx = int(query_arg["night_idx"])
-                browser_slot = int(query_arg["browser_slot"])
+            def _run_benchmark_day_query(*, night_idx: int, browser_slot: int) -> BenchmarkDayResult:
+                night_idx = int(night_idx)
+                browser_slot = int(browser_slot)
                 day_client = _bm_day_query_pool[browser_slot]
                 day_lock = _bm_day_query_locks[browser_slot]
                 date_i = all_nights[night_idx]

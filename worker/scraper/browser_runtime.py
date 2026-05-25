@@ -97,6 +97,15 @@ def _is_local_host(host: Optional[str]) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
+def _format_host_for_url(host: str) -> str:
+    raw = str(host or "").strip()
+    if not raw:
+        return raw
+    if ":" in raw and not raw.startswith("["):
+        return f"[{raw}]"
+    return raw
+
+
 def _is_cdp_endpoint(url: str, timeout_seconds: float = 0.25) -> bool:
     base, _host, _port = _cdp_http_base(url)
     if not base:
@@ -136,8 +145,9 @@ def _discover_local_cdp_urls(seed_cdp_url: str) -> List[str]:
         discovery_timeout = 0.25
 
     discovered: List[str] = []
+    host_for_url = _format_host_for_url(host)
     for candidate_port in ports:
-        candidate = f"http://{host}:{int(candidate_port)}"
+        candidate = f"http://{host_for_url}:{int(candidate_port)}"
         if _is_cdp_endpoint(candidate, timeout_seconds=max(0.05, discovery_timeout)):
             discovered.append(candidate)
             if len(discovered) >= MAX_BROWSER_CLIENTS:
@@ -160,7 +170,9 @@ def build_warmed_browser_client_pool(
         parsed_size = 1
     requested_pool_size = max(1, min(parsed_size, MAX_BROWSER_CLIENTS))
     cdp_urls = resolve_cdp_urls(base_config)
-    pool_size = max(1, min(requested_pool_size, len(cdp_urls)))
+    if not cdp_urls:
+        cdp_urls = [str(base_config.get("CDP_URL") or "http://127.0.0.1:9222")]
+    pool_size = requested_pool_size
     logger.info(
         "[%s] browser pool init requested=%s active=%s endpoints=%s urls=%s",
         pool_name,
