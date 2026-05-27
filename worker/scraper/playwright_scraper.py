@@ -219,6 +219,52 @@ class PlaywrightScraper:
             return future.result(timeout=float(timeout_seconds))
         return future.result()
 
+    @staticmethod
+    def _is_recoverable_browser_failure(exc: BaseException) -> bool:
+        messages: List[str] = []
+        seen: set[int] = set()
+        current: Optional[BaseException] = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            messages.append(str(current or "").lower())
+            next_exc = current.__cause__ or current.__context__
+            current = next_exc if isinstance(next_exc, BaseException) else None
+        error_text = " | ".join(messages)
+        markers = (
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "browser disconnected",
+            "connection closed while reading from the driver",
+            "failed to open a new tab",
+            "page crashed",
+            "target crashed",
+        )
+        return any(marker in error_text for marker in markers)
+
+    def _reset_browser_connection_after_failure(self, exc: BaseException, *, op_name: str) -> bool:
+        if not self._is_recoverable_browser_failure(exc):
+            return False
+        logger.warning(
+            "Playwright browser became unavailable during %s; resetting CDP session before one retry: %s",
+            op_name,
+            exc,
+        )
+        try:
+            self._run_async(
+                self._close_browser_async(),
+                op_name=f"{op_name}_browser_reset",
+                timeout_seconds=20,
+            )
+        except Exception as reset_exc:
+            logger.warning("Playwright CDP session reset failed during %s: %s", op_name, reset_exc)
+            self._context = None
+            self._context_owned = False
+            self._browser = None
+            self._pw = None
+        return True
+
     async def _open_capped_page(self, context):
         await self._acquire_tab_slot()
         try:
@@ -365,7 +411,12 @@ class PlaywrightScraper:
                 return result
             finally:
                 await self._close_capped_page(page)
-        return self._run_async(_run(), op_name="browse_url_html")
+        try:
+            return self._run_async(_run(), op_name="browse_url_html")
+        except Exception as exc:
+            if not self._reset_browser_connection_after_failure(exc, op_name="browse_url_html"):
+                raise
+            return self._run_async(_run(), op_name="browse_url_html_retry")
 
     def _load_hardcoded_stayspdp_template(self) -> bool:
         if not isinstance(HARDCODED_STAYS_PDP_TEMPLATE, dict):
@@ -968,6 +1019,7 @@ class PlaywrightScraper:
                 last_exc = exc
                 logger.warning("Browser StaysSearch attempt %s/2 failed: %s", attempt, exc)
                 if attempt < 2:
+                    self._reset_browser_connection_after_failure(exc, op_name="search_listings")
                     time.sleep(1.0)
         raise RuntimeError(f"Playwright browser search failed after 2 attempts: {last_exc}")
 
@@ -1723,6 +1775,10 @@ class PlaywrightScraper:
                 last_exc = exc
                 logger.warning("Browser StaysSearch(with overrides) attempt %s/2 failed: %s", attempt, exc)
                 if attempt < 2:
+                    self._reset_browser_connection_after_failure(
+                        exc,
+                        op_name="search_listings_with_overrides",
+                    )
                     time.sleep(1.0)
         raise RuntimeError(f"Playwright browser search(with overrides) failed after 2 attempts: {last_exc}")
 
@@ -1762,8 +1818,9 @@ class PlaywrightScraper:
         effective_checkin = checkin or self.config.get("CHECKIN", "")
         effective_checkout = checkout or self.config.get("CHECKOUT", "")
         effective_adults = int(adults if adults is not None else self.config.get("ADULTS", 1))
-        # PDP is single-shot by design: callers handle fallback after one failure.
-        max_attempts = 1
+        # Ordinary PDP failures remain single-shot. A dead browser handle gets
+        # one reconnect attempt so later work is not sent into a stale context.
+        max_attempts = 2
         try:
             pdp_attempt_timeout_seconds = max(
                 5.0, float(self.config.get("PDP_BROWSER_ATTEMPT_TIMEOUT_SECONDS", 45))
@@ -1786,11 +1843,18 @@ class PlaywrightScraper:
                 return response_data
             except Exception as exc:
                 last_exc = exc
+                will_retry = (
+                    attempt < max_attempts
+                    and self._reset_browser_connection_after_failure(
+                        exc,
+                        op_name="get_listing_details",
+                    )
+                )
                 logger.warning(
-                    "Browser PDP attempt %s/%s failed for listing=%s: %s",
+                    "Browser PDP attempt %s failed for listing=%s retrying_after_browser_reset=%s: %s",
                     attempt,
-                    max_attempts,
                     listing_id,
+                    will_retry,
                     exc,
                 )
                 if _is_cdp_connect_error(exc):
@@ -1799,6 +1863,8 @@ class PlaywrightScraper:
                         listing_id,
                     )
                     break
+                if not will_retry:
+                    break
         raise RuntimeError(
-            f"Playwright browser PDP failed after {max_attempts} attempts for listing={listing_id}: {last_exc}"
+            f"Playwright browser PDP failed for listing={listing_id}: {last_exc}"
         )
