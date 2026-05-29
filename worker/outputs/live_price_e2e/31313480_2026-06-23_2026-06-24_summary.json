@@ -1,0 +1,31 @@
+{
+  "listing_id": "31313480",
+  "checkin": "2026-06-23",
+  "checkout": "2026-06-24",
+  "listing_url_with_dates": "https://www.airbnb.com/rooms/31313480?check_in=2026-06-23&check_out=2026-06-24&adults=1&guests=1",
+  "live_result": {
+    "observedListingPrice": 125,
+    "observedListingPriceDate": "2026-06-23",
+    "observedListingPriceCapturedAt": "2026-05-29T07:06:08.663683+00:00",
+    "observedListingPriceSource": "ld_json",
+    "observedListingPriceConfidence": "high",
+    "livePriceStatus": "captured",
+    "livePriceStatusReason": "Nightly price captured from browser HTML for 2026-06-23/2026-06-24 (confidence=high)"
+  },
+  "parsed_price": {
+    "nightly_price": 125.0,
+    "total_price": 125.0,
+    "currency": "USD"
+  },
+  "has_strikethrough": false,
+  "selected_dom_price": {
+    "price": 125.0,
+    "kind": "nightly_standard"
+  },
+  "artifacts": {
+    "raw_pdp": "worker\\outputs\\live_price_e2e\\31313480_2026-06-23_2026-06-24_raw_pdp.json",
+    "dom_candidates": "worker\\outputs\\live_price_e2e\\31313480_2026-06-23_2026-06-24_dom_candidates.json",
+    "screenshot": "worker\\outputs\\live_price_e2e\\31313480_2026-06-23_2026-06-24_page.png",
+    "page_html": "worker\\outputs\\live_price_e2e\\31313480_2026-06-23_2026-06-24_page.html"
+  }
+}

@@ -40,8 +40,8 @@ def test_similarity_city_mismatch_gets_zero_address_weight():
     cand = _spec(city="", location="San Mateo, CA")
 
     # All non-city features match perfectly.
-    # Address(city) contributes 0.0 on mismatch with weight 3.5.
-    expected = 22.5 / 26.0
+    # Address(city) contributes 0.0 on mismatch with weight 5.0.
+    expected = 19.5 / 24.5
     assert similarity_score(target, cand) == pytest.approx(expected)
 
 
@@ -76,8 +76,8 @@ def test_similarity_amenity_weights_penalize_missing_beach_access_more_than_wifi
     score_perfect = similarity_score(target, perfect)
 
     assert score_missing_beach < score_missing_wifi
-    assert (score_missing_wifi - score_missing_beach) > 0.15
-    assert (score_perfect - score_missing_beach) > 0.20
+    assert (score_missing_wifi - score_missing_beach) > 0.08
+    assert (score_perfect - score_missing_beach) > 0.10
 
 
 def test_similarity_missing_low_impact_amenity_has_tiny_effect():

@@ -34,7 +34,7 @@ class PlaywrightScraper:
         self.config = config
         self.base_url = self._normalize_base_url(self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.com"))
         self.locale = str(self.config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA")
-        self.currency = str(self.config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "CAD")) or "CAD")
+        self.currency = str(self.config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "USD")) or "USD")
         self.session = requests.Session()
         self.captured_search_req = None
         self.captured_pdp_req = None
@@ -426,18 +426,36 @@ class PlaywrightScraper:
             return False
         template = copy.deepcopy(HARDCODED_STAYS_PDP_TEMPLATE)
         safe_base = self._normalize_base_url(self.base_url)
+        currency = str(self.currency or "USD").upper()
+
+        def _normalize_query_currency(query: str) -> str:
+            q = str(query or "")
+            if not q:
+                return f"currency={currency}"
+            if re.search(r"(^|&)currency=", q, flags=re.I):
+                return re.sub(
+                    r"(^|&)currency=[^&]*",
+                    lambda m: f"{m.group(1)}currency={currency}",
+                    q,
+                    count=1,
+                    flags=re.I,
+                )
+            return f"{q}&currency={currency}"
+
         try:
             raw_url = str(template.get("url") or "").strip()
             if raw_url:
                 parsed = urlparse(raw_url)
-                query = f"?{parsed.query}" if parsed.query else ""
+                normalized_query = _normalize_query_currency(parsed.query)
+                query = f"?{normalized_query}" if normalized_query else ""
                 template["url"] = f"{safe_base}{parsed.path}{query}"
             headers = template.get("headers")
             if isinstance(headers, dict):
                 raw_referer = str(headers.get("referer") or "").strip()
                 if raw_referer:
                     parsed_ref = urlparse(raw_referer)
-                    query_ref = f"?{parsed_ref.query}" if parsed_ref.query else ""
+                    normalized_query_ref = _normalize_query_currency(parsed_ref.query)
+                    query_ref = f"?{normalized_query_ref}" if normalized_query_ref else ""
                     headers["referer"] = f"{safe_base}{parsed_ref.path}{query_ref}"
         except Exception:
             pass

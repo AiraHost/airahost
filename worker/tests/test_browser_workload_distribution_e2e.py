@@ -429,3 +429,92 @@ def test_self_price_capture_day_query_accepts_runner_keyword_args(monkeypatch):
     assert used_slots.count(0) == 2
     assert used_slots.count(1) == 2
     assert used_slots.count(2) == 2
+
+
+def test_self_price_capture_does_not_backfill_observed_price_from_later_date(monkeypatch):
+    class _PoolClient:
+        def __init__(self, slot_id: int):
+            self.slot_id = slot_id
+            self.cdp_url = f"http://127.0.0.1:{9222 + slot_id}"
+
+        def ensure_browser_ready(self) -> None:
+            return
+
+        def close_browser(self) -> None:
+            return
+
+    browser_pool = [_PoolClient(0)]
+    allow_retry_values: List[bool] = []
+
+    monkeypatch.setattr(worker_main, "DAY_QUERY_MAX_WORKERS", 1)
+    monkeypatch.setattr(worker_main, "RATE_LIMIT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.build_warmed_browser_client_pool",
+        lambda **kwargs: browser_pool,
+    )
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.close_browser_client_pool",
+        lambda _pool: None,
+    )
+
+    def _fake_capture_target_live_price(
+        listing_url,
+        checkin,
+        checkout,
+        cdp_url,
+        cdp_connect_timeout_ms,
+        client,
+        allow_retry_matrix,
+    ):
+        allow_retry_values.append(bool(allow_retry_matrix))
+        if checkin == "2026-06-01":
+            return {
+                "observedListingPrice": None,
+                "livePriceStatus": "no_price_found",
+                "livePriceStatusReason": "No nightly price found",
+                "observedListingPriceSource": None,
+                "observedListingPriceConfidence": "failed",
+                "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+            }
+        return {
+            "observedListingPrice": 155,
+            "livePriceStatus": "captured",
+            "livePriceStatusReason": "",
+            "observedListingPriceSource": "mock",
+            "observedListingPriceConfidence": "high",
+            "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "worker.scraper.target_extractor.capture_target_live_price",
+        _fake_capture_target_live_price,
+    )
+
+    def _fake_execute_day_queries_concurrently(
+        query_func,
+        args_list,
+        max_workers=2,
+        early_stop_threshold=None,
+        progress_callback=None,
+    ):
+        rows = [query_func(**dict(item)) for item in args_list]
+        return rows, object()
+
+    monkeypatch.setattr(
+        "worker.core.concurrent_runner.execute_day_queries_concurrently",
+        _fake_execute_day_queries_concurrently,
+    )
+
+    result = worker_main._capture_user_listing_prices_for_range(
+        report_id="regression-self-price-no-cross-day-backfill",
+        listing_url="https://www.airbnb.com/rooms/123456789",
+        start_date="2026-06-01",
+        end_date="2026-06-03",
+        minimum_booking_nights=1,
+    )
+
+    assert allow_retry_values == [False, False]
+    assert result["capturedDays"] == 1
+    assert result["priceByDate"] == {"2026-06-02": 155}
+    assert result["observedListingPrice"] is None
+    assert result["observedListingPriceDate"] == "2026-06-01"

@@ -752,7 +752,6 @@ def _capture_user_listing_prices_for_range(
 
     price_by_date: Dict[str, int] = {}
     first_day_row: Optional[Dict[str, Any]] = None
-    first_captured_row: Optional[Dict[str, Any]] = None
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -762,14 +761,13 @@ def _capture_user_listing_prices_for_range(
         day_price = row.get("price")
         if isinstance(day_price, (int, float)) and day_price > 0:
             price_by_date[day_date] = round(float(day_price))
-            if first_captured_row is None:
-                first_captured_row = row
 
     _first_day_price = (first_day_row or {}).get("price")
     if isinstance(_first_day_price, (int, float)) and _first_day_price > 0:
         picked = first_day_row or {}
     else:
-        picked = first_captured_row or first_day_row or {}
+        # Strict policy: never substitute observed listing price from a different date.
+        picked = first_day_row or {}
     captured_days = len(price_by_date)
     live_status = "captured" if captured_days > 0 else "no_price_found"
     live_reason = (

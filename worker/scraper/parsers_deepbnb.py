@@ -103,11 +103,11 @@ def parse_deepbnb_search_to_stayssearch_payload(
                 primary_qualifier = "night"
                 sdp = pricing.get("structuredStayDisplayPrice") if isinstance(pricing.get("structuredStayDisplayPrice"), dict) else {}
                 primary_line = sdp.get("primaryLine") if isinstance(sdp.get("primaryLine"), dict) else {}
-                if isinstance(primary_line.get("price"), str):
-                    primary_price = primary_line.get("price")
-                    primary_qualifier = str(primary_line.get("qualifier") or "").lower() or "night"
-                elif isinstance(primary_line.get("discountedPrice"), str):
+                if isinstance(primary_line.get("discountedPrice"), str):
                     primary_price = primary_line.get("discountedPrice")
+                    primary_qualifier = str(primary_line.get("qualifier") or "").lower() or "night"
+                elif isinstance(primary_line.get("price"), str):
+                    primary_price = primary_line.get("price")
                     primary_qualifier = str(primary_line.get("qualifier") or "").lower() or "night"
 
                 if not primary_price and isinstance(pricing.get("rateWithServiceFee"), dict):
@@ -215,7 +215,7 @@ def parse_deepbnb_pdp_to_stayspdp_payload(
         if sid in ("BOOK_IT_FLOATING_FOOTER", "BOOK_IT_SIDEBAR", "BOOK_IT_NAV"):
             sdp = section_data.get("structuredDisplayPrice") if isinstance(section_data.get("structuredDisplayPrice"), dict) else {}
             primary = sdp.get("primaryLine") if isinstance(sdp.get("primaryLine"), dict) else {}
-            for key in ("price", "discountedPrice", "accessibilityLabel"):
+            for key in ("discountedPrice", "price", "accessibilityLabel"):
                 text = primary.get(key)
                 if isinstance(text, str) and _extract_money(text) is not None:
                     primary_price_text = text

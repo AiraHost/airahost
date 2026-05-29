@@ -43,7 +43,7 @@ class DeepBnbBackend:
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
         self.locale = str(config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA")
-        self.currency = str(config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "CAD")) or "CAD")
+        self.currency = str(config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "USD")) or "USD")
         self.api_key = str(
             config.get("AIRBNB_API_KEY")
             or os.getenv("AIRBNB_API_KEY")

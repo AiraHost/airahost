@@ -28,7 +28,8 @@ Applied after filter tiers, before recommend_price().
 
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
 _AMENITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
-_AMENITY_SIMILARITY_WEIGHT: float = 6.0
+_AMENITY_SIMILARITY_WEIGHT: float = 3.0
+_LOCATION_SIMILARITY_WEIGHT: float = 5.0
 
 # Every amenity gets at least this baseline weight. We then override specific
 # amenities with larger weights where market pricing impact is typically higher.
@@ -159,8 +160,8 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
       - baths:         2.0  (tolerance 1.5)
       - rating:        2.0  (tolerance 1.0)
       - reviews:       2.0  (log-scaled count similarity)
-      - address(city): 3.5  (city match = 1.0, else 0.0)
-      - amenities:     6.0  (weighted Jaccard overlap; premium-heavy)
+      - address(city): 5.0  (city match = 1.0, else 0.0)
+      - amenities:     3.0  (weighted Jaccard overlap; premium-heavy)
 
     Property-type mismatch scores 0.0 (not 0.15) because the hard gate in
     filter_similar_candidates already blocks clear type conflicts; this
@@ -240,11 +241,11 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
 
     # Address/city: strict binary signal requested.
     # City match gets full credit; all non-matches (including unknown) get zero.
-    weight_sum += 3.5
+    weight_sum += _LOCATION_SIMILARITY_WEIGHT
     t_city = norm_city(target)
     c_city = norm_city(cand)
     if t_city and c_city and t_city == c_city:
-        score += 3.5
+        score += _LOCATION_SIMILARITY_WEIGHT
 
     if weight_sum <= 0:
         return 0.0

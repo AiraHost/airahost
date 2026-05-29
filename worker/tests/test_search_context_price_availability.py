@@ -226,6 +226,41 @@ def test_parse_search_context_uses_discounted_primary_price_when_available():
     assert row["currency"] == "CAD"
 
 
+def test_parse_search_context_prefers_discounted_primary_price_when_both_fields_exist():
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTY1NjY0MjU2NDc5MTI1Njc0NQ=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "__typename": "DiscountedDisplayPriceLine",
+                                        "price": "$402 CAD",
+                                        "discountedPrice": "$316 CAD",
+                                        "accessibilityLabel": "$316 CAD total, originally $402 CAD",
+                                        "qualifier": "total",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1656642564791256745"]
+    assert row["total_price"] == 316.0
+    assert row["currency"] == "CAD"
+
+
 def test_parse_search_context_falls_back_to_stayssearch_filter_state_and_search_input():
     payload = {
         "data": {
@@ -481,6 +516,40 @@ def test_parse_pdp_response_falls_back_to_primary_accessibility_label():
     out = parse_pdp_response(payload, "1629301846268091180", "https://www.airbnb.ca")
     assert out["total_price"] == 330.0
     assert out["nightly_price"] == 330.0
+    assert out["currency"] == "CAD"
+
+
+def test_parse_pdp_response_prefers_discounted_price_when_both_fields_exist():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_FLOATING_FOOTER",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$402 CAD",
+                                            "discountedPrice": "$316 CAD",
+                                            "accessibilityLabel": "$316 CAD total, originally $402 CAD",
+                                            "qualifier": "total",
+                                        }
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "1656642564791256745", "https://www.airbnb.ca")
+    assert out["total_price"] == 316.0
+    assert out["nightly_price"] == 316.0
     assert out["currency"] == "CAD"
 
 

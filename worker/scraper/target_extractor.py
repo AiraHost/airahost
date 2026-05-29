@@ -1757,7 +1757,7 @@ def capture_target_live_price(
       livePriceStatus                — "captured" | "scrape_failed" | "no_price_found"
       livePriceStatusReason          — str
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
 
     captured_at = datetime.now(timezone.utc).isoformat()
 
@@ -1946,18 +1946,9 @@ def capture_target_live_price(
                 _price = round(float(_total) / _nights, 2)
             return (_price if isinstance(_price, (int, float)) and _price > 0 else None), ("high" if _price else "failed"), _meta
 
-        # Retry matrix: same window adults=1, then adults=2, then next-day window.
+        # Retry matrix: same-day window only (adults=1, then adults=2).
+        # Never shift checkin/checkout to a different date window.
         attempts: List[tuple[str, str, int]] = [(checkin, checkout, 1), (checkin, checkout, 2)]
-        try:
-            _d0 = dt.strptime(checkin, "%Y-%m-%d").date()
-            _d1 = dt.strptime(checkout, "%Y-%m-%d").date()
-            if _d0 <= datetime.now(timezone.utc).date():
-                _span = max(1, (_d1 - _d0).days)
-                _next_checkin = (_d0 + timedelta(days=1)).strftime("%Y-%m-%d")
-                _next_checkout = (_d0 + timedelta(days=1 + _span)).strftime("%Y-%m-%d")
-                attempts.append((_next_checkin, _next_checkout, 2))
-        except Exception:
-            pass
 
         price: Optional[float] = None
         confidence = "failed"

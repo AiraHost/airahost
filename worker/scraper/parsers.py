@@ -797,12 +797,13 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
             row["min_nights"] = int(avail["min_nights"])
 
         # Price source from search payload (strict path only):
-        # available=true + structuredDisplayPrice.primaryLine.{price|discountedPrice}
+        # available=true + structuredDisplayPrice.primaryLine.{discountedPrice|price}
+        # Always prefer discountedPrice when both are present.
         sdp = r.get("structuredDisplayPrice", {})
         if isinstance(sdp, dict):
             primary = sdp.get("primaryLine", {})
             if isinstance(primary, dict):
-                price_text = primary.get("price") or primary.get("discountedPrice")
+                price_text = primary.get("discountedPrice") or primary.get("price")
                 qualifier = str(primary.get("qualifier") or "").lower()
                 accessibility_label = str(primary.get("accessibilityLabel") or "")
 
@@ -1231,7 +1232,7 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             # Airbnb can omit `price` for some PDP contexts while still exposing
             # amount text in `discountedPrice` or `accessibilityLabel`.
             price_candidates: List[str] = []
-            for key in ("price", "discountedPrice", "accessibilityLabel"):
+            for key in ("discountedPrice", "price", "accessibilityLabel"):
                 v = primary.get(key)
                 if isinstance(v, str) and v.strip():
                     price_candidates.append(v.strip())

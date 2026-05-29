@@ -1,0 +1,17 @@
+{
+  "candidates": [
+    {
+      "value": 125,
+      "tripNights": 1,
+      "strikethrough": false,
+      "domIndex": 2
+    }
+  ],
+  "hasWidget": true,
+  "widgetText": "$125 USD\nShow price breakdown\n \nfor 1 night\n$125 USD for 1 night\nCHECK-IN\n6/23/2026\nCHECKOUT\n6/24/2026\nGUESTS\n1 guest\n$0 today · Free cancellation before June 22\nReserve",
+  "nightContainersFound": 0,
+  "usedSiblingFallback": true,
+  "labelsFound": [
+    "for 1 night"
+  ]
+}
