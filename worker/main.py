@@ -196,21 +196,245 @@ def _is_windows_paging_file_error(exc: BaseException) -> bool:
     )
 
 
+def _probe_airbnb_login_state(cdp_url: str, timeout_ms: int) -> Optional[bool]:
+    """
+    Best-effort startup auth probe.
+    Returns:
+      - True  -> appears logged in
+      - False -> login wall detected
+      - None  -> probe failed
+    """
+    check_url = "https://www.airbnb.com/hosting"
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(cdp_url, timeout=timeout_ms)
+            had_contexts = bool(browser.contexts)
+            context = browser.contexts[0] if had_contexts else browser.new_context()
+            created_context = None if had_contexts else context
+            page = context.new_page()
+
+            try:
+                page.goto(check_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1200)
+
+                final_url = str(page.url or "").lower()
+                body_text = ""
+                try:
+                    body_text = (page.locator("body").inner_text(timeout=4000) or "").lower()
+                except Exception:
+                    body_text = ""
+
+                if "/login" in final_url or "log in" in body_text:
+                    return False
+                return True
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                if created_context is not None:
+                    try:
+                        created_context.close()
+                    except Exception:
+                        pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning(f"Startup Airbnb auth probe failed (cdp={cdp_url}): {exc}")
+        return None
+
+
+def _resolve_startup_cdp_urls() -> List[str]:
+    """
+    Resolve CDP endpoints using the same logic as browser pool slot resolution
+    so startup auth checks target the exact browsers the worker will use.
+    """
+    try:
+        from worker.scraper.browser_runtime import resolve_cdp_urls
+
+        urls = resolve_cdp_urls(
+            {
+                "CDP_URL": CDP_URL,
+                "CDP_URLS": os.getenv("CDP_URLS", ""),
+            }
+        )
+    except Exception as exc:
+        logger.warning(f"Startup CDP URL resolution failed; falling back to CDP_URL ({CDP_URL}): {exc}")
+        urls = [CDP_URL]
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(url)
+
+    if not deduped:
+        return [CDP_URL]
+    return deduped[:3]
+
+
+def _run_startup_auto_login_for_cdp(cdp_url: str, slot_index: int) -> bool:
+    try:
+        from worker.airbnb_auto_login import run_login_flow
+    except Exception as exc:
+        logger.warning(f"Startup auto-login import failed for slot={slot_index + 1} cdp={cdp_url}: {exc}")
+        return False
+
+    out_dir = (
+        Path(__file__).resolve().parent
+        / "outputs"
+        / "airbnb_login_debug"
+        / f"slot_{slot_index + 1}"
+    )
+
+    prior_cdp_url = os.getenv("CDP_URL")
+    os.environ["CDP_URL"] = cdp_url
+    try:
+        run_login_flow(out_dir=out_dir, dump_only=False)
+        return True
+    except Exception as exc:
+        logger.warning(f"Startup auto-login flow failed for slot={slot_index + 1} cdp={cdp_url}: {exc}")
+        return False
+    finally:
+        if prior_cdp_url is None:
+            os.environ.pop("CDP_URL", None)
+        else:
+            os.environ["CDP_URL"] = prior_cdp_url
+
+
+def _maybe_run_startup_auto_login() -> None:
+    cdp_urls = _resolve_startup_cdp_urls()
+    logger.info(
+        "Startup Airbnb auth check: validating %s browser slot(s): %s",
+        len(cdp_urls),
+        cdp_urls,
+    )
+
+    all_slots_verified = True
+    for idx, cdp_url in enumerate(cdp_urls):
+        auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
+        if auth_state is True:
+            logger.info(
+                "Startup Airbnb auth probe: slot=%s cdp=%s already logged in.",
+                idx + 1,
+                cdp_url,
+            )
+            continue
+        if auth_state is None:
+            logger.warning(
+                "Startup Airbnb auth probe: slot=%s cdp=%s unavailable; cannot verify login state.",
+                idx + 1,
+                cdp_url,
+            )
+            all_slots_verified = False
+            continue
+
+        logger.warning(
+            "Startup Airbnb auth probe: slot=%s cdp=%s appears logged out. Running auto-login flow.",
+            idx + 1,
+            cdp_url,
+        )
+        ran = _run_startup_auto_login_for_cdp(cdp_url, idx)
+        if not ran:
+            all_slots_verified = False
+            continue
+
+        post_auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
+        if post_auth_state is True:
+            logger.info(
+                "Startup auto-login completed: slot=%s cdp=%s now appears logged in.",
+                idx + 1,
+                cdp_url,
+            )
+        elif post_auth_state is False:
+            logger.warning(
+                "Startup auto-login completed: slot=%s cdp=%s still appears logged out.",
+                idx + 1,
+                cdp_url,
+            )
+            all_slots_verified = False
+        else:
+            logger.warning(
+                "Startup auto-login completed: slot=%s cdp=%s state not verifiable.",
+                idx + 1,
+                cdp_url,
+            )
+            all_slots_verified = False
+
+    if all_slots_verified:
+        logger.info("Startup Airbnb auth check: all browser slots verified logged in.")
+    else:
+        logger.warning(
+            "Startup Airbnb auth check: not all browser slots could be verified logged in. "
+            "Review warnings above."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Job processing
 # ---------------------------------------------------------------------------
 
 
 def _get_listing_url(job: Dict[str, Any]) -> Optional[str]:
-    """Extract listing URL from the job row (multiple possible locations)."""
-    url = job.get("input_listing_url")
-    if url:
-        return url.strip()
+    """Extract canonical listing URL from the job row."""
     attrs = job.get("input_attributes") or {}
-    url = attrs.get("listingUrl") or attrs.get("listing_url")
-    if url:
-        return str(url).strip()
+    attrs_url_raw = attrs.get("listingUrl") or attrs.get("listing_url")
+    attrs_url = str(attrs_url_raw).strip() if attrs_url_raw else None
+    top_url_raw = job.get("input_listing_url")
+    top_url = str(top_url_raw).strip() if top_url_raw else None
+
+    # Canonical source-of-truth is input_attributes.listingUrl. input_listing_url
+    # can lag behind when payload snapshots are stale.
+    if attrs_url:
+        if top_url:
+            attrs_id = _extract_airbnb_listing_id_from_url(attrs_url)
+            top_id = _extract_airbnb_listing_id_from_url(top_url)
+            if attrs_id and top_id and attrs_id != top_id:
+                logger.warning(
+                    "Listing URL mismatch: input_attributes.listingUrl=%s input_listing_url=%s; "
+                    "using input_attributes.listingUrl",
+                    attrs_url,
+                    top_url,
+                )
+        return attrs_url
+
+    if top_url:
+        return top_url
     return None
+
+
+def _resolve_live_capture_adults(attributes: Optional[Dict[str, Any]]) -> int:
+    """
+    Resolve guest count for listing live-price capture from job attributes.
+    Falls back to 1 and clamps to Airbnb's practical upper bound.
+    """
+    attrs = attributes or {}
+    raw = (
+        attrs.get("maxGuests")
+        or attrs.get("adults")
+        or attrs.get("guests")
+        or 1
+    )
+    try:
+        adults = int(raw)
+    except Exception:
+        adults = 1
+    return max(1, min(adults, 16))
 
 
 def _merge_extracted_specs_into_attributes(
@@ -567,6 +791,7 @@ def _build_target_listing_only_daily_results(
     start_date: str,
     end_date: str,
     minimum_booking_nights: int,
+    adults: int,
     report_id: str,
 ) -> List[Dict[str, Any]]:
     """
@@ -584,6 +809,7 @@ def _build_target_listing_only_daily_results(
         start_date=start_date,
         end_date=end_date,
         minimum_booking_nights=minimum_booking_nights,
+        adults=adults,
     )
     by_date: Dict[str, int] = prices_payload.get("priceByDate") or {}
 
@@ -640,6 +866,7 @@ def _capture_user_listing_prices_for_range(
     start_date: str,
     end_date: str,
     minimum_booking_nights: int,
+    adults: int = 1,
 ) -> Dict[str, Any]:
     """
     Capture user-listing nightly prices for each report day using the same
@@ -657,12 +884,16 @@ def _capture_user_listing_prices_for_range(
     end = _dt.strptime(end_date, "%Y-%m-%d")
     total_days = max(1, (end - start).days)
     nights = max(1, int(minimum_booking_nights or 1))
+    try:
+        adults = max(1, min(int(adults), 16))
+    except Exception:
+        adults = 1
     worker_count = DAY_QUERY_MAX_WORKERS
     browser_pool = build_warmed_browser_client_pool(
         base_config={
             "CHECKIN": start_date,
             "CHECKOUT": end_date,
-            "ADULTS": 1,
+            "ADULTS": adults,
             "USE_DEEPBNB_BACKEND": False,
             "CDP_URL": CDP_URL,
         },
@@ -684,9 +915,28 @@ def _capture_user_listing_prices_for_range(
         checkin_dt = start + _td(days=i)
         checkin = checkin_dt.strftime("%Y-%m-%d")
         checkout = (checkin_dt + _td(days=nights)).strftime("%Y-%m-%d")
+        from urllib.parse import urlencode, urlparse
+
+        _parsed_listing = urlparse(str(listing_url))
+        _base_listing_url = f"{_parsed_listing.scheme}://{_parsed_listing.netloc}{_parsed_listing.path}"
+        _capture_query_url = (
+            f"{_base_listing_url}?"
+            + urlencode(
+                {
+                    "check_in": checkin,
+                    "check_out": checkout,
+                    "adults": adults,
+                    "guests": adults,
+                }
+            )
+        )
         logger.info(
             f"[{report_id}] [self_price_capture] day_start "
-            f"index={i} browser_slot={browser_slot} checkin={checkin} checkout={checkout} nights={nights}"
+            f"index={i} browser_slot={browser_slot} checkin={checkin} checkout={checkout} nights={nights} adults={adults}"
+        )
+        logger.info(
+            f"[{report_id}] [price_trace] capture_query date={checkin} "
+            f"url={_capture_query_url}"
         )
         time.sleep(RATE_LIMIT_SECONDS)
         try:
@@ -699,6 +949,7 @@ def _capture_user_listing_prices_for_range(
                     cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
                     client=playwright_live_client,
                     allow_retry_matrix=False,
+                    adults=adults,
                 )
             logger.info(
                 f"[{report_id}] [self_price_capture] day_result_raw "
@@ -707,6 +958,13 @@ def _capture_user_listing_prices_for_range(
                 f"observed={live.get('observedListingPrice')} "
                 f"source={live.get('observedListingPriceSource')} "
                 f"confidence={live.get('observedListingPriceConfidence')}"
+            )
+            logger.info(
+                f"[{report_id}] [price_trace] capture_result date={checkin} "
+                f"price={live.get('observedListingPrice')} "
+                f"source={live.get('observedListingPriceSource')} "
+                f"confidence={live.get('observedListingPriceConfidence')} "
+                f"status={live.get('livePriceStatus')}"
             )
         except Exception as exc:
             logger.warning(
@@ -1158,6 +1416,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         
         address = job.get("input_address", "")
         attributes = job.get("input_attributes") or {}
+        requested_live_capture_adults = _resolve_live_capture_adults(attributes)
         start_date = str(job.get("input_date_start", ""))
         end_date = str(job.get("input_date_end", ""))
         discount_policy = job.get("discount_policy") or {}
@@ -1257,6 +1516,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     start_date=start_date,
                     end_date=end_date,
                     minimum_booking_nights=minimum_booking_nights,
+                    adults=requested_live_capture_adults,
                 )
                 _cache_price_by_date = _cache_live_info.get("priceByDate") or {}
                 for day in calendar:
@@ -1666,6 +1926,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     listing_url=listing_url,
                     checkin=start_date,
                     checkout=end_date,
+                    adults=requested_live_capture_adults,
                     cdp_url=CDP_URL,
                     max_scroll_rounds=MAX_SCROLL_ROUNDS,
                     max_cards=MAX_CARDS,
@@ -1709,6 +1970,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                                 listing_url=listing_url,
                                 checkin=start_date,
                                 checkout=end_date,
+                                adults=requested_live_capture_adults,
                                 cdp_url=CDP_URL,
                                 max_scroll_rounds=MAX_SCROLL_ROUNDS,
                                 max_cards=MAX_CARDS,
@@ -1764,6 +2026,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                                 start_date=start_date,
                                 end_date=end_date,
                                 minimum_booking_nights=minimum_booking_nights,
+                                adults=requested_live_capture_adults,
                                 report_id=report_id,
                             )
                             fallback_valid = [r["median_price"] for r in fallback_daily if r.get("median_price")]
@@ -1803,6 +2066,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                             listing_url=listing_url,
                             checkin=start_date,
                             checkout=end_date,
+                            adults=requested_live_capture_adults,
                             cdp_url=CDP_URL,
                             max_scroll_rounds=MAX_SCROLL_ROUNDS,
                             max_cards=MAX_CARDS,
@@ -1848,6 +2112,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                             start_date=start_date,
                             end_date=end_date,
                             minimum_booking_nights=minimum_booking_nights,
+                            adults=requested_live_capture_adults,
                             report_id=report_id,
                         )
                         fallback_valid = [r["median_price"] for r in fallback_daily if r.get("median_price")]
@@ -2048,12 +2313,14 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         )
         if listing_url:
             _progress(85, "capturing_live_price", "Capturing your current listing prices from Airbnb...")
+            final_live_capture_adults = _resolve_live_capture_adults(finalized_input_attributes)
             live_price_info = _capture_user_listing_prices_for_range(
                 report_id=report_id,
                 listing_url=listing_url,
                 start_date=start_date,
                 end_date=end_date,
                 minimum_booking_nights=minimum_booking_nights,
+                adults=final_live_capture_adults,
             )
             _live_price_by_date = live_price_info.get("priceByDate") or {}
             for day in calendar:
@@ -2074,6 +2341,14 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
 
             # Merge live price fields into summary
             summary.update(live_price_info)
+            logger.info(
+                f"[{report_id}] [price_trace] summary_live_price "
+                f"observed={summary.get('observedListingPrice')} "
+                f"date={summary.get('observedListingPriceDate')} "
+                f"source={summary.get('observedListingPriceSource')} "
+                f"confidence={summary.get('observedListingPriceConfidence')} "
+                f"status={summary.get('livePriceStatus')}"
+            )
 
             # Compute comparison intelligence when observed price is available
             _observed = live_price_info.get("observedListingPrice")
@@ -2365,6 +2640,7 @@ def main():
         f"  auto_apply: stale={AUTO_APPLY_STALE_MINUTES}min, "
         f"max_attempts={AUTO_APPLY_MAX_ATTEMPTS}, cdp={AUTO_APPLY_CDP_URL}"
     )
+    _maybe_run_startup_auto_login()
 
     client = db_helpers.get_client()
     backoff = POLL_SECONDS

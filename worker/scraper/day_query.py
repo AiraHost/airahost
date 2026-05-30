@@ -36,8 +36,8 @@ from worker.core.similarity import (
     similarity_score,
 )
 from worker.scraper.comp_collection import collect_search_comps
-from worker.scraper.parsers import parse_search_listing_context
-from worker.scraper.target_extractor import ListingSpec
+from worker.scraper.parsers import parse_pdp_response, parse_search_listing_context
+from worker.scraper.target_extractor import ListingSpec, safe_domain_base
 
 logger = logging.getLogger("worker.scraper.day_query")
 
@@ -61,6 +61,9 @@ MAP_RADIUS_CAP_KM = 5.0 * 1.609344  # exactly 5 miles
 DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "50"))
 DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "25"))
 DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "25"))
+DAY_QUERY_PDP_REVALIDATE_TOP_N = max(
+    0, int(os.getenv("DAY_QUERY_PDP_REVALIDATE_TOP_N", "5"))
+)
 
 # Relaxed similarity floor — used when the strict floor yields zero comps for a day.
 # Comps in range [SIMILARITY_FLOOR_FALLBACK, SIMILARITY_FLOOR) are accepted only when
@@ -186,6 +189,91 @@ def _get_locked_search_location(client, target: ListingSpec) -> str:
     return canonical
 
 
+def _revalidate_top_comp_prices_with_pdp(
+    client,
+    ranked_comps: List[Tuple[ListingSpec, float]],
+    *,
+    date_i: date,
+    adults: int,
+    top_n: int,
+) -> Dict[str, int]:
+    """
+    Revalidate top comparable prices from PDP for the exact queried date window.
+
+    StaysSearch prices can drift from PDP booking-widget nightly prices by a few
+    dollars. This updates ListingSpec.nightly_price in place for top-ranked comps.
+    """
+    if top_n <= 0 or not ranked_comps:
+        return {"attempted": 0, "updated": 0}
+
+    attempted = 0
+    updated = 0
+    for comp, _score in ranked_comps:
+        if attempted >= top_n:
+            break
+
+        comp_url = str(comp.url or "").strip()
+        comp_id = build_comp_id(comp_url)
+        if not comp_url or not str(comp_id).isdigit():
+            continue
+
+        nights = max(1, int(comp.scrape_nights or 1))
+        checkin = date_i.isoformat()
+        checkout = (date_i + timedelta(days=nights)).isoformat()
+        attempted += 1
+
+        try:
+            pdp_data = client.get_listing_details(
+                str(comp_id),
+                checkin=checkin,
+                checkout=checkout,
+                adults=adults,
+            )
+            parsed = parse_pdp_response(
+                pdp_data,
+                str(comp_id),
+                safe_domain_base(comp_url),
+            )
+            pdp_nightly = parsed.get("nightly_price")
+            if not isinstance(pdp_nightly, (int, float)) or pdp_nightly <= 0:
+                continue
+
+            old_price = comp.nightly_price
+            new_price = round(float(pdp_nightly), 2)
+            comp.nightly_price = new_price
+            comp.currency = str(parsed.get("currency") or comp.currency or "USD")
+            comp.price_kind = "nightly_from_pdp"
+            if nights > 1:
+                total = parsed.get("total_price")
+                if isinstance(total, (int, float)) and total > 0:
+                    comp.query_total_price = round(float(total), 2)
+
+            if not isinstance(old_price, (int, float)) or round(float(old_price), 2) != new_price:
+                updated += 1
+                logger.info(
+                    "[day_query] %s: pdp price revalidated listing=%s nights=%s search_price=%s pdp_price=%s delta=%s",
+                    checkin,
+                    comp_id,
+                    nights,
+                    old_price,
+                    new_price,
+                    (
+                        round(new_price - float(old_price), 2)
+                        if isinstance(old_price, (int, float))
+                        else None
+                    ),
+                )
+        except Exception as exc:
+            logger.info(
+                "[day_query] %s: pdp revalidation skipped listing=%s reason=%s",
+                checkin,
+                comp_id,
+                str(exc)[:200],
+            )
+
+    return {"attempted": attempted, "updated": updated}
+
+
 def estimate_base_price_for_date(
     client,
     target: ListingSpec,
@@ -301,10 +389,6 @@ def estimate_base_price_for_date(
 
         comps_collected = len(comps)
 
-        # Build full comp_prices map (all priced comps, not just top_k).
-        # This populates priceByDate for every comp in comparable listings.
-        all_comp_prices = build_comp_prices_dict(comps)
-
         if comps_collected == 0:
             return DayResult(
                 date=checkin_str,
@@ -414,6 +498,25 @@ def estimate_base_price_for_date(
                     f"day will have no price"
                 )
                 selection_mode = "strict_empty"
+
+        # Search-feed nightly prices can drift from PDP exact-night prices.
+        # Revalidate top-ranked comps so comparable card prices stay accurate.
+        if above_floor and DAY_QUERY_PDP_REVALIDATE_TOP_N > 0:
+            _rv = _revalidate_top_comp_prices_with_pdp(
+                client,
+                above_floor,
+                date_i=date_i,
+                adults=adults,
+                top_n=DAY_QUERY_PDP_REVALIDATE_TOP_N,
+            )
+            if _rv["updated"] > 0:
+                logger.info(
+                    "[day_query] %s: pdp revalidation updated=%s attempted=%s top_n=%s",
+                    checkin_str,
+                    _rv["updated"],
+                    _rv["attempted"],
+                    DAY_QUERY_PDP_REVALIDATE_TOP_N,
+                )
 
         # ── Layer 1 Price Sanity ──────────────────────────────────
         # Applied after the similarity floor.  Severe price outliers
@@ -543,6 +646,8 @@ def estimate_base_price_for_date(
 
         # Price distribution
         dist = compute_price_distribution(prices)
+        # Build comp_prices after potential PDP revalidation.
+        all_comp_prices = build_comp_prices_dict(comps)
 
         logger.info(
             f"[day_query] {checkin_str}: comps={comps_collected} filtered={len(filtered_comps)} "

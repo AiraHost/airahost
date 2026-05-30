@@ -1350,6 +1350,7 @@ def extract_nightly_price_from_listing_page(
     listing_url: str,
     checkin: str,
     checkout: str,
+    adults: int = 1,
 ) -> Tuple[Optional[float], str]:
     """
     Navigate to a listing page with check-in/check-out dates appended and
@@ -1371,6 +1372,10 @@ def extract_nightly_price_from_listing_page(
         )
     except Exception:
         stay_nights = 1
+    try:
+        adults = max(1, int(adults))
+    except Exception:
+        adults = 1
 
     if hasattr(page, "get_listing_details"):
         # Client-backed path: fetch PDP payload for this exact date window and
@@ -1383,7 +1388,7 @@ def extract_nightly_price_from_listing_page(
                 parsed_rb = urlparse(listing_url)
                 url_with_dates_rb = (
                     f"{parsed_rb.scheme}://{parsed_rb.netloc}{parsed_rb.path}"
-                    f"?check_in={checkin}&check_out={checkout}&guests=1&adults=1"
+                    f"?check_in={checkin}&check_out={checkout}&guests={adults}&adults={adults}"
                 )
                 nav = page.browse_url_html(
                     url_with_dates_rb,
@@ -1419,7 +1424,7 @@ def extract_nightly_price_from_listing_page(
                 str(listing_id),
                 checkin=checkin,
                 checkout=checkout,
-                adults=1,
+                adults=adults,
             )
             parsed_pdp = parse_pdp_response(
                 pdp,
@@ -1458,7 +1463,7 @@ def extract_nightly_price_from_listing_page(
     # Reconstruct with only check_in / check_out — drop any pre-existing params.
     url_with_dates = (
         f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        f"?check_in={checkin}&check_out={checkout}"
+        f"?check_in={checkin}&check_out={checkout}&adults={adults}&guests={adults}"
     )
 
     # Navigate with one retry on transient failure
@@ -1740,6 +1745,7 @@ def capture_target_live_price(
     cdp_connect_timeout_ms: int = 15000,
     client: Optional[Any] = None,
     allow_retry_matrix: bool = True,
+    adults: int = 1,
 ) -> Dict[str, Any]:
     """
     Open a short Playwright session to extract the target listing's current
@@ -1766,6 +1772,10 @@ def capture_target_live_price(
         "medium": "booking_widget",
         "low": "body_text",
     }
+    try:
+        requested_adults = max(1, int(adults))
+    except Exception:
+        requested_adults = 1
 
     listing_url = normalize_airbnb_url(listing_url)
 
@@ -1779,7 +1789,7 @@ def capture_target_live_price(
                 {
                     "CHECKIN": checkin,
                     "CHECKOUT": checkout,
-                    "ADULTS": 1,
+                    "ADULTS": requested_adults,
                     # Keep current behavior by default (Deepbnb enabled). This env switch
                     # allows explicit Playwright-only live-capture debugging when needed.
                     "USE_DEEPBNB_BACKEND": use_deepbnb_live,
@@ -1798,8 +1808,20 @@ def capture_target_live_price(
                 listing_url=listing_url,
                 checkin=checkin,
                 checkout=checkout,
+                adults=requested_adults,
             )
             if isinstance(_html_price, (int, float)) and _html_price > 0:
+                logger.info(
+                    "[price_trace] target_live_price captured listing=%s checkin=%s checkout=%s adults=%s "
+                    "price=%s source=%s confidence=%s",
+                    listing_id,
+                    checkin,
+                    checkout,
+                    requested_adults,
+                    round(float(_html_price)),
+                    _CONFIDENCE_TO_SOURCE.get(_html_conf, "unknown"),
+                    _html_conf,
+                )
                 return {
                     "observedListingPrice": round(float(_html_price)),
                     "observedListingPriceDate": checkin,
@@ -1895,6 +1917,18 @@ def capture_target_live_price(
                     _raw_preview,
                 )
                 _parsed = parse_pdp_response(_pdp_data, str(listing_id), safe_domain_base(listing_url))
+                logger.info(
+                    "[price_trace] target_live_price parsed listing=%s checkin=%s checkout=%s adults=%s backend=%s "
+                    "nightly=%s total=%s currency=%s",
+                    listing_id,
+                    _checkin,
+                    _checkout,
+                    _adults,
+                    _backend_label,
+                    _parsed.get("nightly_price"),
+                    _parsed.get("total_price"),
+                    _parsed.get("currency"),
+                )
                 return _parsed.get("nightly_price"), _parsed.get("total_price"), _section_ids, _has_errors
 
             _nightly, _total, _section_ids, _has_errors = _extract_with_client(
@@ -1946,9 +1980,11 @@ def capture_target_live_price(
                 _price = round(float(_total) / _nights, 2)
             return (_price if isinstance(_price, (int, float)) and _price > 0 else None), ("high" if _price else "failed"), _meta
 
-        # Retry matrix: same-day window only (adults=1, then adults=2).
+        # Retry matrix: same-day window only. Keep legacy 1->2 fallback only for 1-adult requests.
         # Never shift checkin/checkout to a different date window.
-        attempts: List[tuple[str, str, int]] = [(checkin, checkout, 1), (checkin, checkout, 2)]
+        attempts: List[tuple[str, str, int]] = [(checkin, checkout, requested_adults)]
+        if requested_adults == 1:
+            attempts.append((checkin, checkout, 2))
 
         price: Optional[float] = None
         confidence = "failed"
@@ -1979,8 +2015,8 @@ def capture_target_live_price(
                         {
                             "check_in": checkin,
                             "check_out": checkout,
-                            "adults": 1,
-                            "guests": 1,
+                            "adults": requested_adults,
+                            "guests": requested_adults,
                         }
                     )
                 )
@@ -2010,6 +2046,18 @@ def capture_target_live_price(
                     listing_id,
                     _render_exc,
                 )
+        else:
+            logger.info(
+                "[price_trace] target_live_price captured listing=%s checkin=%s checkout=%s adults=%s "
+                "price=%s source=%s confidence=%s",
+                listing_id,
+                used_checkin,
+                used_checkout,
+                requested_adults,
+                round(float(price)),
+                _CONFIDENCE_TO_SOURCE.get(confidence, "unknown"),
+                confidence,
+            )
     except Exception as exc:
         logger.warning(f"[target_live_price] HTTP extraction failed: {exc}")
         return {

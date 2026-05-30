@@ -1800,7 +1800,7 @@ def run_scrape(
                     f"{checkin} -> {_checkout_1n}"
                 )
                 _tp, _tp_conf = extract_nightly_price_from_listing_page(
-                    page, listing_url, checkin, _checkout_1n
+                    page, listing_url, checkin, _checkout_1n, adults=effective_adults
                 )
                 if _tp is None and _tp_conf != "scrape_failed":
                     logger.info(
@@ -1808,7 +1808,7 @@ def run_scrape(
                         f"(confidence={_tp_conf}), retrying with 2-night window"
                     )
                     _tp, _tp_conf = extract_nightly_price_from_listing_page(
-                        page, listing_url, checkin, _checkout_2n
+                        page, listing_url, checkin, _checkout_2n, adults=effective_adults
                     )
 
                 if _tp is not None:

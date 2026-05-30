@@ -363,12 +363,14 @@ def test_self_price_capture_day_query_accepts_runner_keyword_args(monkeypatch):
 
     browser_pool = [_PoolClient(i) for i in range(3)]
     used_slots: List[int] = []
+    pool_kwargs: Dict[str, Any] = {}
+    used_adults: List[int] = []
 
     monkeypatch.setattr(worker_main, "DAY_QUERY_MAX_WORKERS", 3)
     monkeypatch.setattr(worker_main, "RATE_LIMIT_SECONDS", 0.0)
     monkeypatch.setattr(
         "worker.scraper.browser_runtime.build_warmed_browser_client_pool",
-        lambda **kwargs: browser_pool,
+        lambda **kwargs: (pool_kwargs.update(kwargs) or browser_pool),
     )
     monkeypatch.setattr(
         "worker.scraper.browser_runtime.close_browser_client_pool",
@@ -383,8 +385,10 @@ def test_self_price_capture_day_query_accepts_runner_keyword_args(monkeypatch):
         cdp_connect_timeout_ms,
         client,
         allow_retry_matrix,
+        adults=1,
     ):
         used_slots.append(int(client.slot_id))
+        used_adults.append(int(adults))
         return {
             "observedListingPrice": 120 + int(client.slot_id),
             "livePriceStatus": "captured",
@@ -422,6 +426,7 @@ def test_self_price_capture_day_query_accepts_runner_keyword_args(monkeypatch):
         start_date="2026-06-01",
         end_date="2026-06-07",
         minimum_booking_nights=1,
+        adults=8,
     )
 
     assert result["capturedDays"] == 6
@@ -429,6 +434,8 @@ def test_self_price_capture_day_query_accepts_runner_keyword_args(monkeypatch):
     assert used_slots.count(0) == 2
     assert used_slots.count(1) == 2
     assert used_slots.count(2) == 2
+    assert used_adults == [8, 8, 8, 8, 8, 8]
+    assert pool_kwargs["base_config"]["ADULTS"] == 8
 
 
 def test_self_price_capture_does_not_backfill_observed_price_from_later_date(monkeypatch):
@@ -465,6 +472,7 @@ def test_self_price_capture_does_not_backfill_observed_price_from_later_date(mon
         cdp_connect_timeout_ms,
         client,
         allow_retry_matrix,
+        adults=1,
     ):
         allow_retry_values.append(bool(allow_retry_matrix))
         if checkin == "2026-06-01":
@@ -518,3 +526,29 @@ def test_self_price_capture_does_not_backfill_observed_price_from_later_date(mon
     assert result["priceByDate"] == {"2026-06-02": 155}
     assert result["observedListingPrice"] is None
     assert result["observedListingPriceDate"] == "2026-06-01"
+
+
+def test_get_listing_url_prefers_input_attributes_when_payload_urls_conflict(caplog):
+    job = {
+        "input_listing_url": "https://www.airbnb.com/rooms/50302420",
+        "input_attributes": {
+            "listingUrl": "https://www.airbnb.com/rooms/12034936",
+        },
+    }
+
+    caplog.set_level("WARNING")
+    resolved = worker_main._get_listing_url(job)
+
+    assert resolved == "https://www.airbnb.com/rooms/12034936"
+    assert "Listing URL mismatch" in caplog.text
+
+
+def test_get_listing_url_falls_back_to_top_level_when_attributes_missing():
+    job = {
+        "input_listing_url": "https://www.airbnb.com/rooms/12034936",
+        "input_attributes": {},
+    }
+
+    resolved = worker_main._get_listing_url(job)
+
+    assert resolved == "https://www.airbnb.com/rooms/12034936"

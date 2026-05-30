@@ -35,10 +35,15 @@ yarn-error.log*
 
 # worker logs
 worker/logs/
+worker/outputs/
 ml_sidecar/logs/
 .local-stack/
 __pycache__/
 *.pyc
+
+# generic local debug artifacts
+*.stackdump
+*.trace
 
 # vercel
 .vercel

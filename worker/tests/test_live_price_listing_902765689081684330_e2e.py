@@ -53,6 +53,16 @@ def _resolve_listing_id() -> str:
     return str(os.getenv("AIRBNB_LIVE_LISTING_ID", DEFAULT_LISTING_ID)).strip()
 
 
+def _resolve_adults() -> int:
+    raw = str(os.getenv("AIRBNB_LIVE_ADULTS", "1")).strip()
+    try:
+        adults = int(raw)
+    except Exception as exc:
+        raise AssertionError(f"AIRBNB_LIVE_ADULTS must be an integer, got {raw!r}") from exc
+    assert adults > 0, f"AIRBNB_LIVE_ADULTS must be >= 1, got {adults}"
+    return adults
+
+
 def _amount_from_text(text: Optional[str]) -> Optional[float]:
     if not isinstance(text, str):
         return None
@@ -107,8 +117,8 @@ def _listing_url(listing_id: str) -> str:
     return f"https://www.airbnb.com/rooms/{listing_id}"
 
 
-def _build_listing_url_with_dates(listing_id: str, checkin: str, checkout: str) -> str:
-    return f"{_listing_url(listing_id)}?{urlencode({'check_in': checkin, 'check_out': checkout, 'adults': 1, 'guests': 1})}"
+def _build_listing_url_with_dates(listing_id: str, checkin: str, checkout: str, adults: int) -> str:
+    return f"{_listing_url(listing_id)}?{urlencode({'check_in': checkin, 'check_out': checkout, 'adults': adults, 'guests': adults})}"
 
 
 def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
@@ -126,6 +136,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
       AIRBNB_LIVE_LISTING_ID=902765689081684330  (optional override)
       AIRBNB_LIVE_CHECKIN=YYYY-MM-DD          (optional)
       AIRBNB_LIVE_CHECKOUT=YYYY-MM-DD         (optional)
+      AIRBNB_LIVE_ADULTS=N                    (optional, default 1)
       AIRBNB_LIVE_ARTIFACT_DIR=...            (optional, default worker/outputs/live_price_e2e)
       AIRBNB_LIVE_EXPECT_DISCOUNT=1|0         (optional, default 1)
     """
@@ -135,6 +146,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
     cdp_url = str(os.getenv("CDP_URL", "http://127.0.0.1:9222")).strip()
     listing_id = _resolve_listing_id()
     checkin, checkout = _resolve_checkin_checkout()
+    adults = _resolve_adults()
     expect_discount = str(os.getenv("AIRBNB_LIVE_EXPECT_DISCOUNT", "1")).strip().lower() not in (
         "0",
         "false",
@@ -146,7 +158,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
         str(os.getenv("AIRBNB_LIVE_ARTIFACT_DIR", "worker/outputs/live_price_e2e")).strip()
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{listing_id}_{checkin}_{checkout}"
+    stem = f"{listing_id}_{checkin}_{checkout}_{adults}guests"
     payload_path = artifact_dir / f"{stem}_raw_pdp.json"
     dom_path = artifact_dir / f"{stem}_dom_candidates.json"
     screenshot_path = artifact_dir / f"{stem}_page.png"
@@ -157,7 +169,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
         {
             "CHECKIN": checkin,
             "CHECKOUT": checkout,
-            "ADULTS": 1,
+            "ADULTS": adults,
             "CDP_URL": cdp_url,
             "USE_DEEPBNB_BACKEND": False,
             "CURRENCY": "USD",
@@ -169,11 +181,11 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
         listing_id,
         checkin=checkin,
         checkout=checkout,
-        adults=1,
+        adults=adults,
     )
     payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    listing_url_with_dates = _build_listing_url_with_dates(listing_id, checkin, checkout)
+    listing_url_with_dates = _build_listing_url_with_dates(listing_id, checkin, checkout, adults)
     dom_result: Dict[str, Any] = {}
     created_context = None
     with sync_playwright() as pw:
@@ -249,6 +261,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
         cdp_url=cdp_url,
         client=client,
         allow_retry_matrix=False,
+        adults=adults,
     )
     assert live.get("livePriceStatus") == "captured", (
         f"Live capture failed: status={live.get('livePriceStatus')} "
@@ -309,6 +322,7 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
         "listing_id": listing_id,
         "checkin": checkin,
         "checkout": checkout,
+        "adults": adults,
         "listing_url_with_dates": listing_url_with_dates,
         "live_result": live,
         "parsed_price": {

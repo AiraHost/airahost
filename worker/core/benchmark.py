@@ -63,6 +63,7 @@ BENCHMARK_SCROLL_ROUNDS: int = 1     # standard: DAY_SCROLL_ROUNDS = 2
 BENCHMARK_MAX_CARDS: int = 15        # standard: DAY_MAX_CARDS = 30
 BENCHMARK_TOP_K: int = 5             # standard: top_k = 10
 BENCHMARK_MAX_SAMPLE_QUERIES: int = 10  # standard: MAX_SAMPLE_QUERIES = 20
+MAP_RADIUS_CAP_KM: float = 5.0 * 1.609344  # exactly 5 miles
 
 # Pricing formula weights
 BENCHMARK_MARKET_WEIGHT: float = 0.30   # 30 % weight to market adjustment (high-confidence baseline)
@@ -112,6 +113,22 @@ _SECONDARY_CONSENSUS_THRESHOLD: float = 0.20  # 20 %
 FETCH_STATUS_SEARCH_HIT = "search_hit"       # benchmark appeared in search results
 FETCH_STATUS_DIRECT_PAGE = "direct_page"     # obtained via listing-page scrape
 FETCH_STATUS_FAILED = "failed"               # price unavailable for this day
+
+
+def _resolve_query_center(target: ListingSpec) -> Tuple[Optional[float], Optional[float]]:
+    if isinstance(target.lat, (int, float)) and isinstance(target.lng, (int, float)):
+        return float(target.lat), float(target.lng)
+    if not str(target.location or "").strip():
+        return None, None
+    try:
+        from worker.core.geocode_details import geocode_address_details
+
+        result = geocode_address_details(str(target.location), timeout=3)
+        if result and result.get("lat") is not None and result.get("lng") is not None:
+            return float(result["lat"]), float(result["lng"])
+    except Exception:
+        pass
+    return None, None
 
 
 
@@ -289,6 +306,11 @@ def estimate_benchmark_price_for_date(
     is_weekend = date_i.weekday() >= 4  # Fri=4, Sat=5
 
     try:
+        query_center_lat, query_center_lng = _resolve_query_center(target)
+        map_radius_limit_km = MAP_RADIUS_CAP_KM
+        if isinstance(max_radius_km, (int, float)) and float(max_radius_km) > 0:
+            map_radius_limit_km = min(float(max_radius_km), MAP_RADIUS_CAP_KM)
+
         # 2-night-primary / 1-night-fallback search with coord extraction.
         # exclude_url is intentionally None: the benchmark listing must remain
         # in the results so Stage 1 can capture its search-card price as a
@@ -306,6 +328,13 @@ def estimate_benchmark_price_for_date(
             target_accommodates=target.accommodates,
             target_beds=target.beds,
             target_baths=target.baths,
+            center_lat=query_center_lat,
+            center_lng=query_center_lng,
+            map_radius_km=(
+                map_radius_limit_km
+                if query_center_lat is not None and query_center_lng is not None
+                else None
+            ),
         )
 
         # ── Geographic distance filter ────────────────────────────────────
