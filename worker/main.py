@@ -83,6 +83,7 @@ AIRBNB_ENABLE_AI_SEARCH = bool(
 AUTO_APPLY_STALE_MINUTES = int(os.getenv("AUTO_APPLY_STALE_MINUTES", "15"))
 AUTO_APPLY_MAX_ATTEMPTS = int(os.getenv("AUTO_APPLY_MAX_ATTEMPTS", "3"))
 AUTO_APPLY_CDP_URL = os.getenv("AUTO_APPLY_CDP_URL", CDP_URL)
+AIRBNB_AUTH_CHECK_EVERY_TASKS = max(0, int(os.getenv("AIRBNB_AUTH_CHECK_EVERY_TASKS", "50")))
 
 NIGHTLY_QUEUE_ML_FORECAST = str(
     os.getenv("NIGHTLY_QUEUE_ML_FORECAST", "1")
@@ -382,6 +383,27 @@ def _maybe_run_startup_auto_login() -> None:
         logger.warning(
             "Startup Airbnb auth check: not all browser slots could be verified logged in. "
             "Review warnings above."
+        )
+
+
+def _maybe_run_periodic_airbnb_auth_check(processed_task_count: int) -> None:
+    if AIRBNB_AUTH_CHECK_EVERY_TASKS <= 0:
+        return
+    if processed_task_count <= 0 or processed_task_count % AIRBNB_AUTH_CHECK_EVERY_TASKS != 0:
+        return
+
+    logger.info(
+        "Periodic Airbnb auth check: processed_tasks=%s interval=%s. Validating browser login state.",
+        processed_task_count,
+        AIRBNB_AUTH_CHECK_EVERY_TASKS,
+    )
+    try:
+        _maybe_run_startup_auto_login()
+    except Exception as exc:
+        logger.warning(
+            "Periodic Airbnb auth check failed after processed_tasks=%s: %s",
+            processed_task_count,
+            exc,
         )
 
 
@@ -2638,13 +2660,15 @@ def main():
     )
     logger.info(
         f"  auto_apply: stale={AUTO_APPLY_STALE_MINUTES}min, "
-        f"max_attempts={AUTO_APPLY_MAX_ATTEMPTS}, cdp={AUTO_APPLY_CDP_URL}"
+        f"max_attempts={AUTO_APPLY_MAX_ATTEMPTS}, cdp={AUTO_APPLY_CDP_URL}, "
+        f"auth_check_every_tasks={AIRBNB_AUTH_CHECK_EVERY_TASKS}"
     )
     _maybe_run_startup_auto_login()
 
     client = db_helpers.get_client()
     backoff = POLL_SECONDS
     max_backoff = POLL_SECONDS * 12  # 60s at default
+    processed_task_count = 0
 
     while not _shutdown_event.is_set():
         try:
@@ -2665,7 +2689,11 @@ def main():
                 # Got auto-apply work — reset backoff and process.
                 backoff = POLL_SECONDS
                 logger.info(f"[{auto_job['id']}] Claimed auto-apply price update job")
-                process_price_update_job(auto_job, worker_token, client)
+                try:
+                    process_price_update_job(auto_job, worker_token, client)
+                finally:
+                    processed_task_count += 1
+                    _maybe_run_periodic_airbnb_auth_check(processed_task_count)
                 continue
 
             # Got work — reset backoff
@@ -2721,10 +2749,16 @@ def main():
                         "worker_version": WORKER_VERSION,
                     },
                 )
+                processed_task_count += 1
+                _maybe_run_periodic_airbnb_auth_check(processed_task_count)
                 continue
 
             logger.info(f"Claimed job {report_id} (attempt {attempts})")
-            process_job(job, worker_token)
+            try:
+                process_job(job, worker_token)
+            finally:
+                processed_task_count += 1
+                _maybe_run_periodic_airbnb_auth_check(processed_task_count)
 
         except KeyboardInterrupt:
             break

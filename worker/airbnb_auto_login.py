@@ -41,12 +41,35 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from email.utils import parsedate_to_datetime
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 LOGIN_URL = "https://www.airbnb.ca/login"
 DEFAULT_CDP_URL = os.getenv("CDP_URL", "http://127.0.0.1:9222").strip()
+EMAIL_INPUT_SELECTORS = (
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[data-testid*="email"]',
+)
+CODE_INPUT_SELECTORS = (
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'input[name*="code"]',
+    'input[data-testid*="code"]',
+)
+WELCOME_BACK_HEADING_PATTERN = re.compile(r"welcome back", re.I)
+WELCOME_BACK_LOGIN_BUTTON_PATTERN = re.compile(r"^log\s*in$", re.I)
+NOT_YOU_BUTTON_PATTERN = re.compile(r"not you", re.I)
+CONTINUE_BUTTON_PATTERN = re.compile(r"continue|next", re.I)
+CODE_SUBMIT_BUTTON_PATTERN = re.compile(r"continue|verify|submit|next", re.I)
+CODE_EXPIRED_PATTERN = re.compile(r"code expired|please request a new one", re.I)
+SEND_NEW_CODE_PATTERN = re.compile(
+    r"send new code|request a new one|resend code|send another code|get a new code",
+    re.I,
+)
 
 
 @dataclass
@@ -140,10 +163,40 @@ def _extract_text_from_message(msg: Message) -> str:
     return "\n".join(chunks)
 
 
-def wait_for_airbnb_code(config: ImapConfig) -> str:
+def get_device_identifiers(ua: str) -> list[str]:
+    ua = (ua or "").lower()
+    identifiers = []
+    if "firefox" in ua:
+        identifiers.append("firefox")
+    elif "edg" in ua or "edge" in ua:
+        identifiers.append("edge")
+    elif "chrome" in ua:
+        identifiers.append("chrome")
+    elif "safari" in ua:
+        identifiers.append("safari")
+
+    if "windows" in ua:
+        identifiers.append("windows")
+    elif "mac os" in ua or "macos" in ua or "macintosh" in ua:
+        identifiers.append("mac")
+    elif "linux" in ua:
+        identifiers.append("linux")
+    
+    return identifiers
+
+
+def wait_for_airbnb_code(
+    config: ImapConfig,
+    request_time: float = 0.0,
+    user_agent: str = "",
+    after_message_id: int = 0,
+    return_message_id: bool = False,
+) -> str | tuple[str, int]:
     pattern = re.compile(config.code_regex)
     deadline = time.time() + config.timeout_seconds
     debug_email = _env_bool("AIRAHOST_EMAIL_DEBUG", False)
+
+    device_ids = get_device_identifiers(user_agent)
 
     while time.time() < deadline:
         if config.use_ssl:
@@ -164,6 +217,12 @@ def wait_for_airbnb_code(config: ImapConfig) -> str:
                 print(f"[auto_login][email_debug] total messages in folder={len(ids)}")
             # Check latest messages first.
             for msg_id in reversed(ids[-20:]):
+                try:
+                    numeric_msg_id = int(msg_id.decode(errors="ignore"))
+                except ValueError:
+                    numeric_msg_id = 0
+                if after_message_id > 0 and numeric_msg_id <= after_message_id:
+                    continue
                 fetch_status, fetched = conn.fetch(msg_id, "(RFC822)")
                 if fetch_status != "OK" or not fetched or not fetched[0]:
                     continue
@@ -173,8 +232,18 @@ def wait_for_airbnb_code(config: ImapConfig) -> str:
                 msg = email.message_from_bytes(raw)
                 from_header = _decode_mime_header(str(msg.get("From", "")))
                 subject = _decode_mime_header(str(msg.get("Subject", "")))
+                date_header = _decode_mime_header(str(msg.get("Date", "")))
+                
+                try:
+                    msg_time = parsedate_to_datetime(date_header).timestamp()
+                    if request_time > 0 and msg_time < request_time - 60:
+                        if debug_email:
+                            print(f"[auto_login][email_debug] ignoring old email from {date_header}")
+                        continue
+                except Exception:
+                    pass
+
                 if debug_email:
-                    date_header = _decode_mime_header(str(msg.get("Date", "")))
                     print(
                         "[auto_login][email_debug] "
                         f"id={msg_id.decode(errors='ignore')} "
@@ -184,9 +253,21 @@ def wait_for_airbnb_code(config: ImapConfig) -> str:
                     continue
                 body = _extract_text_from_message(msg)
                 source = f"{subject}\n{body}"
+                
+                source_lower = source.lower()
+                has_any_browser = any(b in source_lower for b in ["chrome", "firefox", "safari", "edge", "mac", "windows", "linux"])
+                if has_any_browser and device_ids:
+                    if not all(ident in source_lower for ident in device_ids):
+                        if debug_email:
+                            print(f"[auto_login][email_debug] ignoring email due to device mismatch. Expected: {device_ids}")
+                        continue
+
                 m = pattern.search(source)
                 if m:
-                    return m.group(1)
+                    code = m.group(1)
+                    if return_message_id:
+                        return code, numeric_msg_id
+                    return code
         finally:
             try:
                 conn.close()
@@ -224,24 +305,164 @@ def dump_rendered_html(page: Page, out_dir: Path, stem: str) -> Path:
     return path
 
 
+def _locator_is_visible(locator: Locator) -> bool:
+    try:
+        return locator.count() > 0 and locator.first.is_visible()
+    except PlaywrightError:
+        return False
+
+
+def _find_first_visible_locator(
+    page: Page,
+    selectors: tuple[str, ...],
+) -> Optional[tuple[str, Locator]]:
+    for sel in selectors:
+        matches = page.locator(sel)
+        try:
+            count = matches.count()
+        except PlaywrightError:
+            continue
+        for idx in range(count):
+            candidate = matches.nth(idx)
+            try:
+                if candidate.is_visible():
+                    return sel, candidate
+            except PlaywrightError:
+                continue
+    return None
+
+
+def _find_first_visible_role_locator(
+    page: Page,
+    role: str,
+    name_pattern: re.Pattern[str],
+) -> Optional[Locator]:
+    matches = page.get_by_role(role, name=name_pattern)
+    try:
+        count = matches.count()
+    except PlaywrightError:
+        return None
+    for idx in range(count):
+        candidate = matches.nth(idx)
+        if _locator_is_visible(candidate):
+            return candidate
+    return None
+
+
+def _is_login_url(page: Page) -> bool:
+    return "login" in str(page.url or "").lower()
+
+
+def _wait_for_login_url_to_change(page: Page, timeout_ms: int = 2500) -> bool:
+    deadline = time.monotonic() + (max(timeout_ms, 0) / 1000.0)
+    while time.monotonic() < deadline:
+        if not _is_login_url(page):
+            return True
+        page.wait_for_timeout(100)
+    return not _is_login_url(page)
+
+
+def _is_welcome_back_login_visible(page: Page) -> bool:
+    login_button = page.get_by_role(
+        "button",
+        name=WELCOME_BACK_LOGIN_BUTTON_PATTERN,
+    ).first
+    not_you_button = page.get_by_role("button", name=NOT_YOU_BUTTON_PATTERN).first
+    not_you_text = page.get_by_text(NOT_YOU_BUTTON_PATTERN).first
+    welcome_back_heading = page.get_by_text(WELCOME_BACK_HEADING_PATTERN).first
+    return _locator_is_visible(login_button) and (
+        _locator_is_visible(not_you_button)
+        or _locator_is_visible(not_you_text)
+        or _locator_is_visible(welcome_back_heading)
+    )
+
+
+def _is_code_expired_visible(page: Page) -> bool:
+    expired_text = page.get_by_text(CODE_EXPIRED_PATTERN).first
+    if _locator_is_visible(expired_text):
+        return True
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000)
+    except PlaywrightError:
+        return False
+    return bool(CODE_EXPIRED_PATTERN.search(body_text or ""))
+
+
+def _click_send_new_code(page: Page) -> float:
+    request_time = time.time()
+    for role in ("button", "link"):
+        control = _find_first_visible_role_locator(page, role, SEND_NEW_CODE_PATTERN)
+        if control is not None:
+            control.click(timeout=2000)
+            return request_time
+
+    control = page.get_by_text(SEND_NEW_CODE_PATTERN).first
+    if _locator_is_visible(control):
+        control.click(timeout=2000)
+        return request_time
+
+    raise RuntimeError(
+        "Confirmation code expired, but no visible 'Send new code' or resend control was found."
+    )
+
+
+def _wait_for_post_code_submit_state(page: Page, timeout_ms: int = 5000) -> str:
+    deadline = time.monotonic() + (max(timeout_ms, 0) / 1000.0)
+    while time.monotonic() < deadline:
+        if not _is_login_url(page):
+            return "advanced"
+        if _is_code_expired_visible(page):
+            return "expired"
+        page.wait_for_timeout(100)
+    if not _is_login_url(page):
+        return "advanced"
+    if _is_code_expired_visible(page):
+        return "expired"
+    return "pending"
+
+
+def detect_login_page_variant(page: Page, timeout_ms: int = 12000) -> str:
+    deadline = time.monotonic() + (max(timeout_ms, 0) / 1000.0)
+    while True:
+        current_url = str(page.url or "").lower()
+        if "login" not in current_url:
+            return "already_logged_in"
+        if _is_welcome_back_login_visible(page):
+            return "welcome_back"
+        if _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS) is not None:
+            return "email_entry"
+        if time.monotonic() >= deadline:
+            return "unknown"
+        page.wait_for_timeout(250)
+
+
+def click_welcome_back_login(page: Page) -> None:
+    def _human_pause(min_s: float = 0.35, max_s: float = 1.4) -> None:
+        time.sleep(random.uniform(min_s, max_s))
+
+    btn = page.get_by_role(
+        "button",
+        name=WELCOME_BACK_LOGIN_BUTTON_PATTERN,
+    ).first
+    if not _locator_is_visible(btn):
+        raise RuntimeError(
+            "Welcome-back login state detected, but the primary 'Log in' button is not visible."
+        )
+    print("[auto_login] welcome-back flow detected. Clicking Log in.")
+    _human_pause()
+    btn.click()
+
+
 def fill_email_and_continue(page: Page, email_value: str) -> None:
     def _human_pause(min_s: float = 0.25, max_s: float = 1.1) -> None:
         time.sleep(random.uniform(min_s, max_s))
 
-    # Candidate selectors observed on Airbnb login flows.
-    selectors = [
-        'input[name="email"]',
-        'input[type="email"]',
-        'input[autocomplete="email"]',
-        'input[data-testid*="email"]',
-    ]
-    for sel in selectors:
-        loc = page.locator(sel).first
-        if loc.count() > 0:
-            print(f"[auto_login] filling email with selector: {sel}")
-            _human_pause()
-            loc.fill(email_value)
-            break
+    visible_email_input = _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS)
+    if visible_email_input is not None:
+        sel, loc = visible_email_input
+        print(f"[auto_login] filling email with selector: {sel}")
+        _human_pause()
+        loc.fill(email_value)
     else:
         # Label fallback.
         print("[auto_login] filling email with label fallback")
@@ -251,36 +472,110 @@ def fill_email_and_continue(page: Page, email_value: str) -> None:
     # Continue button candidates.
     print("[auto_login] clicking Continue/Next")
     _human_pause(0.35, 1.4)
-    btn = page.get_by_role("button", name=re.compile(r"continue|next", re.I)).first
+    btn = _find_first_visible_role_locator(page, "button", CONTINUE_BUTTON_PATTERN)
+    if btn is None:
+        raise RuntimeError("Could not find a visible Continue/Next button on the email step.")
     btn.click()
 
 
 def fill_code_and_continue(page: Page, code_value: str) -> None:
-    def _human_pause(min_s: float = 0.25, max_s: float = 1.1) -> None:
-        time.sleep(random.uniform(min_s, max_s))
-
-    selectors = [
-        'input[autocomplete="one-time-code"]',
-        'input[inputmode="numeric"]',
-        'input[name*="code"]',
-        'input[data-testid*="code"]',
-    ]
-    for sel in selectors:
-        loc = page.locator(sel).first
-        if loc.count() > 0:
-            print(f"[auto_login] filling code with selector: {sel}")
-            _human_pause()
-            loc.fill(code_value)
-            break
+    visible_code_input = _find_first_visible_locator(page, CODE_INPUT_SELECTORS)
+    if visible_code_input is not None:
+        sel, loc = visible_code_input
+        print(f"[auto_login] filling code with selector: {sel}")
+        loc.fill(code_value)
     else:
         print("[auto_login] filling code with label fallback")
-        _human_pause()
-        page.get_by_label(re.compile(r"code|verification", re.I)).first.fill(code_value)
+        loc = page.get_by_label(re.compile(r"code|verification", re.I)).first
+        loc.fill(code_value)
 
     print("[auto_login] clicking code Continue/Verify/Submit")
-    _human_pause(0.35, 1.4)
-    btn = page.get_by_role("button", name=re.compile(r"continue|verify|submit|next", re.I)).first
-    btn.click()
+    # OTPs are short-lived. Avoid randomized delays on this step and try the
+    # fastest visible submit control immediately after filling the input.
+    btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
+    if btn is None:
+        try:
+            loc.press("Enter", timeout=250)
+        except PlaywrightError:
+            pass
+        if _wait_for_login_url_to_change(page, timeout_ms=350):
+            print("[auto_login] code entry advanced login flow without an explicit submit click.")
+            return
+        btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
+        if btn is None:
+            raise RuntimeError("Could not find a visible Continue/Verify/Submit/Next button on the code step.")
+
+    try:
+        btn.click(timeout=1500)
+        if _wait_for_login_url_to_change(page, timeout_ms=350):
+            return
+    except PlaywrightTimeoutError:
+        if _wait_for_login_url_to_change(page, timeout_ms=500):
+            print("[auto_login] login flow advanced during the code submit click.")
+            return
+        print("[auto_login] code submit click timed out; retrying with force=True.")
+    except PlaywrightError:
+        if _wait_for_login_url_to_change(page, timeout_ms=500):
+            print("[auto_login] login flow advanced during the code submit click.")
+            return
+        print("[auto_login] code submit click failed; retrying with force=True.")
+
+    btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
+    if btn is None:
+        if _wait_for_login_url_to_change(page, timeout_ms=500):
+            print("[auto_login] login flow advanced before the forced code submit retry.")
+            return
+        raise RuntimeError("Code submit button disappeared before the forced retry completed.")
+
+    try:
+        btn.click(timeout=2000, force=True)
+        if _wait_for_login_url_to_change(page, timeout_ms=500):
+            return
+    except PlaywrightError:
+        if _wait_for_login_url_to_change(page, timeout_ms=500):
+            print("[auto_login] login flow advanced during the forced code submit click.")
+            return
+        raise
+
+
+def submit_confirmation_code_with_retry(
+    page: Page,
+    cfg: ImapConfig,
+    request_time: float,
+    user_agent: str,
+    max_expired_retries: int = 1,
+) -> None:
+    current_request_time = request_time
+    latest_message_id = 0
+
+    for attempt in range(max_expired_retries + 1):
+        print("[auto_login] waiting for confirmation code email")
+        wait_result = wait_for_airbnb_code(
+            cfg,
+            request_time=current_request_time,
+            user_agent=user_agent,
+            after_message_id=latest_message_id,
+            return_message_id=True,
+        )
+        code, latest_message_id = wait_result
+        print("[auto_login] confirmation code received")
+        fill_code_and_continue(page, code)
+
+        post_submit_state = _wait_for_post_code_submit_state(page)
+        if post_submit_state != "expired":
+            return
+        if attempt >= max_expired_retries:
+            print("[auto_login] confirmation code expired after the final retry attempt.")
+            return
+
+        print("[auto_login] confirmation code expired. Requesting a new code.")
+        current_request_time = _click_send_new_code(page)
+        for sel in CODE_INPUT_SELECTORS:
+            try:
+                page.locator(sel).first.wait_for(state="visible", timeout=5000)
+                break
+            except PlaywrightTimeoutError:
+                continue
 
 
 def run_login_flow(out_dir: Path, dump_only: bool) -> None:
@@ -317,17 +612,38 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
                 browser.close()
             return
 
-        print("[auto_login] step: submit email")
-        fill_email_and_continue(page, email_value)
+        user_agent = page.evaluate("navigator.userAgent")
+
+        # Let the page settle in case of redirect
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except PlaywrightTimeoutError:
+            pass
+
+        login_variant = detect_login_page_variant(page)
+        print(f"[auto_login] detected login page variant: {login_variant}")
+
+        if login_variant == "already_logged_in":
+            print(f"[auto_login] URL is now {page.url} - assuming already logged in.")
+            if created_new_browser:
+                browser.close()
+            return
+
+        request_time = time.time()
+        if login_variant == "welcome_back":
+            print("[auto_login] step: submit welcome-back login")
+            click_welcome_back_login(page)
+        elif login_variant == "email_entry":
+            print("[auto_login] step: submit email")
+            fill_email_and_continue(page, email_value)
+        else:
+            raise RuntimeError(
+                f"Airbnb login page state not recognized at {page.url}. "
+                "Expected a welcome-back prompt or visible email input."
+            )
         # Wait for either OTP/code input or a stable post-submit state.
-        code_ready_selectors = [
-            'input[autocomplete="one-time-code"]',
-            'input[inputmode="numeric"]',
-            'input[name*="code"]',
-            'input[data-testid*="code"]',
-        ]
         code_ready = False
-        for sel in code_ready_selectors:
+        for sel in CODE_INPUT_SELECTORS:
             try:
                 print(f"[auto_login] waiting for code input selector: {sel}")
                 page.locator(sel).first.wait_for(state="visible", timeout=8000)
@@ -346,11 +662,12 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
         print(f"[auto_login] saved rendered html: {code_html}")
 
         cfg = _read_imap_config_from_env()
-        print("[auto_login] waiting for confirmation code email")
-        code = wait_for_airbnb_code(cfg)
-        print("[auto_login] confirmation code received")
-
-        fill_code_and_continue(page, code)
+        submit_confirmation_code_with_retry(
+            page,
+            cfg,
+            request_time=request_time,
+            user_agent=user_agent,
+        )
         try:
             page.wait_for_load_state("networkidle", timeout=30000)
         except PlaywrightTimeoutError:
