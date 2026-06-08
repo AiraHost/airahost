@@ -905,7 +905,7 @@ def _capture_user_listing_prices_for_range(
     start = _dt.strptime(start_date, "%Y-%m-%d")
     end = _dt.strptime(end_date, "%Y-%m-%d")
     total_days = max(1, (end - start).days)
-    nights = max(1, int(minimum_booking_nights or 1))
+    attempt_nights_sequence = (1, 2)
     try:
         adults = max(1, min(int(adults), 16))
     except Exception:
@@ -936,43 +936,50 @@ def _capture_user_listing_prices_for_range(
         day_lock = browser_locks[browser_slot]
         checkin_dt = start + _td(days=i)
         checkin = checkin_dt.strftime("%Y-%m-%d")
-        checkout = (checkin_dt + _td(days=nights)).strftime("%Y-%m-%d")
         from urllib.parse import urlencode, urlparse
 
         _parsed_listing = urlparse(str(listing_url))
         _base_listing_url = f"{_parsed_listing.scheme}://{_parsed_listing.netloc}{_parsed_listing.path}"
-        _capture_query_url = (
-            f"{_base_listing_url}?"
-            + urlencode(
-                {
-                    "check_in": checkin,
-                    "check_out": checkout,
-                    "adults": adults,
-                    "guests": adults,
-                }
-            )
-        )
-        logger.info(
-            f"[{report_id}] [self_price_capture] day_start "
-            f"index={i} browser_slot={browser_slot} checkin={checkin} checkout={checkout} nights={nights} adults={adults}"
-        )
-        logger.info(
-            f"[{report_id}] [price_trace] capture_query date={checkin} "
-            f"url={_capture_query_url}"
-        )
         time.sleep(RATE_LIMIT_SECONDS)
+        live = None
+        nights_used = None
         try:
-            with day_lock:
-                live = capture_target_live_price(
-                    listing_url=listing_url,
-                    checkin=checkin,
-                    checkout=checkout,
-                    cdp_url=playwright_live_client.cdp_url,
-                    cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
-                    client=playwright_live_client,
-                    allow_retry_matrix=False,
-                    adults=adults,
+            for attempt_nights in attempt_nights_sequence:
+                checkout = (checkin_dt + _td(days=attempt_nights)).strftime("%Y-%m-%d")
+                _capture_query_url = (
+                    f"{_base_listing_url}?"
+                    + urlencode(
+                        {
+                            "check_in": checkin,
+                            "check_out": checkout,
+                            "adults": adults,
+                            "guests": adults,
+                        }
+                    )
                 )
+                logger.info(
+                    f"[{report_id}] [self_price_capture] day_start "
+                    f"index={i} browser_slot={browser_slot} checkin={checkin} checkout={checkout} "
+                    f"nights={attempt_nights} configured_min_nights={minimum_booking_nights} adults={adults}"
+                )
+                logger.info(
+                    f"[{report_id}] [price_trace] capture_query date={checkin} "
+                    f"url={_capture_query_url}"
+                )
+                with day_lock:
+                    live = capture_target_live_price(
+                        listing_url=listing_url,
+                        checkin=checkin,
+                        checkout=checkout,
+                        cdp_url=playwright_live_client.cdp_url,
+                        cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
+                        client=playwright_live_client,
+                        allow_retry_matrix=False,
+                        adults=adults,
+                    )
+                nights_used = attempt_nights
+                if isinstance(live.get("observedListingPrice"), (int, float)) and live.get("observedListingPrice") > 0:
+                    break
             logger.info(
                 f"[{report_id}] [self_price_capture] day_result_raw "
                 f"date={checkin} status={live.get('livePriceStatus')} "
@@ -997,12 +1004,13 @@ def _capture_user_listing_prices_for_range(
                 "livePriceStatus": "scrape_failed",
                 "livePriceStatusReason": str(exc)[:300],
             }
+            nights_used = None
 
         obs = live.get("observedListingPrice")
         price = round(float(obs)) if isinstance(obs, (int, float)) and obs > 0 else None
         logger.info(
             f"[{report_id}] [self_price_capture] day_result_normalized "
-            f"date={checkin} normalized_price={price} status={live.get('livePriceStatus')}"
+            f"date={checkin} normalized_price={price} status={live.get('livePriceStatus')} nights_used={nights_used}"
         )
         return {
             "date": checkin,
@@ -1012,6 +1020,7 @@ def _capture_user_listing_prices_for_range(
             "source": live.get("observedListingPriceSource"),
             "confidence": live.get("observedListingPriceConfidence"),
             "captured_at": live.get("observedListingPriceCapturedAt"),
+            "nights_used": nights_used,
         }
 
     logger.info(

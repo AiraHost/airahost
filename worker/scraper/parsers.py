@@ -3,6 +3,8 @@ import base64
 import logging
 from typing import Any, Dict, List, Optional
 
+from worker.scraper.price_normalizer import normalize_raw_price
+
 logger = logging.getLogger("worker.scraper")
 
 
@@ -819,24 +821,19 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                         # Some payloads omit qualifier but include "for N nights" in
                         # accessibilityLabel, so inspect both fields.
                         qualifier_ctx = f"{qualifier} {accessibility_label}".strip()
-                        _for_n = re.search(r"\bfor\s+(\d+)\s+nights?\b", qualifier_ctx)
-                        if _for_n:
-                            _n = int(_for_n.group(1))
-                            row["total_price"] = strict_val
-                            row["price_nights"] = _n
-                            row["nightly_price"] = round(strict_val / _n, 2)
-                        elif "night" in qualifier:
-                            row["nightly_price"] = strict_val
-                            row["price_nights"] = 1
-                        elif "total" in qualifier_ctx or nights_hint > 1:
-                            row["total_price"] = strict_val
-                            row["price_nights"] = max(1, nights_hint)
-                        else:
-                            # Conservative fallback: unknown qualifier is treated as
-                            # TOTAL (not nightly) to avoid inflating nightly prices
-                            # when multi-night totals omit explicit qualifier text.
-                            row["total_price"] = strict_val
-                            row["price_nights"] = max(1, nights_hint)
+                        normalized = normalize_raw_price(
+                            strict_val,
+                            qualifier=qualifier,
+                            context_text=qualifier_ctx,
+                            stay_nights=nights_hint,
+                            source="search",
+                            currency=strict_ccy,
+                            produce_nightly_from_total=False,
+                        )
+                        if normalized is not None:
+                            row["nightly_price"] = normalized.nightly_price
+                            row["total_price"] = normalized.total_price
+                            row["price_nights"] = normalized.price_nights
 
         # Structural/context fields used for similarity scoring.
         derived = _extract_structural_context_from_search_result(r)
@@ -910,6 +907,8 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
         "nightly_price": None,
         "total_price": None,
         "currency": None,
+        "price_nights": 1,
+        "price_kind": "unknown",
         "cleaning_fee": None,
         "service_fee": None,
         "amenities": [],
@@ -1249,14 +1248,21 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             if amount is None:
                 return False
             qualifier = str(primary.get("qualifier") or "").lower()
-            if "night" in qualifier:
-                result["nightly_price"] = amount
-                if result["total_price"] is None:
-                    result["total_price"] = amount
-            else:
-                result["total_price"] = amount
-                if result["nightly_price"] is None:
-                    result["nightly_price"] = amount
+            normalized = normalize_raw_price(
+                amount,
+                qualifier=qualifier,
+                context_text=" ".join(price_candidates + [qualifier]),
+                stay_nights=1,
+                source="pdp",
+                currency=ccy,
+                produce_nightly_from_total=True,
+            )
+            if normalized is None:
+                return False
+            result["nightly_price"] = normalized.nightly_price
+            result["total_price"] = normalized.total_price
+            result["price_nights"] = normalized.price_nights
+            result["price_kind"] = normalized.price_kind
             if ccy:
                 result["currency"] = ccy
             return True

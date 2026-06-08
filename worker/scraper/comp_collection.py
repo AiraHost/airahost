@@ -21,6 +21,7 @@ from worker.scraper.parsers import (
     parse_search_listing_context,
     parse_search_response,
 )
+from worker.scraper.price_normalizer import normalize_raw_price
 from worker.scraper.target_extractor import (
     ListingSpec,
     normalize_property_type,
@@ -131,7 +132,14 @@ def _map_search_row_to_spec(
             price_kind = "multi_night_total_skipped"
             scrape_nights = nights
         else:
-            effective_nightly = round(float(total) / nights, 2)
+            normalized = normalize_raw_price(
+                total,
+                qualifier="total",
+                stay_nights=nights,
+                source="search",
+                produce_nightly_from_total=True,
+            )
+            effective_nightly = normalized.nightly_price if normalized is not None else None
             price_kind = "trip_total_from_search"
             scrape_nights = nights
             query_total_price = float(total)

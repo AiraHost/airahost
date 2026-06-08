@@ -261,6 +261,40 @@ def test_parse_search_context_prefers_discounted_primary_price_when_both_fields_
     assert row["currency"] == "CAD"
 
 
+def test_parse_search_context_marks_two_night_total_for_later_normalization():
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "accessibilityLabel": "$300 CAD for 2 nights",
+                                        "price": "$300 CAD",
+                                        "qualifier": "total",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] is None
+    assert row["total_price"] == 300.0
+    assert row["price_nights"] == 2
+
+
 def test_parse_search_context_falls_back_to_stayssearch_filter_state_and_search_input():
     payload = {
         "data": {
@@ -551,6 +585,40 @@ def test_parse_pdp_response_prefers_discounted_price_when_both_fields_exist():
     assert out["total_price"] == 316.0
     assert out["nightly_price"] == 316.0
     assert out["currency"] == "CAD"
+
+
+def test_parse_pdp_response_divides_two_night_total():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "accessibilityLabel": "$300 CAD for 2 nights",
+                                            "price": "$300 CAD",
+                                            "qualifier": "total",
+                                        }
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "1629301846268091180", "https://www.airbnb.ca")
+    assert out["total_price"] == 300.0
+    assert out["nightly_price"] == 150.0
+    assert out["price_nights"] == 2
+    assert out["price_kind"] == "trip_total_from_pdp"
 
 
 def test_parse_pdp_response_reads_overview_v2_capacity_layout_and_location():

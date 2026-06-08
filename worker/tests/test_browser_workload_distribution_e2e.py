@@ -521,11 +521,92 @@ def test_self_price_capture_does_not_backfill_observed_price_from_later_date(mon
         minimum_booking_nights=1,
     )
 
-    assert allow_retry_values == [False, False]
+    assert allow_retry_values == [False, False, False]
     assert result["capturedDays"] == 1
     assert result["priceByDate"] == {"2026-06-02": 155}
     assert result["observedListingPrice"] is None
     assert result["observedListingPriceDate"] == "2026-06-01"
+
+
+def test_self_price_capture_tries_two_night_window_after_one_night_miss(monkeypatch):
+    class _PoolClient:
+        def __init__(self):
+            self.cdp_url = "http://127.0.0.1:9222"
+
+        def ensure_browser_ready(self) -> None:
+            return
+
+        def close_browser(self) -> None:
+            return
+
+    calls: List[Dict[str, Any]] = []
+    browser_pool = [_PoolClient()]
+
+    monkeypatch.setattr(worker_main, "DAY_QUERY_MAX_WORKERS", 1)
+    monkeypatch.setattr(worker_main, "RATE_LIMIT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.build_warmed_browser_client_pool",
+        lambda **kwargs: browser_pool,
+    )
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.close_browser_client_pool",
+        lambda _pool: None,
+    )
+
+    def _fake_capture_target_live_price(
+        listing_url,
+        checkin,
+        checkout,
+        cdp_url,
+        cdp_connect_timeout_ms,
+        client,
+        allow_retry_matrix,
+        adults=1,
+    ):
+        calls.append({"checkin": checkin, "checkout": checkout, "allow_retry_matrix": allow_retry_matrix})
+        if checkout == "2026-06-02":
+            return {
+                "observedListingPrice": None,
+                "livePriceStatus": "no_price_found",
+                "livePriceStatusReason": "No nightly price found",
+                "observedListingPriceSource": None,
+                "observedListingPriceConfidence": "failed",
+                "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+            }
+        return {
+            "observedListingPrice": 150,
+            "livePriceStatus": "captured",
+            "livePriceStatusReason": "Nightly price captured for two-night fallback",
+            "observedListingPriceSource": "mock",
+            "observedListingPriceConfidence": "high",
+            "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "worker.scraper.target_extractor.capture_target_live_price",
+        _fake_capture_target_live_price,
+    )
+
+    monkeypatch.setattr(
+        "worker.core.concurrent_runner.execute_day_queries_concurrently",
+        lambda query_func, args_list, **_kwargs: ([query_func(**dict(args_list[0]))], object()),
+    )
+
+    result = worker_main._capture_user_listing_prices_for_range(
+        report_id="regression-self-price-two-night-fallback",
+        listing_url="https://www.airbnb.com/rooms/123456789",
+        start_date="2026-06-01",
+        end_date="2026-06-02",
+        minimum_booking_nights=2,
+    )
+
+    assert [(c["checkin"], c["checkout"]) for c in calls] == [
+        ("2026-06-01", "2026-06-02"),
+        ("2026-06-01", "2026-06-03"),
+    ]
+    assert all(c["allow_retry_matrix"] is False for c in calls)
+    assert result["observedListingPrice"] == 150
+    assert result["priceByDate"] == {"2026-06-01": 150}
 
 
 def test_get_listing_url_prefers_input_attributes_when_payload_urls_conflict(caplog):

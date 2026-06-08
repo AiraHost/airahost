@@ -50,6 +50,7 @@ from worker.scraper.parsers import (
     parse_search_response,
 )
 from worker.scraper.comp_collection import collect_search_comps
+from worker.scraper.price_normalizer import normalize_raw_price
 from worker.scraper.day_query import (
     DAY_MAX_CARDS,
     DAY_SCROLL_ROUNDS,
@@ -3363,7 +3364,14 @@ def run_criteria_search(
             total = row.get("total_price")
             nights = int(row.get("price_nights") or 1)
             if isinstance(total, (int, float)) and total > 0 and nights > 0:
-                nightly = round(float(total) / nights, 2)
+                normalized = normalize_raw_price(
+                    total,
+                    qualifier="total",
+                    stay_nights=nights,
+                    source="search",
+                    produce_nightly_from_total=True,
+                )
+                nightly = normalized.nightly_price if normalized is not None else None
         candidates.append(
             ListingSpec(
                 url=f"{base_origin}/rooms/{lid}",

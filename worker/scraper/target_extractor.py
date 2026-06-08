@@ -22,6 +22,10 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from worker.scraper.parsers import parse_pdp_response
+from worker.scraper.price_normalizer import (
+    normalize_raw_price,
+    select_price_from_dom_candidates,
+)
 
 logger = logging.getLogger("worker.scraper.target_extractor")
 
@@ -1274,32 +1278,7 @@ def select_nightly_price_from_candidates(
       price_kind: "nightly_discounted" if strikethrough originals are also present,
                   "nightly_standard" otherwise.
     """
-    if not candidates:
-        return None
-
-    non_st = [c for c in candidates if not c.get("strikethrough")]
-    has_strikethrough = any(c.get("strikethrough") for c in candidates)
-
-    if not non_st:
-        return None
-
-    # Sort by domIndex (document order); take the last (= discounted price when
-    # a discount is active, or the sole price when there is no discount).
-    non_st_sorted = sorted(non_st, key=lambda c: c.get("domIndex", 0))
-    best = non_st_sorted[-1]
-    raw_val = float(best["value"])
-    trip_nights = int(best.get("tripNights") or 1)
-    if trip_nights < 1:
-        trip_nights = 1
-
-    # Divide trip totals to arrive at per-night price.
-    price_val = raw_val / trip_nights if trip_nights > 1 else raw_val
-
-    if not (10 <= price_val <= 10000):
-        return None
-
-    price_kind = "nightly_discounted" if has_strikethrough else "nightly_standard"
-    return price_val, price_kind
+    return select_price_from_dom_candidates(candidates)
 
 
 def _extract_text_price_matches(text: str) -> List[Tuple[int, float]]:
@@ -1323,9 +1302,16 @@ def _extract_text_price_matches(text: str) -> List[Tuple[int, float]]:
     for pat in _NIGHTLY_PRICE_RES:
         for m in pat.finditer(text):
             try:
-                p = float(m.group(1).replace(",", ""))
-                if 10 <= p <= 10000:
-                    matches.append((m.start(), p))
+                raw = float(m.group(1).replace(",", ""))
+                normalized = normalize_raw_price(
+                    raw,
+                    context_text=m.group(0),
+                    stay_nights=1,
+                    source="html_text",
+                )
+                p = normalized.nightly_price if normalized is not None else None
+                if isinstance(p, (int, float)) and 10 <= p <= 10000:
+                    matches.append((m.start(), float(p)))
             except Exception:
                 continue
 
@@ -1336,9 +1322,16 @@ def _extract_text_price_matches(text: str) -> List[Tuple[int, float]]:
             nights = int(m.group(2))
             if nights < 2:
                 continue
-            per_night = raw / nights
-            if 10 <= per_night <= 10000:
-                matches.append((m.start(), per_night))
+            normalized = normalize_raw_price(
+                raw,
+                context_text=m.group(0),
+                stay_nights=nights,
+                source="html_text",
+                produce_nightly_from_total=True,
+            )
+            per_night = normalized.nightly_price if normalized is not None else None
+            if isinstance(per_night, (int, float)) and 10 <= per_night <= 10000:
+                matches.append((m.start(), float(per_night)))
         except Exception:
             continue
 
@@ -1432,10 +1425,23 @@ def extract_nightly_price_from_listing_page(
                 safe_domain_base(listing_url),
             )
             nightly = parsed_pdp.get("nightly_price")
-            if nightly is None:
-                total = parsed_pdp.get("total_price")
-                if isinstance(total, (int, float)) and total > 0:
-                    nightly = round(float(total) / max(1, stay_nights), 2)
+            total = parsed_pdp.get("total_price")
+            price_kind = str(parsed_pdp.get("price_kind") or "")
+            price_nights = int(parsed_pdp.get("price_nights") or 1)
+            if isinstance(total, (int, float)) and total > 0 and (
+                nightly is None
+                or price_kind.startswith("trip_total")
+                or price_nights > 1
+            ):
+                normalized = normalize_raw_price(
+                    total,
+                    qualifier="total",
+                    stay_nights=stay_nights,
+                    source="pdp",
+                    produce_nightly_from_total=True,
+                )
+                if normalized is not None:
+                    nightly = normalized.nightly_price
             if isinstance(nightly, (int, float)) and nightly > 0:
                 return float(nightly), "high"
             # PDP returned but had no usable price: switch immediately to rendered HTML fallback.
@@ -1977,7 +1983,14 @@ def capture_target_live_price(
             _price = _nightly
             if _price is None and isinstance(_total, (int, float)):
                 _nights = max(1, (dt.strptime(_checkout, "%Y-%m-%d") - dt.strptime(_checkin, "%Y-%m-%d")).days)
-                _price = round(float(_total) / _nights, 2)
+                _normalized = normalize_raw_price(
+                    _total,
+                    qualifier="total",
+                    stay_nights=_nights,
+                    source="pdp",
+                    produce_nightly_from_total=True,
+                )
+                _price = _normalized.nightly_price if _normalized is not None else None
             return (_price if isinstance(_price, (int, float)) and _price > 0 else None), ("high" if _price else "failed"), _meta
 
         # Retry matrix: same-day window only. Keep legacy 1->2 fallback only for 1-adult requests.
