@@ -3,9 +3,12 @@ import fs from 'fs';
 import path from 'path';
 
 test.describe('Daily Agent - AiraHost Analysis Checker', () => {
-  // Use a long timeout because AiraHost analysis might take time,
+  // Use a long timeout (15 mins) because AiraHost analysis might take time,
   // and we are scraping multiple Airbnb URLs.
-  test.setTimeout(300000); 
+  test.setTimeout(900000); 
+
+  // Explicitly use production site since local test environments may not run the ML workers
+  test.use({ baseURL: 'https://airahost.com' });
 
   test('run URL analysis and check comps', async ({ page }) => {
     const urlsToTest = [
@@ -34,34 +37,25 @@ test.describe('Daily Agent - AiraHost Analysis Checker', () => {
 });
 
 async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
-  await page.goto('/tool');
+  await page.goto('https://airahost.com/tool');
 
   if (input.mode === 'url') {
     await page.getByRole('button', { name: 'I have a listing URL' }).click();
     await page.getByPlaceholder('https://airbnb.com/rooms/').fill(input.url);
   } else {
     await page.getByRole('button', { name: 'Search by criteria' }).click();
-    await page.getByLabel('City *').fill(input.city);
-    await page.getByLabel('State *').fill(input.state);
-    
-    // Set bedrooms
-    const bedInput = page.getByLabel('Bedrooms').locator('input').first();
-    if (await bedInput.isVisible()) {
-      await bedInput.fill(input.bedrooms.toString());
-    }
-    // Set guests
-    const guestsInput = page.getByLabel('Max guests').locator('input').first();
-    if (await guestsInput.isVisible()) {
-      await guestsInput.fill(input.guests.toString());
-    }
+    await page.getByPlaceholder('e.g. New York, Taipei').fill(input.city);
+    await page.getByPlaceholder('e.g. CA').fill(input.state);
+    await setStepperValue(page, 'Bedrooms', input.bedrooms);
+    await setStepperValue(page, 'Max guests', input.guests);
   }
 
   await page.getByRole('button', { name: 'Continue' }).click();
 
   // Set dates (5 days span)
   if (input.mode === 'criteria' && input.days) {
-     const startDateInput = page.getByLabel('Start date');
-     const endDateInput = page.getByLabel('End date');
+     const startDateInput = page.locator('input[type="date"]').nth(0);
+     const endDateInput = page.locator('input[type="date"]').nth(1);
      const start = new Date();
      start.setDate(start.getDate() + 7); // Start 1 week from now
      const end = new Date(start);
@@ -75,25 +69,32 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
   // Benchmark - just continue
   await page.getByRole('button', { name: 'Generate Revenue Report' }).click();
 
-  // Wait for the report page to load and API to return
+  // Poll the report endpoint directly; browser response events can be missed between waits.
+  await page.waitForURL(/\/r\/[^/?#]+/, { timeout: 60000 });
+  const reportApiUrl = new URL(`/api${new URL(page.url()).pathname}`, page.url()).toString();
   let reportData: any = null;
-  const response = await page.waitForResponse(res => res.url().includes('/api/r/') && res.status() === 200, { timeout: 60000 });
-  reportData = await response.json();
 
-  // Wait until status is ready
-  while (reportData && reportData.status !== 'ready' && reportData.status !== 'error') {
-    await page.waitForTimeout(3000);
-    const pollResponse = await page.waitForResponse(res => res.url().includes('/api/r/') && res.status() === 200, { timeout: 60000 });
+  await expect.poll(async () => {
+    const pollResponse = await page.context().request.get(reportApiUrl);
+    if (!pollResponse.ok()) {
+      return `http:${pollResponse.status()}`;
+    }
     reportData = await pollResponse.json();
-  }
+    return reportData.status;
+  }, {
+    intervals: [3000],
+    timeout: 600000,
+    message: `Report did not finish for ${JSON.stringify(input)}`,
+  }).toMatch(/^(ready|error)$/);
 
   if (reportData.status === 'error') {
-    appendReport(reportPath, `## Error in analysis\n\nInput: ${JSON.stringify(input)}\nError: ${reportData.errorMessage}\n\n`);
+    appendReport(reportPath, `## Error in analysis\n\nInput: ${JSON.stringify(input)}\nAiraHost Report URL: ${page.url()}\nError: ${reportData.errorMessage}\n\n`);
     return;
   }
 
   const comps = reportData.resultSummary?.comparableListings || [];
-  appendReport(reportPath, `## Analysis successful\n\nInput: ${JSON.stringify(input)}\nFound ${comps.length} comps.\n\n`);
+  const reportUrl = page.url();
+  appendReport(reportPath, `## Analysis successful\n\nInput: ${JSON.stringify(input)}\nAiraHost Report URL: ${reportUrl}\nFound ${comps.length} comps.\n\n`);
 
   for (const comp of comps.slice(0, 3)) { // Check top 3 to save time
     if (!comp.url) continue;
@@ -128,10 +129,9 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
       if (errors.length > 0) {
         const reproduceSteps = `
 **Way to reproduce:**
-1. Go to AiraHost tool (/tool)
-2. Submit ${input.mode === 'url' ? 'URL ' + input.url : 'Criteria: Seattle, WA'}
-3. Open comparable listing: ${compUrl}
-4. Compare the scraped data with the live Airbnb page
+1. Go to AiraHost Report URL: ${reportUrl}
+2. Open comparable listing: ${compUrl}
+3. Compare the scraped data with the live Airbnb page
 `;
         appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\n\n`);
       } else {
@@ -139,9 +139,25 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
       }
 
     } catch (e: any) {
-      appendReport(reportPath, `**Failed to load comp URL:** ${compUrl}\nError: ${e.message}\n\n`);
+      appendReport(reportPath, `**Failed to load comp URL:** ${compUrl}\nAiraHost Report URL: ${reportUrl}\nError: ${e.message}\n\n`);
     }
   }
+}
+
+async function setStepperValue(page: Page, label: string, targetValue: number) {
+  const field = page.locator('label').filter({ hasText: new RegExp(`^${label}$`) }).locator('xpath=..');
+  const value = field.locator('xpath=.//button[normalize-space()="-"]/following-sibling::*[1]');
+
+  await expect(field).toBeVisible();
+
+  for (let i = 0; i < 50; i++) {
+    const currentValue = Number(await value.textContent());
+    if (currentValue === targetValue) return;
+
+    await field.getByRole('button', { name: currentValue < targetValue ? '+' : '-' }).click();
+  }
+
+  throw new Error(`Could not set ${label} to ${targetValue}`);
 }
 
 function appendReport(filePath: string, text: string) {

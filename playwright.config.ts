@@ -72,7 +72,7 @@ export default defineConfig({
       dependencies: ["setup"],
       // Keep the auth setup file out, plus anything explicitly meant for the
       // public anonymous project.
-      testIgnore: [/auth\.setup\.ts/, /public-share-readonly\.spec\.ts/],
+      testIgnore: [/auth\.setup\.ts/, /public-share-readonly\.spec\.ts/, /daily-agent\.spec\.ts/],
     },
     {
       name: "chromium-public",
@@ -81,7 +81,7 @@ export default defineConfig({
         // Intentionally no storageState — share view must be testable
         // exactly as an anonymous viewer would see it.
       },
-      testMatch: /public-share-readonly\.spec\.ts/,
+      testMatch: /public-share-readonly\.spec\.ts|daily-agent\.spec\.ts/,
     },
   ],
 });
