@@ -10,8 +10,12 @@ jobs:
   run-agent:
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.head_ref }}
     - uses: actions/setup-node@v4
       with:
         node-version: 18
@@ -24,6 +28,14 @@ jobs:
       env:
         # Define any env vars needed
         E2E_BASE_URL: https://airahost.com
+    - name: Commit and Push Report
+      if: always()
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add agent_error_report.md
+        git commit -m "Update daily agent error report" || echo "No changes to commit"
+        git push
     - name: Upload Artifacts
       if: always()
       uses: actions/upload-artifact@v4
