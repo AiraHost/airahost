@@ -75,12 +75,16 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
   let reportData: any = null;
 
   await expect.poll(async () => {
-    const pollResponse = await page.context().request.get(reportApiUrl);
-    if (!pollResponse.ok()) {
-      return `http:${pollResponse.status()}`;
+    try {
+      const pollResponse = await page.context().request.get(reportApiUrl, { timeout: 30000 });
+      if (!pollResponse.ok()) {
+        return `http:${pollResponse.status()}`;
+      }
+      reportData = await pollResponse.json();
+      return reportData.status;
+    } catch (e: any) {
+      return `fetch_error:${e.message}`;
     }
-    reportData = await pollResponse.json();
-    return reportData.status;
   }, {
     intervals: [3000],
     timeout: 600000,
@@ -92,65 +96,138 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
     return;
   }
 
-  const comps = reportData.resultSummary?.comparableListings || [];
   const reportUrl = page.url();
-  appendReport(reportPath, `## Analysis successful\n\nInput: ${JSON.stringify(input)}\nAiraHost Report URL: ${reportUrl}\nFound ${comps.length} comps.\n\n`);
+  appendReport(reportPath, `## Analysis successful\n\nInput: ${JSON.stringify(input)}\nAiraHost Report URL: ${reportUrl}\n\n`);
 
-  for (const comp of comps.slice(0, 3)) { // Check top 3 to save time
-    if (!comp.url) continue;
+  const compsToTest: { title: string, compUrl: string, expectedPrice: string, expectedTotal: string, targetDate: string }[] = [];
+  
+  // Interact with UI to get dates and prices
+  const dateButtons = page.locator('.grid-cols-7 button:has-text("$")');
+  const dateCount = await dateButtons.count();
+  
+  for (let i = 0; i < Math.min(2, dateCount); i++) {
+     const btn = dateButtons.nth(i);
+     const dateTextRaw = await btn.innerText();
+     const targetDateLabel = dateTextRaw.split('\n')[0] || `Day-${i}`;
+     
+     await btn.click();
+     await page.waitForTimeout(1000); // wait for comps to filter
+     
+     const compCards = page.locator('[data-testid="comparable-card"]');
+     const compCount = await compCards.count();
+     
+     for (let j = 0; j < Math.min(3, compCount); j++) {
+        const card = compCards.nth(j);
+        const viewLink = card.locator('a', { hasText: 'View' }).first();
+        if (await viewLink.count() === 0) continue;
+        
+        const compUrl = await viewLink.getAttribute('href');
+        const title = (await card.locator('.truncate').textContent()) || 'Unknown';
+        const cardText = await card.innerText();
+        
+        let expectedTotal = '';
+        let expectedPrice = '';
+        const totalMatch = cardText.match(/From \$([0-9,]+(?:\.[0-9]+)?)\s*total/);
+        if (totalMatch) expectedTotal = totalMatch[1].replace(/,/g, '');
+        
+        const nightMatch = cardText.match(/\$([0-9,]+(?:\.[0-9]+)?)\s*\n?\s*\/\s*night/);
+        if (nightMatch) expectedPrice = nightMatch[1].replace(/,/g, '');
+        
+        if (compUrl) {
+           compsToTest.push({ title, compUrl, expectedPrice, expectedTotal, targetDate: targetDateLabel });
+        }
+     }
+     
+     // un-click
+     await btn.click();
+     await page.waitForTimeout(500);
+  }
 
-    const compUrl = comp.url;
-    appendReport(reportPath, `### Checking Comp: ${compUrl}\n`);
-    
-    try {
-      await page.goto(compUrl, { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(3000); // let airbnb render
-      
-      const dateStr = new Date().toISOString().split('T')[0];
-      const captureDir = path.join(process.cwd(), 'tests', dateStr);
-      if (!fs.existsSync(captureDir)) {
-        fs.mkdirSync(captureDir, { recursive: true });
-      }
-      
-      const screenshotPath = path.join(captureDir, `screenshot-${comp.id}.png`);
-      const htmlPath = path.join(captureDir, `page-${comp.id}.html`);
-      
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      const htmlContent = await page.content();
-      fs.writeFileSync(htmlPath, htmlContent);
+  appendReport(reportPath, `Collected ${compsToTest.length} comp checks from UI.\n\n`);
 
-      // Here we would typically extract text from the page to compare, 
-      // but Airbnb's DOM is highly dynamic. We will extract basic title and price.
-      const pageTitle = await page.title();
-      const pageText = await page.evaluate(() => document.body.innerText);
+  for (const comp of compsToTest) {
+      appendReport(reportPath, `### Checking Comp: ${comp.compUrl} [From Entry: ${comp.title}]\n`);
       
-      let errors = [];
-      
-      // Name aligns
-      if (comp.title && !pageTitle.toLowerCase().includes(comp.title.toLowerCase().substring(0, 10))) {
-        errors.push(`- Title mismatch: Expected "${comp.title}", got page title "${pageTitle}"`);
-      }
-      
-      // Price scraped aligns
-      if (comp.nightlyPrice && !pageText.includes(comp.nightlyPrice.toString())) {
-         errors.push(`- Price mismatch: Expected "${comp.nightlyPrice}" but not found in page text.`);
-      }
-      
-      if (errors.length > 0) {
-        const reproduceSteps = `
+      try {
+        let finalUrl = comp.compUrl;
+        try {
+           const u = new URL(finalUrl);
+           u.searchParams.set('currency', 'USD');
+           finalUrl = u.toString();
+        } catch {
+           finalUrl += (finalUrl.includes('?') ? '&' : '?') + 'currency=USD';
+        }
+        
+        await page.goto(finalUrl, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(4000); // let airbnb render completely
+        
+        const dateStr = new Date().toISOString().split('T')[0];
+        const captureDir = path.join(process.cwd(), 'tests', dateStr);
+        if (!fs.existsSync(captureDir)) {
+          fs.mkdirSync(captureDir, { recursive: true });
+        }
+        
+        // Use a safe filename
+        const safeTitle = comp.title.replace(/[^a-z0-9]/gi, '_').substring(0, 15);
+        const screenshotPath = path.join(captureDir, `screenshot-${safeTitle}-${comp.targetDate}.png`);
+        const htmlPath = path.join(captureDir, `page-${safeTitle}-${comp.targetDate}.html`);
+        
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        const htmlContent = await page.content();
+        fs.writeFileSync(htmlPath, htmlContent);
+
+        const pageTitle = await page.title();
+        const pageText = await page.evaluate(() => document.body.innerText);
+        const normalizedText = pageText.replace(/[\s,\$]/g, '');
+        
+        let errors = [];
+        
+        // Name aligns
+        if (comp.title && comp.title !== 'Unknown' && !pageTitle.toLowerCase().includes(comp.title.toLowerCase().substring(0, 10))) {
+          errors.push(`- Title mismatch on date ${comp.targetDate}: Expected "${comp.title}", got page title "${pageTitle}"`);
+        }
+        
+        // Price scraped aligns
+        if (comp.expectedPrice || comp.expectedTotal) {
+           let found = false;
+           // Only exact substring match on the stripped page text
+           if (comp.expectedTotal && normalizedText.includes(comp.expectedTotal)) found = true;
+           if (comp.expectedPrice && normalizedText.includes(comp.expectedPrice)) found = true;
+           // Sometimes Airbnb rounds the decimal, try rounding as a fallback
+           if (!found && comp.expectedPrice) {
+               const parsedPrice = parseFloat(comp.expectedPrice);
+               if (!isNaN(parsedPrice) && normalizedText.includes(Math.round(parsedPrice).toString())) {
+                   found = true;
+               }
+           }
+           if (!found && comp.expectedTotal) {
+               const parsedTotal = parseFloat(comp.expectedTotal);
+               if (!isNaN(parsedTotal) && normalizedText.includes(Math.round(parsedTotal).toString())) {
+                   found = true;
+               }
+           }
+           
+           if (!found) {
+              const otherPricesMatch = pageText.match(/\$([0-9,]+(?:\.[0-9]+)?)/g);
+              const otherPrices = otherPricesMatch ? Array.from(new Set(otherPricesMatch)).join(', ') : 'none';
+              errors.push(`- Price mismatch on date ${comp.targetDate}: Expected "${comp.expectedPrice}" (Total: ${comp.expectedTotal}) but not found in page text. (Found other prices on page: ${otherPrices})`);
+           }
+        }
+        
+        if (errors.length > 0) {
+          const reproduceSteps = `
 **Way to reproduce:**
 1. Go to AiraHost Report URL: ${reportUrl}
-2. Open comparable listing: ${compUrl}
-3. Compare the scraped data with the live Airbnb page
+2. Click on the calendar tile for date ${comp.targetDate}
+3. Click 'View' on the comparable listing card for "${comp.title}"
 `;
-        appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\nHTML saved to ${htmlPath}\n\n`);
-      } else {
-        appendReport(reportPath, `All basic checks passed.\n\n`);
+          appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\nHTML saved to ${htmlPath}\n\n`);
+        } else {
+          appendReport(reportPath, `All basic checks passed for date ${comp.targetDate}.\n\n`);
+        }
+      } catch (e: any) {
+        appendReport(reportPath, `**Failed to load comp URL:** ${comp.compUrl}\nAiraHost Report URL: ${reportUrl}\nError: ${e.message}\n\n`);
       }
-
-    } catch (e: any) {
-      appendReport(reportPath, `**Failed to load comp URL:** ${compUrl}\nAiraHost Report URL: ${reportUrl}\nError: ${e.message}\n\n`);
-    }
   }
 }
 
