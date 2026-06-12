@@ -106,8 +106,18 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
       await page.goto(compUrl, { waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(3000); // let airbnb render
       
-      const screenshotPath = path.join(process.cwd(), `screenshot-${comp.id}.png`);
+      const dateStr = new Date().toISOString().split('T')[0];
+      const captureDir = path.join(process.cwd(), 'tests', dateStr);
+      if (!fs.existsSync(captureDir)) {
+        fs.mkdirSync(captureDir, { recursive: true });
+      }
+      
+      const screenshotPath = path.join(captureDir, `screenshot-${comp.id}.png`);
+      const htmlPath = path.join(captureDir, `page-${comp.id}.html`);
+      
       await page.screenshot({ path: screenshotPath, fullPage: true });
+      const htmlContent = await page.content();
+      fs.writeFileSync(htmlPath, htmlContent);
 
       // Here we would typically extract text from the page to compare, 
       // but Airbnb's DOM is highly dynamic. We will extract basic title and price.
@@ -133,7 +143,7 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
 2. Open comparable listing: ${compUrl}
 3. Compare the scraped data with the live Airbnb page
 `;
-        appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\n\n`);
+        appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\nHTML saved to ${htmlPath}\n\n`);
       } else {
         appendReport(reportPath, `All basic checks passed.\n\n`);
       }

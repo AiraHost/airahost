@@ -43,6 +43,7 @@ jobs:
         name: agent-error-report
         path: |
           agent_error_report.md
-          screenshot-*.png
+          tests/**/*.png
+          tests/**/*.html
           playwright-report/
         retention-days: 7
