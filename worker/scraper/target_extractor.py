@@ -1374,41 +1374,6 @@ def extract_nightly_price_from_listing_page(
         # Client-backed path: fetch PDP payload for this exact date window and
         # parse nightly price directly. This avoids mixing async Playwright
         # page objects with sync extraction logic.
-        def _extract_from_rendered_html_via_client() -> Tuple[Optional[float], str]:
-            if not hasattr(page, "browse_url_html"):
-                return None, "failed"
-            try:
-                parsed_rb = urlparse(listing_url)
-                url_with_dates_rb = (
-                    f"{parsed_rb.scheme}://{parsed_rb.netloc}{parsed_rb.path}"
-                    f"?check_in={checkin}&check_out={checkout}&guests={adults}&adults={adults}"
-                )
-                nav = page.browse_url_html(
-                    url_with_dates_rb,
-                    label="pdp_rendered_html_fallback",
-                    wait_until="domcontentloaded",
-                    timeout=35000,
-                )
-                html = str((nav or {}).get("html") or "")
-                if not html:
-                    return None, "failed"
-
-                # Try price-near-night patterns first.
-                matches = _extract_text_price_matches(html[:50000])
-                if matches:
-                    matches.sort(key=lambda x: x[0])
-                    return matches[-1][1], "low"
-
-                # Fallback: strip tags and retry.
-                plain = re.sub(r"<[^>]+>", " ", html[:50000])
-                matches2 = _extract_text_price_matches(plain)
-                if matches2:
-                    matches2.sort(key=lambda x: x[0])
-                    return matches2[-1][1], "low"
-                return None, "failed"
-            except Exception:
-                return None, "failed"
-
         try:
             listing_id = extract_listing_id_from_url(listing_url)
             if not listing_id:
@@ -1444,8 +1409,15 @@ def extract_nightly_price_from_listing_page(
                     nightly = normalized.nightly_price
             if isinstance(nightly, (int, float)) and nightly > 0:
                 return float(nightly), "high"
-            # PDP returned but had no usable price: switch immediately to rendered HTML fallback.
-            return _extract_from_rendered_html_via_client()
+            
+            # If the PDP successfully extracted core listing data but no price,
+            # it means the listing is genuinely unavailable/unpriced for these dates.
+            # Do NOT fallback to hallucinating a price from the HTML body!
+            if parsed_pdp.get("title") or parsed_pdp.get("location"):
+                return None, "failed"
+
+            # PDP returned but had no usable price AND failed to parse title/location.
+            return None, "failed"
         except Exception as exc:
             _msg = str(exc or "").lower()
             _cdp_connect_failed = (
@@ -1455,15 +1427,13 @@ def extract_nightly_price_from_listing_page(
             )
             if _cdp_connect_failed:
                 logger.warning(
-                    "[price_extract] PDP client CDP connect failed; using rendered HTML fallback "
+                    "[price_extract] PDP client CDP connect failed; returning None "
                     "listing=%s checkin=%s checkout=%s",
                     listing_url,
                     checkin,
                     checkout,
                 )
-                return _extract_from_rendered_html_via_client()
-            # Non-CDP PDP errors: switch immediately to rendered HTML fallback.
-            return _extract_from_rendered_html_via_client()
+            return None, "failed"
 
     parsed = urlparse(listing_url)
     # Reconstruct with only check_in / check_out — drop any pre-existing params.

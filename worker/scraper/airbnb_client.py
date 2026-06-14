@@ -148,6 +148,9 @@ class AirbnbClient:
             "403",
             "login required",
             "verify",
+            "persistedquerynotfound",
+            "persisted query not found",
+            "not found",
         )
         return any(marker in text for marker in markers)
 

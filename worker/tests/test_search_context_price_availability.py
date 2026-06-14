@@ -621,6 +621,106 @@ def test_parse_pdp_response_divides_two_night_total():
     assert out["price_kind"] == "trip_total_from_pdp"
 
 
+def test_parse_pdp_response_prefers_nightly_breakdown_over_fee_inclusive_primary_total():
+    """
+    User-listing prices must reflect the nightly base rate shown by Airbnb,
+    not a fee-inclusive booking total from primaryLine.
+    """
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$1,048 USD",
+                                            "qualifier": "total",
+                                        },
+                                        "explanationData": {
+                                            "priceDetails": [
+                                                {
+                                                    "items": [
+                                                        {
+                                                            "description": "2 nights x $430 USD",
+                                                            "priceString": "$860 USD",
+                                                        },
+                                                        {
+                                                            "description": "Cleaning fee",
+                                                            "priceString": "$188 USD",
+                                                        },
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
+
+    assert out["nightly_price"] == 430.0
+    assert out["total_price"] == 860.0
+    assert out["price_nights"] == 2
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+    assert out["currency"] == "USD"
+
+
+def test_parse_pdp_response_supports_amount_before_nights_breakdown_shape():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$1,048 USD",
+                                            "qualifier": "total",
+                                        },
+                                        "explanationData": {
+                                            "priceDetails": [
+                                                {
+                                                    "items": [
+                                                        {
+                                                            "description": "$430 USD x 2 nights",
+                                                            "priceString": "$860 USD",
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
+
+    assert out["nightly_price"] == 430.0
+    assert out["price_nights"] == 2
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+
+
 def test_parse_pdp_response_reads_overview_v2_capacity_layout_and_location():
     payload = {
         "data": {

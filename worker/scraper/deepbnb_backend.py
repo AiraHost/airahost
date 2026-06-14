@@ -170,64 +170,64 @@ class DeepBnbBackend:
         return out
 
     @staticmethod
-    def _looks_blocked(status: int, response_json: Dict[str, Any]) -> bool:
+    def _looks_blocked(status: int, response_json: dict) -> bool:
         if status in (401, 403):
             return True
         if not isinstance(response_json, dict):
             return False
-        errors = response_json.get("errors")
+        errors = response_json.get('errors')
         if not isinstance(errors, list):
             return False
         for err in errors:
             if not isinstance(err, dict):
                 continue
-            text = " ".join(
-                str(x or "")
+            text = ' '.join(
+                str(x or '')
                 for x in (
-                    err.get("message"),
-                    err.get("errorType"),
-                    err.get("code"),
-                    (err.get("extensions") or {}).get("code"),
-                    (err.get("extensions") or {}).get("errorType"),
+                    err.get('message'),
+                    err.get('errorType'),
+                    err.get('code'),
+                    (err.get('extensions') or {}).get('code'),
+                    (err.get('extensions') or {}).get('errorType'),
                 )
             ).lower()
-            if any(k in text for k in ("forbidden", "unauth", "challenge", "captcha", "security", "login", "block")):
+            if any(k in text for k in ('forbidden', 'unauth', 'challenge', 'captcha', 'security', 'login', 'block', 'persistedquerynotfound', 'persisted query not found', 'not found')):
                 return True
         return False
 
     @staticmethod
-    def _raw_params_from_overrides(overrides: Dict[str, Any]) -> list[Dict[str, Any]]:
+    def _raw_params_from_overrides(overrides: dict) -> list[dict]:
         mapping = {
-            "checkin": "checkin",
-            "checkout": "checkout",
-            "adults": "adults",
-            "guests": "guests",
-            "query": "query",
-            "placeId": "placeId",
-            "itemsOffset": "itemsOffset",
-            "itemsPerGrid": "itemsPerGrid",
-            "searchByMap": "searchByMap",
-            "neLat": "neLat",
-            "neLng": "neLng",
-            "swLat": "swLat",
-            "swLng": "swLng",
-            "centerLat": "lat",
-            "centerLng": "lng",
-            "searchMode": "searchMode",
-            "searchType": "searchType",
-            "guestFavorite": "guestFavorite",
-            "minBedrooms": "minBedrooms",
-            "minBeds": "minBeds",
-            "minBathrooms": "minBathrooms",
+            'checkin': 'checkin',
+            'checkout': 'checkout',
+            'adults': 'adults',
+            'guests': 'guests',
+            'query': 'query',
+            'placeId': 'placeId',
+            'itemsOffset': 'itemsOffset',
+            'itemsPerGrid': 'itemsPerGrid',
+            'searchByMap': 'searchByMap',
+            'neLat': 'neLat',
+            'neLng': 'neLng',
+            'swLat': 'swLat',
+            'swLng': 'swLng',
+            'centerLat': 'lat',
+            'centerLng': 'lng',
+            'searchMode': 'searchMode',
+            'searchType': 'searchType',
+            'guestFavorite': 'guestFavorite',
+            'minBedrooms': 'minBedrooms',
+            'minBeds': 'minBeds',
+            'minBathrooms': 'minBathrooms',
         }
-        out: list[Dict[str, Any]] = []
+        out = []
         for key, raw_name in mapping.items():
             val = overrides.get(key)
             if val is None:
                 continue
             if isinstance(val, bool):
-                val = "true" if val else "false"
-            out.append({"filterName": raw_name, "filterValues": [str(val)]})
+                val = 'true' if val else 'false'
+            out.append({'filterName': raw_name, 'filterValues': [str(val)]})
         return out
 
     @staticmethod

@@ -840,6 +840,12 @@ class PlaywrightScraper:
         return any(m in payload_text for m in markers)
 
     @staticmethod
+    def _rendered_html_dates_unavailable(rendered_html: str) -> bool:
+        if not isinstance(rendered_html, str) or not rendered_html:
+            return False
+        return "those dates are not available" in rendered_html.lower()
+
+    @staticmethod
     def _extract_dom_price_text(raw_text: str) -> Optional[str]:
         if not isinstance(raw_text, str):
             return None
@@ -1614,6 +1620,7 @@ class PlaywrightScraper:
                         listing_id,
                         nav_final_url,
                     )
+            rendered_html = str((nav or {}).get("html") or "")
             logger.info(
                 "Playwright PDP nav result listing=%s final_url=%s status=%s html_len=%s",
                 listing_id,
@@ -1658,6 +1665,23 @@ class PlaywrightScraper:
 
             await self._sync_context_cookies_into_session(context)
             self._save_cached_state()
+
+            try:
+                latest_html = await page.content() or ""
+                if latest_html:
+                    rendered_html = latest_html
+            except Exception as exc:
+                logger.info(
+                    "Playwright PDP rendered HTML refresh failed listing=%s: %s",
+                    listing_id,
+                    exc,
+                )
+            if self._rendered_html_dates_unavailable(rendered_html):
+                logger.info(
+                    "Playwright PDP rendered HTML shows unavailable dates listing=%s; returning no-price payload",
+                    listing_id,
+                )
+                return (captured_status or 200), self._build_minimal_pdp_payload(None)
 
             has_api_price = bool(captured_data and self._pdp_booking_has_price(captured_data))
             if noncanonical_pdp_host and has_api_price:
@@ -1709,6 +1733,22 @@ class PlaywrightScraper:
                     )
                 except Exception:
                     pass
+                try:
+                    latest_html = await page.content() or ""
+                    if latest_html:
+                        rendered_html = latest_html
+                except Exception as exc:
+                    logger.info(
+                        "Playwright PDP post-hydration HTML refresh failed listing=%s: %s",
+                        listing_id,
+                        exc,
+                    )
+                if self._rendered_html_dates_unavailable(rendered_html):
+                    logger.info(
+                        "Playwright PDP post-hydration HTML shows unavailable dates listing=%s; returning no-price payload",
+                        listing_id,
+                    )
+                    return (captured_status or 200), self._build_minimal_pdp_payload(None)
                 dom_price_text: Optional[str] = None
                 for attempt in range(1, 6):
                     logger.info(

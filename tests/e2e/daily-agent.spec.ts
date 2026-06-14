@@ -16,7 +16,12 @@ test.describe('Daily Agent - AiraHost Analysis Checker', () => {
       'https://www.airbnb.com/rooms/1669685800392899021',
     ];
 
-    const reportPath = path.join(process.cwd(), 'agent_error_report.md');
+    const dateStr = new Date().toISOString().split('T')[0];
+    const reportDir = path.join(process.cwd(), 'tests', dateStr);
+    if (!fs.existsSync(reportDir)) {
+      fs.mkdirSync(reportDir, { recursive: true });
+    }
+    const reportPath = path.join(reportDir, 'agent_error_report.md');
     fs.writeFileSync(reportPath, '# Daily Agent Error Report\n\n');
 
     for (const airbnbUrl of urlsToTest) {
@@ -105,7 +110,7 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
   const dateButtons = page.locator('.grid-cols-7 button:has-text("$")');
   const dateCount = await dateButtons.count();
   
-  for (let i = 0; i < Math.min(2, dateCount); i++) {
+  for (let i = 0; i < dateCount; i++) {
      const btn = dateButtons.nth(i);
      const dateTextRaw = await btn.innerText();
      const targetDateLabel = dateTextRaw.split('\n')[0] || `Day-${i}`;
@@ -143,10 +148,31 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
      await page.waitForTimeout(500);
   }
 
-  appendReport(reportPath, `Collected ${compsToTest.length} comp checks from UI.\n\n`);
+  
+  if (input.mode === 'url') {
+      const userListingUrl = input.url;
+      const calendar = reportData.calendar || [];
+      for (const day of calendar) {
+          if (day.userPrice || day.targetListingPrice || day.median_price || day.observedListingPrice) {
+              const uPrice = day.userPrice || day.targetListingPrice || day.observedListingPrice;
+              if (uPrice) {
+                  compsToTest.push({
+                      title: "USER_LISTING",
+                      compUrl: userListingUrl,
+                      expectedPrice: uPrice.toString(),
+                      expectedTotal: "",
+                      targetDate: day.date || "UnknownDate"
+                  });
+              }
+          }
+      }
+  }
 
+  appendReport(reportPath, `Collected ${compsToTest.length} checks.\n\n`);
+
+  let anyErrorsFound = false;
   for (const comp of compsToTest) {
-      appendReport(reportPath, `### Checking Comp: ${comp.compUrl} [From Entry: ${comp.title}]\n`);
+      
       
       try {
         let finalUrl = comp.compUrl;
@@ -190,20 +216,17 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
         // Price scraped aligns
         if (comp.expectedPrice || comp.expectedTotal) {
            let found = false;
-           // Only exact substring match on the stripped page text
-           if (comp.expectedTotal && normalizedText.includes(comp.expectedTotal)) found = true;
-           if (comp.expectedPrice && normalizedText.includes(comp.expectedPrice)) found = true;
-           // Sometimes Airbnb rounds the decimal, try rounding as a fallback
-           if (!found && comp.expectedPrice) {
-               const parsedPrice = parseFloat(comp.expectedPrice);
-               if (!isNaN(parsedPrice) && normalizedText.includes(Math.round(parsedPrice).toString())) {
-                   found = true;
+           const pagePrices = (pageText.match(/\$([0-9,]+(?:\.[0-9]+)?)/g) || []).map(p => parseFloat(p.replace(/[$,]/g, '')));
+           if (comp.expectedPrice) {
+               const expected = parseFloat(comp.expectedPrice);
+               if (!isNaN(expected)) {
+                   found = pagePrices.some(p => Math.abs(p - expected) / expected <= 0.02);
                }
            }
            if (!found && comp.expectedTotal) {
-               const parsedTotal = parseFloat(comp.expectedTotal);
-               if (!isNaN(parsedTotal) && normalizedText.includes(Math.round(parsedTotal).toString())) {
-                   found = true;
+               const expected = parseFloat(comp.expectedTotal);
+               if (!isNaN(expected)) {
+                   found = pagePrices.some(p => Math.abs(p - expected) / expected <= 0.02);
                }
            }
            
@@ -221,15 +244,33 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
 2. Click on the calendar tile for date ${comp.targetDate}
 3. Click 'View' on the comparable listing card for "${comp.title}"
 `;
-          appendReport(reportPath, `**Misalignments Found:**\n${errors.join('\n')}\n${reproduceSteps}\nScreenshot saved to ${screenshotPath}\nHTML saved to ${htmlPath}\n\n`);
+          appendReport(reportPath, `### Checking Comp: ${comp.compUrl} [From Entry: ${comp.title}]
+**Misalignments Found:**
+${errors.join('\n')}
+${reproduceSteps}
+Screenshot saved to ${screenshotPath}
+HTML saved to ${htmlPath}
+
+`);
+          anyErrorsFound = true;
         } else {
-          appendReport(reportPath, `All basic checks passed for date ${comp.targetDate}.\n\n`);
+          
         }
       } catch (e: any) {
-        appendReport(reportPath, `**Failed to load comp URL:** ${comp.compUrl}\nAiraHost Report URL: ${reportUrl}\nError: ${e.message}\n\n`);
+        appendReport(reportPath, `**Failed to load comp URL:** ${comp.compUrl}
+AiraHost Report URL: ${reportUrl}
+Error: ${e.message}
+
+`);
+        anyErrorsFound = true;
       }
   }
+
+  if (!anyErrorsFound && compsToTest.length > 0) {
+      appendReport(reportPath, `\n✅ All checks passed! No pricing misalignments found.\n\n`);
+  }
 }
+
 
 async function setStepperValue(page: Page, label: string, targetValue: number) {
   const field = page.locator('label').filter({ hasText: new RegExp(`^${label}$`) }).locator('xpath=..');

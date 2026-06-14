@@ -45,7 +45,14 @@ def resolve_cdp_urls(config: Dict[str, Any]) -> List[str]:
 
     discovered = _discover_local_cdp_urls(fallback)
     if discovered:
-        return _dedupe_urls(discovered)[:MAX_BROWSER_CLIENTS]
+        deduped = _dedupe_urls(discovered)
+        # Shift the discovered endpoints based on lane so they don't all pile onto the first one
+        lane = str(os.getenv("WORKER_LANE", "interactive")).strip().lower()
+        if lane == "nightly" and len(deduped) > 1:
+            deduped = deduped[1:] + [deduped[0]]
+        elif lane == "auto_apply" and len(deduped) > 2:
+            deduped = deduped[2:] + deduped[:2]
+        return deduped[:MAX_BROWSER_CLIENTS]
     return [fallback]
 
 

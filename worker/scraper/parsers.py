@@ -271,6 +271,98 @@ def _parse_dollar_amount_currency(text: str) -> tuple[Optional[float], Optional[
     return (amount if amount > 0 else None), currency
 
 
+def _parse_pdp_booking_breakdown_nightly(
+    structured_display_price: Dict[str, Any],
+) -> Optional[tuple[float, Optional[str], int]]:
+    """
+    Return Airbnb's base nightly amount from the booking breakdown.
+
+    PDP primaryLine can be a fee-inclusive trip total. explanationData keeps
+    the base-rate row, usually as "1 night x $430" or "$430 x 2 nights".
+    """
+    if not isinstance(structured_display_price, dict):
+        return None
+
+    explanation_data = structured_display_price.get("explanationData")
+    if not isinstance(explanation_data, dict):
+        return None
+    price_details = explanation_data.get("priceDetails")
+    if not isinstance(price_details, list):
+        return None
+
+    first_item: Optional[Dict[str, Any]] = None
+    fee_markers = (
+        "cleaning",
+        "service fee",
+        "tax",
+        "taxes",
+        "discount",
+        "subtotal",
+        "total",
+        "price after discount",
+    )
+
+    for detail in price_details:
+        if not isinstance(detail, dict):
+            continue
+        items = detail.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if first_item is None:
+                first_item = item
+
+            description = str(item.get("description") or "").replace("\xa0", " ").strip()
+            if not description:
+                continue
+            desc_lower = description.lower()
+            if "x" not in desc_lower or "night" not in desc_lower:
+                continue
+
+            parts = re.split(r"\s+x\s+", description, maxsplit=1, flags=re.I)
+            if len(parts) != 2:
+                continue
+            left, right = parts[0].strip(), parts[1].strip()
+            if "night" in left.lower():
+                price_text = right
+            elif "night" in right.lower():
+                price_text = left
+            else:
+                continue
+
+            amount, currency = _parse_dollar_amount_currency(price_text)
+            if amount is None:
+                continue
+            night_match = re.search(r"\b(\d+)\s+nights?\b", description, re.I)
+            nights = 1
+            if night_match:
+                try:
+                    nights = max(1, int(night_match.group(1)))
+                except Exception:
+                    nights = 1
+            return amount, currency, nights
+
+    if not isinstance(first_item, dict):
+        return None
+
+    description = str(first_item.get("description") or "").replace("\xa0", " ").strip()
+    price_string = str(first_item.get("priceString") or "").replace("\xa0", " ").strip()
+    desc_lower = description.lower()
+    if any(marker in desc_lower for marker in fee_markers):
+        return None
+    if description and re.search(r"[A-Za-z]", description) and "night" not in desc_lower and "base" not in desc_lower:
+        return None
+
+    amount, currency = _parse_dollar_amount_currency(price_string)
+    if amount is None:
+        amount, currency = _parse_dollar_amount_currency(description)
+    if amount is None:
+        return None
+    return amount, currency, 1
+
+
 _GUEST_RE = re.compile(r"(\d+)\s*(?:guests?|guest|people|person)\b", re.I)
 _BEDROOM_RE = re.compile(r"(\d+)\s*(?:bedrooms?|bedroom|br)\b", re.I)
 _BED_RE = re.compile(r"(\d+)\s*beds?\b", re.I)
@@ -1224,6 +1316,18 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             sdp = sec.get("structuredDisplayPrice")
             if not isinstance(sdp, dict):
                 return False
+
+            breakdown = _parse_pdp_booking_breakdown_nightly(sdp)
+            if breakdown is not None:
+                amount, ccy, price_nights = breakdown
+                result["nightly_price"] = round(float(amount), 2)
+                result["total_price"] = round(float(amount) * max(1, int(price_nights)), 2)
+                result["price_nights"] = max(1, int(price_nights))
+                result["price_kind"] = "nightly_from_pdp_breakdown"
+                if ccy:
+                    result["currency"] = ccy
+                return True
+
             primary = sdp.get("primaryLine")
             if not isinstance(primary, dict):
                 return False
@@ -1266,7 +1370,6 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             if ccy:
                 result["currency"] = ccy
             return True
-
         parsed_price = False
         for require_available in (True, False):
             if parsed_price:

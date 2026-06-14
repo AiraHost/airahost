@@ -609,6 +609,71 @@ def test_self_price_capture_tries_two_night_window_after_one_night_miss(monkeypa
     assert result["priceByDate"] == {"2026-06-01": 150}
 
 
+def test_self_price_capture_prefers_one_night_before_minimum_stay_fallback(monkeypatch):
+    class _PoolClient:
+        cdp_url = "http://127.0.0.1:9222"
+
+        def ensure_browser_ready(self) -> None:
+            return
+
+        def close_browser(self) -> None:
+            return
+
+    calls: List[Dict[str, Any]] = []
+
+    monkeypatch.setattr(worker_main, "DAY_QUERY_MAX_WORKERS", 1)
+    monkeypatch.setattr(worker_main, "RATE_LIMIT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.build_warmed_browser_client_pool",
+        lambda **_kwargs: [_PoolClient()],
+    )
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.close_browser_client_pool",
+        lambda _pool: None,
+    )
+
+    def _fake_capture_target_live_price(
+        listing_url,
+        checkin,
+        checkout,
+        cdp_url,
+        cdp_connect_timeout_ms,
+        client,
+        allow_retry_matrix,
+        adults=1,
+    ):
+        calls.append({"checkin": checkin, "checkout": checkout})
+        return {
+            "observedListingPrice": 430,
+            "livePriceStatus": "captured",
+            "livePriceStatusReason": "",
+            "observedListingPriceSource": "mock",
+            "observedListingPriceConfidence": "high",
+            "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "worker.scraper.target_extractor.capture_target_live_price",
+        _fake_capture_target_live_price,
+    )
+    monkeypatch.setattr(
+        "worker.core.concurrent_runner.execute_day_queries_concurrently",
+        lambda query_func, args_list, **_kwargs: ([query_func(**dict(args_list[0]))], object()),
+    )
+
+    result = worker_main._capture_user_listing_prices_for_range(
+        report_id="regression-self-price-one-night-first",
+        listing_url="https://www.airbnb.com/rooms/123456789",
+        start_date="2026-06-17",
+        end_date="2026-06-18",
+        minimum_booking_nights=3,
+    )
+
+    assert calls == [{"checkin": "2026-06-17", "checkout": "2026-06-18"}]
+    assert result["observedListingPrice"] == 430
+    assert result["priceByDate"] == {"2026-06-17": 430}
+
+
 def test_get_listing_url_prefers_input_attributes_when_payload_urls_conflict(caplog):
     job = {
         "input_listing_url": "https://www.airbnb.com/rooms/50302420",
