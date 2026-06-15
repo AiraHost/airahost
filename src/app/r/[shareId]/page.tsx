@@ -479,20 +479,26 @@ export default function ResultsPage({
   }, [report?.resultCalendar, mlPredictionsByDate, mlWeight, mlWeightPct]);
 
   const priceBlendPreview = useMemo(() => {
-    const firstDay = report?.resultCalendar?.[0] ?? null;
-    const suggestedPrice = getCalendarSuggestedPrice(firstDay);
-    const mlPrice = firstDay ? mlPredictionsByDate.get(firstDay.date) ?? null : null;
+    const calendar = report?.resultCalendar ?? [];
+    const previewDay =
+      (snappedDate ? calendar.find((day) => day.date === snappedDate) : null) ??
+      calendar[0] ??
+      null;
+    const suggestedPrice = getCalendarSuggestedPrice(previewDay);
+    const mlPrice = previewDay ? mlPredictionsByDate.get(previewDay.date) ?? null : null;
     const adjustedPrice =
       typeof suggestedPrice === "number" && typeof mlPrice === "number"
         ? Math.round(suggestedPrice * (1 - mlWeight) + mlPrice * mlWeight)
         : suggestedPrice;
     return {
-      date: firstDay?.date ?? null,
+      date: previewDay?.date ?? null,
       suggestedPrice,
       mlPrice,
       adjustedPrice,
+      hasMlPrediction: typeof mlPrice === "number" && Number.isFinite(mlPrice),
+      isSelectedDate: !!snappedDate && previewDay?.date === snappedDate,
     };
-  }, [report?.resultCalendar, mlPredictionsByDate, mlWeight]);
+  }, [report?.resultCalendar, snappedDate, mlPredictionsByDate, mlWeight]);
 
   const contextualBenchmarkInfo = useMemo((): BenchmarkInfo | null => {
     return (report?.benchmarkInfo ?? report?.resultSummary?.benchmarkInfo ?? null) as BenchmarkInfo | null;
@@ -1101,7 +1107,12 @@ export default function ResultsPage({
                   </div>
                   {priceBlendPreview.date && (
                     <p className="mt-3 text-xs text-foreground/45">
-                      Previewing {priceBlendPreview.date}. Dates without an ML prediction keep the suggested price.
+                      Previewing {priceBlendPreview.date}
+                      {priceBlendPreview.isSelectedDate ? " (selected date)" : ""}.
+                      {" "}
+                      {priceBlendPreview.hasMlPrediction
+                        ? "Dates without an ML prediction keep the suggested price."
+                        : "No ML prediction for this date, so the calendar keeps the suggested price."}
                     </p>
                   )}
                 </div>
