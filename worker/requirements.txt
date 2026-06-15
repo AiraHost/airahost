@@ -3,4 +3,5 @@ playwright>=1.48.0
 python-dotenv>=1.0.0
 pydantic>=2.9.0
 pydantic-settings>=2.6.0
+requests>=2.32.0
 timezonefinder>=6.0.0
