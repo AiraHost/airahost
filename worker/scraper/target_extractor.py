@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 from worker.scraper.parsers import parse_pdp_response
 from worker.scraper.price_normalizer import (
+    nightly_price_from_parsed_pdp,
     normalize_raw_price,
     select_price_from_dom_candidates,
 )
@@ -1389,24 +1390,11 @@ def extract_nightly_price_from_listing_page(
                 str(listing_id),
                 safe_domain_base(listing_url),
             )
-            nightly = parsed_pdp.get("nightly_price")
-            total = parsed_pdp.get("total_price")
-            price_kind = str(parsed_pdp.get("price_kind") or "")
-            price_nights = int(parsed_pdp.get("price_nights") or 1)
-            if isinstance(total, (int, float)) and total > 0 and (
-                nightly is None
-                or price_kind.startswith("trip_total")
-                or price_nights > 1
-            ):
-                normalized = normalize_raw_price(
-                    total,
-                    qualifier="total",
-                    stay_nights=stay_nights,
-                    source="pdp",
-                    produce_nightly_from_total=True,
-                )
-                if normalized is not None:
-                    nightly = normalized.nightly_price
+            nightly = nightly_price_from_parsed_pdp(
+                parsed_pdp,
+                stay_nights=stay_nights,
+                source="pdp",
+            )
             if isinstance(nightly, (int, float)) and nightly > 0:
                 return float(nightly), "high"
             
@@ -1953,14 +1941,11 @@ def capture_target_live_price(
             _price = _nightly
             if _price is None and isinstance(_total, (int, float)):
                 _nights = max(1, (dt.strptime(_checkout, "%Y-%m-%d") - dt.strptime(_checkin, "%Y-%m-%d")).days)
-                _normalized = normalize_raw_price(
-                    _total,
-                    qualifier="total",
+                _price = nightly_price_from_parsed_pdp(
+                    {"nightly_price": _nightly, "total_price": _total},
                     stay_nights=_nights,
                     source="pdp",
-                    produce_nightly_from_total=True,
                 )
-                _price = _normalized.nightly_price if _normalized is not None else None
             return (_price if isinstance(_price, (int, float)) and _price > 0 else None), ("high" if _price else "failed"), _meta
 
         # Retry matrix: same-day window only. Keep legacy 1->2 fallback only for 1-adult requests.

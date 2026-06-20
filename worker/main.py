@@ -1046,6 +1046,31 @@ def _capture_user_listing_prices_for_range(
             early_stop_threshold=None,
             progress_callback=None,
         )
+        priced_dates = {
+            str(row.get("date") or "")
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("price"), (int, float))
+            and row.get("price") > 0
+        }
+        missing_retry_args = []
+        for item in query_args:
+            checkin = (start + _td(days=int(item["day_index"]))).strftime("%Y-%m-%d")
+            if checkin not in priced_dates:
+                missing_retry_args.append(item)
+        if missing_retry_args:
+            logger.info(
+                f"[{report_id}] user-listing daily capture retry: "
+                f"retrying {len(missing_retry_args)}/{total_days} unpriced dates"
+            )
+            retry_rows, _retry_state = execute_day_queries_concurrently(
+                query_func=_capture_for_index,
+                args_list=missing_retry_args,
+                max_workers=min(worker_count, browser_count, len(missing_retry_args)),
+                early_stop_threshold=None,
+                progress_callback=None,
+            )
+            rows.extend(retry_rows)
     finally:
         close_browser_client_pool(browser_pool)
 
@@ -1055,9 +1080,20 @@ def _capture_user_listing_prices_for_range(
         if not isinstance(row, dict):
             continue
         day_date = str(row.get("date") or "")
-        if day_date == start_date and first_day_row is None:
-            first_day_row = row
         day_price = row.get("price")
+        first_day_price = (first_day_row or {}).get("price")
+        if (
+            day_date == start_date
+            and (
+                first_day_row is None
+                or (
+                    not (isinstance(first_day_price, (int, float)) and first_day_price > 0)
+                    and isinstance(day_price, (int, float))
+                    and day_price > 0
+                )
+            )
+        ):
+            first_day_row = row
         if isinstance(day_price, (int, float)) and day_price > 0:
             price_by_date[day_date] = round(float(day_price))
 

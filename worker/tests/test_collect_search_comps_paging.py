@@ -9,7 +9,13 @@ def _gid(listing_id: str) -> str:
     return base64.b64encode(raw).decode("utf-8")
 
 
-def _payload(listing_id: str, price_text: str):
+def _payload(listing_id: str, price_text: str, accessibility_label: str | None = None):
+    primary_line = {
+        "price": price_text,
+        "qualifier": "total",
+    }
+    if accessibility_label:
+        primary_line["accessibilityLabel"] = accessibility_label
     return {
         "data": {
             "presentation": {
@@ -20,10 +26,7 @@ def _payload(listing_id: str, price_text: str):
                                 "demandStayListing": {"id": _gid(listing_id)},
                                 "available": True,
                                 "structuredDisplayPrice": {
-                                    "primaryLine": {
-                                        "price": price_text,
-                                        "qualifier": "total",
-                                    }
+                                    "primaryLine": primary_line,
                                 },
                             }
                         ]
@@ -60,6 +63,25 @@ class _FakeClientOneNightEmptyTwoNightHasPrice:
             return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
         if checkin == "2026-05-06" and checkout == "2026-05-08":
             return 200, _payload("444", "$400 CAD")
+        return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
+
+
+class _FakeClientOneNightEmptyTwoNightDecimalTotal:
+    def __init__(self):
+        self.calls = []
+
+    def search_listings_with_overrides(self, overrides):
+        self.calls.append(dict(overrides))
+        checkin = str(overrides.get("checkin"))
+        checkout = str(overrides.get("checkout"))
+        if checkin == "2026-05-06" and checkout == "2026-05-07":
+            return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
+        if checkin == "2026-05-06" and checkout == "2026-05-08":
+            return 200, _payload(
+                "555",
+                "$1110.36 USD",
+                "$1110.36 USD for 2 nights",
+            )
         return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
 
 
@@ -230,6 +252,32 @@ def test_collect_search_comps_default_retries_two_night_when_one_night_empty():
     assert qn == 2
     assert len(comps) == 1
     assert comps[0].url == "https://www.airbnb.com/rooms/444"
+
+
+def test_collect_search_comps_ceils_decimal_two_night_total_before_deriving_nightly():
+    """
+    Airbnb API totals can carry cent-level artifacts even when the card displays
+    whole-dollar prices. Normalize the 2-night total first, then derive nightly.
+    """
+    client = _FakeClientOneNightEmptyTwoNightDecimalTotal()
+    comps, qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.com",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=1,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+        page_offsets=[0],
+    )
+
+    assert qn == 2
+    assert len(comps) == 1
+    assert comps[0].nightly_price == 555.5
+    assert comps[0].query_total_price == 1111.0
+    assert comps[0].scrape_nights == 2
+    assert comps[0].price_kind == "trip_total_from_search"
 
 
 def test_collect_search_comps_enables_map_search_with_bounds_when_center_and_radius_provided():

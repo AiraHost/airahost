@@ -11,7 +11,9 @@ candidate dicts that the JS layer (_BOOKING_WIDGET_PRICE_JS) would return.
 """
 
 import pytest
+from worker.scraper.price_normalizer import normalize_raw_price
 from worker.scraper.target_extractor import (
+    extract_nightly_price_from_listing_page,
     select_nightly_price_from_candidates,
     _extract_text_price_matches,
     _TRIP_TOTAL_RE,
@@ -174,6 +176,91 @@ def test_float_value_preserved():
     result = select_nightly_price_from_candidates(candidates)
     assert result is not None
     assert result[0] == 123.45
+
+
+def test_client_pdp_extraction_uses_price_after_discount_not_primary_price():
+    """
+    Airbnb can place the visible one-night price in a "price after discount"
+    breakdown row while primaryLine carries another nearby price.
+    """
+
+    class _Client:
+        def get_listing_details(self, listing_id, checkin, checkout, adults=1):
+            return {
+                "data": {
+                    "presentation": {
+                        "stayProductDetailPage": {
+                            "sections": {
+                                "sections": [
+                                    {
+                                        "sectionId": "BOOK_IT_SIDEBAR",
+                                        "section": {
+                                            "available": True,
+                                            "structuredDisplayPrice": {
+                                                "primaryLine": {
+                                                    "price": "$769 USD",
+                                                    "accessibilityLabel": "$684 USD for 1 night",
+                                                    "qualifier": "for 1 night",
+                                                },
+                                                "explanationData": {
+                                                    "priceDetails": [
+                                                        {
+                                                            "items": [
+                                                                {
+                                                                    "description": "Price after discount",
+                                                                    "priceString": "$684 USD",
+                                                                },
+                                                            ]
+                                                        }
+                                                    ]
+                                                },
+                                            },
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+
+    price, confidence = extract_nightly_price_from_listing_page(
+        _Client(),
+        listing_url="https://www.airbnb.com/rooms/12345",
+        checkin="2026-06-17",
+        checkout="2026-06-18",
+        adults=1,
+    )
+
+    assert price == 684.0
+    assert confidence == "high"
+
+
+def test_normalizer_ceils_one_night_api_decimal_but_keeps_divided_total_fraction():
+    one_night = normalize_raw_price(
+        40.19,
+        qualifier="total",
+        stay_nights=1,
+        source="search",
+        produce_nightly_from_total=True,
+        round_direct_nightly_to_whole=True,
+    )
+    assert one_night is not None
+    assert one_night.nightly_price == 41
+    assert one_night.total_price == 41
+
+    two_night = normalize_raw_price(
+        827,
+        qualifier="total",
+        context_text="for 2 nights",
+        stay_nights=2,
+        source="search",
+        produce_nightly_from_total=True,
+        round_direct_nightly_to_whole=True,
+    )
+    assert two_night is not None
+    assert two_night.nightly_price == 413.5
+    assert two_night.total_price == 827
 
 
 # ---------------------------------------------------------------------------

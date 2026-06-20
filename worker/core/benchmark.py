@@ -52,7 +52,7 @@ from worker.core.similarity import (
 )
 from worker.scraper.comp_collection import collect_search_comps
 from worker.scraper.parsers import parse_pdp_response
-from worker.scraper.price_normalizer import normalize_raw_price
+from worker.scraper.price_normalizer import nightly_price_from_parsed_pdp
 from worker.scraper.target_extractor import ListingSpec, extract_listing_id_from_url, safe_domain_base
 
 logger = logging.getLogger("worker.core.benchmark")
@@ -193,22 +193,12 @@ def _extract_benchmark_price_with_min_stay_fallback(
         return None, "failed"
     pdp = client.get_listing_details(listing_id, checkin=checkin, checkout=checkout, adults=1)
     parsed = parse_pdp_response(pdp, listing_id, safe_domain_base(benchmark_url))
-    price = parsed.get("nightly_price")
-    total = parsed.get("total_price")
     requested_nights = max(1, (date.fromisoformat(checkout) - date.fromisoformat(checkin)).days)
-    if isinstance(total, (int, float)) and total > 0 and (
-        str(parsed.get("price_kind") or "").startswith("trip_total")
-        or int(parsed.get("price_nights") or 1) > 1
-    ):
-        normalized = normalize_raw_price(
-            total,
-            qualifier="total",
-            stay_nights=requested_nights,
-            source="pdp",
-            produce_nightly_from_total=True,
-        )
-        if normalized is not None:
-            price = normalized.nightly_price
+    price = nightly_price_from_parsed_pdp(
+        parsed,
+        stay_nights=requested_nights,
+        source="pdp",
+    )
     confidence = "high" if price is not None else "failed"
     if price is not None:
         return price, confidence
@@ -219,21 +209,11 @@ def _extract_benchmark_price_with_min_stay_fallback(
     fallback_checkout = (date.fromisoformat(checkin) + timedelta(days=2)).isoformat()
     pdp_fb = client.get_listing_details(listing_id, checkin=checkin, checkout=fallback_checkout, adults=1)
     parsed_fb = parse_pdp_response(pdp_fb, listing_id, safe_domain_base(benchmark_url))
-    fallback_price = parsed_fb.get("nightly_price")
-    fallback_total = parsed_fb.get("total_price")
-    if isinstance(fallback_total, (int, float)) and fallback_total > 0 and (
-        str(parsed_fb.get("price_kind") or "").startswith("trip_total")
-        or int(parsed_fb.get("price_nights") or 1) > 1
-    ):
-        normalized_fb = normalize_raw_price(
-            fallback_total,
-            qualifier="total",
-            stay_nights=2,
-            source="pdp",
-            produce_nightly_from_total=True,
-        )
-        if normalized_fb is not None:
-            fallback_price = normalized_fb.nightly_price
+    fallback_price = nightly_price_from_parsed_pdp(
+        parsed_fb,
+        stay_nights=2,
+        source="pdp",
+    )
     fallback_confidence = "high" if fallback_price is not None else "failed"
     if fallback_price is not None:
         logger.info(

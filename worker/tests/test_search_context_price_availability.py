@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from worker.scraper.parsers import (
     _extract_availability_context_from_search_result,
     parse_pdp_baths_property_type_fast,
@@ -261,6 +264,41 @@ def test_parse_search_context_prefers_discounted_primary_price_when_both_fields_
     assert row["currency"] == "CAD"
 
 
+def test_parse_search_context_prefers_discount_accessibility_label_when_discounted_price_missing():
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "price": "$5,648 USD",
+                                        "accessibilityLabel": "$4,659 USD for 2 nights, originally $5,648 USD",
+                                        "qualifier": "total",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] is None
+    assert row["total_price"] == 4659.0
+    assert row["price_nights"] == 2
+    assert row["currency"] == "USD"
+
+
 def test_parse_search_context_marks_two_night_total_for_later_normalization():
     payload = {
         "data": {
@@ -292,6 +330,74 @@ def test_parse_search_context_marks_two_night_total_for_later_normalization():
     row = ctx["1629301846268091180"]
     assert row["nightly_price"] is None
     assert row["total_price"] == 300.0
+    assert row["price_nights"] == 2
+
+
+def test_parse_search_context_ceils_direct_nightly_api_decimal_to_display_price():
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "accessibilityLabel": "$40.19 USD per night",
+                                        "price": "$40.19 USD",
+                                        "qualifier": "night",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] == 41
+    assert row["total_price"] == 41
+    assert row["price_nights"] == 1
+
+
+def test_parse_search_context_ceils_decimal_two_night_total_to_display_price():
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "accessibilityLabel": "$1110.36 USD for 2 nights",
+                                        "price": "$1110.36 USD",
+                                        "qualifier": "total",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] is None
+    assert row["total_price"] == 1111
     assert row["price_nights"] == 2
 
 
@@ -676,6 +782,73 @@ def test_parse_pdp_response_prefers_nightly_breakdown_over_fee_inclusive_primary
     assert out["currency"] == "USD"
 
 
+def test_parse_pdp_response_uses_display_primary_when_breakdown_has_cent_artifact():
+    """
+    Real fixture shape: primaryLine is Airbnb's displayed price, while
+    explanationData has a lower-level base amount with cents. The parser should
+    choose the displayed primary amount when it matches the breakdown total
+    within display precision.
+    """
+    fixture = Path("worker/tests/fixtures/pdp_sparse_1408676238256636483.json")
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+
+    out = parse_pdp_response(payload, "1408676238256636483", "https://www.airbnb.ca")
+
+    assert out["nightly_price"] == 321.0
+    assert out["total_price"] == 321.0
+    assert out["price_nights"] == 1
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+    assert out["currency"] == "CAD"
+
+
+def test_parse_pdp_response_uses_display_two_night_total_when_breakdown_has_cent_artifact():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$1,111 USD",
+                                            "accessibilityLabel": "$1,111 USD for 2 nights",
+                                            "qualifier": "total",
+                                        },
+                                        "explanationData": {
+                                            "priceDetails": [
+                                                {
+                                                    "items": [
+                                                        {
+                                                            "description": "2 nights x $555.18 USD",
+                                                            "priceString": "$1,110.36 USD",
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
+
+    assert out["nightly_price"] == 555.5
+    assert out["total_price"] == 1111.0
+    assert out["price_nights"] == 2
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+    assert out["currency"] == "USD"
+
+
 def test_parse_pdp_response_supports_amount_before_nights_breakdown_shape():
     payload = {
         "data": {
@@ -719,6 +892,102 @@ def test_parse_pdp_response_supports_amount_before_nights_breakdown_shape():
     assert out["nightly_price"] == 430.0
     assert out["price_nights"] == 2
     assert out["price_kind"] == "nightly_from_pdp_breakdown"
+
+
+def test_parse_pdp_response_prefers_one_night_price_after_discount_over_primary_price():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$769 USD",
+                                            "accessibilityLabel": "$684 USD for 1 night",
+                                            "qualifier": "for 1 night",
+                                        },
+                                        "explanationData": {
+                                            "priceDetails": [
+                                                {
+                                                    "items": [
+                                                        {
+                                                            "description": "Price after discount",
+                                                            "priceString": "$684 USD",
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
+
+    assert out["nightly_price"] == 684
+    assert out["total_price"] == 684
+    assert out["price_nights"] == 1
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+    assert out["currency"] == "USD"
+
+
+def test_parse_pdp_response_prefers_two_night_discount_breakdown_over_original_primary_price():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": True,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$5,648 USD",
+                                            "accessibilityLabel": "$4,659 USD for 2 nights, originally $5,648 USD",
+                                            "qualifier": "total",
+                                        },
+                                        "explanationData": {
+                                            "priceDetails": [
+                                                {
+                                                    "items": [
+                                                        {
+                                                            "description": "Price after discount",
+                                                            "priceString": "$4,659 USD",
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
+
+    assert out["nightly_price"] == 2329.5
+    assert out["total_price"] == 4659.0
+    assert out["price_nights"] == 2
+    assert out["price_kind"] == "nightly_from_pdp_breakdown"
+    assert out["currency"] == "USD"
 
 
 def test_parse_pdp_response_reads_overview_v2_capacity_layout_and_location():

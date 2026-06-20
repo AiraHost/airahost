@@ -528,6 +528,99 @@ def test_self_price_capture_does_not_backfill_observed_price_from_later_date(mon
     assert result["observedListingPriceDate"] == "2026-06-01"
 
 
+def test_self_price_capture_retries_missing_dates(monkeypatch):
+    class _PoolClient:
+        cdp_url = "http://127.0.0.1:9222"
+
+        def ensure_browser_ready(self) -> None:
+            return
+
+        def close_browser(self) -> None:
+            return
+
+    attempts_by_date: Dict[str, int] = {}
+    execute_calls: List[List[Dict[str, Any]]] = []
+
+    monkeypatch.setattr(worker_main, "DAY_QUERY_MAX_WORKERS", 1)
+    monkeypatch.setattr(worker_main, "RATE_LIMIT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.build_warmed_browser_client_pool",
+        lambda **_kwargs: [_PoolClient()],
+    )
+    monkeypatch.setattr(
+        "worker.scraper.browser_runtime.close_browser_client_pool",
+        lambda _pool: None,
+    )
+
+    def _fake_capture_target_live_price(
+        listing_url,
+        checkin,
+        checkout,
+        cdp_url,
+        cdp_connect_timeout_ms,
+        client,
+        allow_retry_matrix,
+        adults=1,
+    ):
+        attempts_by_date[checkin] = attempts_by_date.get(checkin, 0) + 1
+        if checkin == "2026-06-02" and attempts_by_date[checkin] <= 2:
+            return {
+                "observedListingPrice": None,
+                "livePriceStatus": "no_price_found",
+                "livePriceStatusReason": "transient blank widget",
+                "observedListingPriceSource": None,
+                "observedListingPriceConfidence": "failed",
+                "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+            }
+        return {
+            "observedListingPrice": 150 + attempts_by_date[checkin],
+            "livePriceStatus": "captured",
+            "livePriceStatusReason": "",
+            "observedListingPriceSource": "mock",
+            "observedListingPriceConfidence": "high",
+            "observedListingPriceCapturedAt": f"{checkin}T00:00:00Z",
+        }
+
+    monkeypatch.setattr(
+        "worker.scraper.target_extractor.capture_target_live_price",
+        _fake_capture_target_live_price,
+    )
+
+    def _fake_execute_day_queries_concurrently(
+        query_func,
+        args_list,
+        max_workers=2,
+        early_stop_threshold=None,
+        progress_callback=None,
+    ):
+        execute_calls.append([dict(item) for item in args_list])
+        rows = [query_func(**dict(item)) for item in args_list]
+        return rows, object()
+
+    monkeypatch.setattr(
+        "worker.core.concurrent_runner.execute_day_queries_concurrently",
+        _fake_execute_day_queries_concurrently,
+    )
+
+    result = worker_main._capture_user_listing_prices_for_range(
+        report_id="regression-self-price-missing-day-retry",
+        listing_url="https://www.airbnb.com/rooms/123456789",
+        start_date="2026-06-01",
+        end_date="2026-06-04",
+        minimum_booking_nights=1,
+    )
+
+    assert len(execute_calls) == 2
+    assert [item["day_index"] for item in execute_calls[1]] == [1]
+    assert attempts_by_date == {
+        "2026-06-01": 1,
+        "2026-06-02": 3,
+        "2026-06-03": 1,
+    }
+    assert result["capturedDays"] == 3
+    assert result["priceByDate"]["2026-06-02"] == 153
+
+
 def test_self_price_capture_tries_two_night_window_after_one_night_miss(monkeypatch):
     class _PoolClient:
         def __init__(self):

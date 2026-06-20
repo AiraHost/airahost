@@ -74,6 +74,13 @@ function similarityBadgeClasses(similarity: number): string {
   return "bg-gray-100 text-gray-600";
 }
 
+function formatComparableNightlyPrice(price: number, queryNights: number): string {
+  if (queryNights <= 1) {
+    return String(Math.ceil(price));
+  }
+  return String(Number(price.toFixed(2)));
+}
+
 function matchQualityLabel(stage: string): {
   label: string;
   description: string;
@@ -424,7 +431,7 @@ function ComparableCard({
             </div>
           ) : hasDisplayPrice ? (
             <p className="text-2xl font-semibold text-gray-900">
-              ${displayPrice}
+              ${formatComparableNightlyPrice(displayPrice, queryNights)}
               <span className="text-sm font-normal text-gray-500"> / night</span>
             </p>
           ) : null}

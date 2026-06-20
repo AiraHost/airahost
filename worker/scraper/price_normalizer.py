@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,6 +39,10 @@ def extract_price_nights(text: str, default: int = 1) -> int:
     return nights if nights > 0 else fallback
 
 
+def _airbnb_display_whole_dollar(amount: float) -> int:
+    return int(math.ceil(float(amount)))
+
+
 def normalize_raw_price(
     amount: Any,
     *,
@@ -47,6 +52,7 @@ def normalize_raw_price(
     source: str = "price",
     currency: Optional[str] = None,
     produce_nightly_from_total: bool = True,
+    round_direct_nightly_to_whole: bool = False,
 ) -> Optional[NormalizedPrice]:
     """
     Convert raw scraped price text into one nightly/total interpretation.
@@ -83,22 +89,65 @@ def normalize_raw_price(
     )
 
     if is_total:
-        nightly = round(raw_amount / max(1, price_nights), 2) if produce_nightly_from_total else None
+        if round_direct_nightly_to_whole and price_nights == 1:
+            total = _airbnb_display_whole_dollar(raw_amount)
+            nightly = total if produce_nightly_from_total else None
+        else:
+            total = round(raw_amount, 2)
+            nightly = round(raw_amount / max(1, price_nights), 2) if produce_nightly_from_total else None
         return NormalizedPrice(
             nightly_price=nightly,
-            total_price=round(raw_amount, 2),
+            total_price=total,
             price_nights=max(1, price_nights),
             price_kind=f"trip_total_from_{source}",
             currency=currency,
         )
 
+    nightly_amount = (
+        _airbnb_display_whole_dollar(raw_amount)
+        if round_direct_nightly_to_whole
+        else round(raw_amount, 2)
+    )
     return NormalizedPrice(
-        nightly_price=round(raw_amount, 2),
-        total_price=round(raw_amount, 2),
+        nightly_price=nightly_amount,
+        total_price=nightly_amount,
         price_nights=1,
         price_kind=f"nightly_from_{source}",
         currency=currency,
     )
+
+
+def nightly_price_from_parsed_pdp(
+    parsed: Dict[str, Any],
+    *,
+    stay_nights: int,
+    source: str = "pdp",
+) -> Optional[float]:
+    """
+    Return the canonical nightly price from parse_pdp_response().
+
+    parse_pdp_response already normalizes Airbnb PDP totals and prefers booking
+    breakdown rows when present. Callers should only derive nightly from total
+    when the parser did not provide a usable nightly value.
+    """
+    nightly = parsed.get("nightly_price") if isinstance(parsed, dict) else None
+    if isinstance(nightly, (int, float)) and nightly > 0:
+        return float(nightly)
+
+    total = parsed.get("total_price") if isinstance(parsed, dict) else None
+    if not isinstance(total, (int, float)) or total <= 0:
+        return None
+
+    normalized = normalize_raw_price(
+        total,
+        qualifier="total",
+        stay_nights=stay_nights,
+        source=source,
+        produce_nightly_from_total=True,
+    )
+    if normalized is None or not isinstance(normalized.nightly_price, (int, float)):
+        return None
+    return float(normalized.nightly_price)
 
 
 def select_price_from_dom_candidates(

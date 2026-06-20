@@ -37,7 +37,7 @@ from worker.core.similarity import (
 )
 from worker.scraper.comp_collection import collect_search_comps
 from worker.scraper.parsers import parse_pdp_response, parse_search_listing_context
-from worker.scraper.price_normalizer import normalize_raw_price
+from worker.scraper.price_normalizer import nightly_price_from_parsed_pdp
 from worker.scraper.target_extractor import ListingSpec, safe_domain_base
 
 logger = logging.getLogger("worker.scraper.day_query")
@@ -235,21 +235,12 @@ def _revalidate_top_comp_prices_with_pdp(
                 str(comp_id),
                 safe_domain_base(comp_url),
             )
-            pdp_nightly = parsed.get("nightly_price")
             pdp_total = parsed.get("total_price")
-            if isinstance(pdp_total, (int, float)) and pdp_total > 0 and (
-                str(parsed.get("price_kind") or "").startswith("trip_total")
-                or int(parsed.get("price_nights") or 1) > 1
-            ):
-                normalized = normalize_raw_price(
-                    pdp_total,
-                    qualifier="total",
-                    stay_nights=nights,
-                    source="pdp",
-                    produce_nightly_from_total=True,
-                )
-                if normalized is not None:
-                    pdp_nightly = normalized.nightly_price
+            pdp_nightly = nightly_price_from_parsed_pdp(
+                parsed,
+                stay_nights=nights,
+                source="pdp",
+            )
             if not isinstance(pdp_nightly, (int, float)) or pdp_nightly <= 0:
                 continue
 

@@ -271,6 +271,10 @@ def _parse_dollar_amount_currency(text: str) -> tuple[Optional[float], Optional[
     return (amount if amount > 0 else None), currency
 
 
+def _mentions_original_price(text: Any) -> bool:
+    return bool(re.search(r"\boriginal(?:ly)?\b", str(text or ""), re.I))
+
+
 def _parse_pdp_booking_breakdown_nightly(
     structured_display_price: Dict[str, Any],
 ) -> Optional[tuple[float, Optional[str], int]]:
@@ -291,6 +295,12 @@ def _parse_pdp_booking_breakdown_nightly(
         return None
 
     first_item: Optional[Dict[str, Any]] = None
+    current_price_item: Optional[Dict[str, Any]] = None
+    current_price_markers = (
+        "price after discount",
+        "discounted price",
+        "discounted total",
+    )
     fee_markers = (
         "cleaning",
         "service fee",
@@ -301,6 +311,57 @@ def _parse_pdp_booking_breakdown_nightly(
         "total",
         "price after discount",
     )
+
+    primary = structured_display_price.get("primaryLine")
+    primary_context = ""
+    if isinstance(primary, dict):
+        primary_context = " ".join(
+            str(primary.get(key) or "")
+            for key in ("discountedPrice", "price", "accessibilityLabel", "qualifier")
+        )
+
+    def _infer_price_nights_from_context(*texts: str) -> Optional[int]:
+        for text in texts:
+            s = str(text or "")
+            if not s.strip():
+                continue
+            if re.search(r"\b(?:min(?:imum)?|at least)\b", s, re.I):
+                continue
+            m = re.search(r"\bfor\s+(\d+)\s+nights?\b", s, re.I)
+            if m:
+                return max(1, int(m.group(1)))
+            m = re.search(r"\b(\d+)\s+nights?\b", s, re.I)
+            if m:
+                return max(1, int(m.group(1)))
+        return None
+
+    def _matching_primary_display_total(
+        raw_total: float,
+        price_nights: int,
+        fallback_currency: Optional[str],
+    ) -> Optional[tuple[float, Optional[str]]]:
+        if not isinstance(primary, dict):
+            return None
+        accessibility_label = str(primary.get("accessibilityLabel") or "")
+        candidate_keys = (
+            ("discountedPrice", "accessibilityLabel", "price")
+            if _mentions_original_price(accessibility_label)
+            else ("discountedPrice", "price", "accessibilityLabel")
+        )
+        qualifier = str(primary.get("qualifier") or "")
+        for key in candidate_keys:
+            candidate = primary.get(key)
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            primary_amount, primary_currency = _parse_dollar_amount_currency(candidate)
+            if primary_amount is None:
+                continue
+            primary_nights = _infer_price_nights_from_context(candidate, qualifier, primary_context)
+            if primary_nights is not None and int(primary_nights) != int(price_nights):
+                continue
+            if abs(float(primary_amount) - float(raw_total)) <= 1.0:
+                return float(primary_amount), primary_currency or fallback_currency
+        return None
 
     for detail in price_details:
         if not isinstance(detail, dict):
@@ -318,6 +379,8 @@ def _parse_pdp_booking_breakdown_nightly(
             if not description:
                 continue
             desc_lower = description.lower()
+            if current_price_item is None and any(marker in desc_lower for marker in current_price_markers):
+                current_price_item = item
             if "x" not in desc_lower or "night" not in desc_lower:
                 continue
 
@@ -342,7 +405,42 @@ def _parse_pdp_booking_breakdown_nightly(
                     nights = max(1, int(night_match.group(1)))
                 except Exception:
                     nights = 1
+            primary_total = _matching_primary_display_total(
+                float(amount) * max(1, int(nights)),
+                nights,
+                currency,
+            )
+            if primary_total is not None:
+                display_total, display_currency = primary_total
+                return round(display_total / max(1, int(nights)), 2), display_currency, nights
             return amount, currency, nights
+
+    if isinstance(current_price_item, dict):
+        description = str(current_price_item.get("description") or "").replace("\xa0", " ").strip()
+        price_string = str(current_price_item.get("priceString") or "").replace("\xa0", " ").strip()
+        price_nights = _infer_price_nights_from_context(description, price_string, primary_context)
+        if price_nights is not None:
+            amount, currency = _parse_dollar_amount_currency(price_string)
+            if amount is None:
+                amount, currency = _parse_dollar_amount_currency(description)
+            if amount is not None:
+                primary_total = _matching_primary_display_total(
+                    float(amount),
+                    price_nights,
+                    currency,
+                )
+                if primary_total is not None:
+                    amount, currency = primary_total
+                normalized = normalize_raw_price(
+                    amount,
+                    qualifier="total",
+                    context_text=f"for {price_nights} nights",
+                    stay_nights=price_nights,
+                    source="pdp_breakdown",
+                    produce_nightly_from_total=True,
+                )
+                if normalized is not None and normalized.nightly_price is not None:
+                    return float(normalized.nightly_price), currency, price_nights
 
     if not isinstance(first_item, dict):
         return None
@@ -897,9 +995,14 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
         if isinstance(sdp, dict):
             primary = sdp.get("primaryLine", {})
             if isinstance(primary, dict):
-                price_text = primary.get("discountedPrice") or primary.get("price")
                 qualifier = str(primary.get("qualifier") or "").lower()
                 accessibility_label = str(primary.get("accessibilityLabel") or "")
+                price_text = primary.get("discountedPrice")
+                if not isinstance(price_text, str) or not price_text.strip():
+                    if _mentions_original_price(accessibility_label):
+                        price_text = accessibility_label
+                    else:
+                        price_text = primary.get("price")
 
                 # Exact payload rule:
                 # if available=true and primaryLine.price is '$<num> <ccy>',
@@ -921,6 +1024,7 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                             source="search",
                             currency=strict_ccy,
                             produce_nightly_from_total=False,
+                            round_direct_nightly_to_whole=True,
                         )
                         if normalized is not None:
                             row["nightly_price"] = normalized.nightly_price
@@ -1335,7 +1439,13 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             # Airbnb can omit `price` for some PDP contexts while still exposing
             # amount text in `discountedPrice` or `accessibilityLabel`.
             price_candidates: List[str] = []
-            for key in ("discountedPrice", "price", "accessibilityLabel"):
+            accessibility_label = str(primary.get("accessibilityLabel") or "")
+            candidate_keys = (
+                ("discountedPrice", "accessibilityLabel", "price")
+                if _mentions_original_price(accessibility_label)
+                else ("discountedPrice", "price", "accessibilityLabel")
+            )
+            for key in candidate_keys:
                 v = primary.get(key)
                 if isinstance(v, str) and v.strip():
                     price_candidates.append(v.strip())
@@ -1360,6 +1470,7 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
                 source="pdp",
                 currency=ccy,
                 produce_nightly_from_total=True,
+                round_direct_nightly_to_whole=True,
             )
             if normalized is None:
                 return False
