@@ -2,6 +2,8 @@ import { test, expect, Page } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 test.describe('Daily Agent - AiraHost Analysis Checker', () => {
   // Use a long timeout (15 mins) because AiraHost analysis might take time,
   // and we are scraping multiple Airbnb URLs.
@@ -204,9 +206,7 @@ async function runAnalysisAndCheck(page: Page, input: any, reportPath: string) {
 
         const pageTitle = await page.title();
         const pageText = await page.evaluate(() => document.body.innerText);
-        const normalizedText = pageText.replace(/[\s,\$]/g, '');
-        
-        let errors = [];
+        const errors = [];
         
         // Name aligns
         if (comp.title && comp.title !== 'Unknown' && !pageTitle.toLowerCase().includes(comp.title.toLowerCase().substring(0, 10))) {

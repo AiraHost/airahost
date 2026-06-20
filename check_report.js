@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { chromium } = require('playwright');
 
 (async () => {
@@ -5,7 +6,7 @@ const { chromium } = require('playwright');
   const page = await browser.newPage();
   
   await page.goto('https://www.airahost.com/r/azs2csep', { waitUntil: 'networkidle' });
-  const html = await page.content();
+  await page.content();
   
   // Find all links
   const links = await page.evaluate(() => {
