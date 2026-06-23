@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from worker.scraper.parsers_deepbnb import (
     parse_deepbnb_pdp_to_stayspdp_payload,
@@ -42,6 +44,22 @@ class DeepBnbBackend:
         self.config = config
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
+
+        # Configure connection pooling for optimal performance
+        retry_strategy = Retry(
+            total=2,
+            connect=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=20,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
         self.locale = str(config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA")
         self.currency = str(config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "USD")) or "USD")
         self.api_key = str(

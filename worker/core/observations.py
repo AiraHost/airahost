@@ -239,9 +239,13 @@ def _write_comp_observations(
         similarity   = _safe_num(comp.get("similarity"))
         is_pinned    = bool(comp.get("isPinnedBenchmark", False))
         price_by_date: Dict[str, Any] = comp.get("priceByDate") or {}
+        price_details: Dict[str, Any] = comp.get("priceByDateDetails") or {}
 
         for date_str, price in price_by_date.items():
             if not date_str or price is None:
+                continue
+            detail = price_details.get(date_str) if isinstance(price_details, dict) else None
+            if isinstance(detail, dict) and detail.get("source") == "fixed_pool_reuse":
                 continue
             rows.append({
                 "saved_listing_id": saved_listing_id,

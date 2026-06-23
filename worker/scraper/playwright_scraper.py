@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 class PlaywrightScraper:
     """Legacy Playwright capture/replay strategy restored from pre-deepbnb history."""
     _refresh_lock = threading.Lock()
-    _tab_gate_lock = threading.Lock()
-    _tab_gate = None
-    _tab_limit = 5
-    _open_tab_count = 0
     _CANONICAL_AIRBNB_HOST_RE = re.compile(
         r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.com$",
         re.IGNORECASE,
@@ -89,6 +85,10 @@ class PlaywrightScraper:
         self._browser = None
         self._context = None
         self._context_owned = False
+        self._tab_gate_lock = threading.Lock()
+        self._tab_gate = None
+        self._tab_limit = 5
+        self._open_tab_count = 0
         self._ensure_tab_gate()
         if self.use_hardcoded_stayspdp_template:
             self._load_hardcoded_stayspdp_template()
@@ -128,44 +128,41 @@ class PlaywrightScraper:
         }
         return f"{self.base_url}/rooms/{listing_id}?{urlencode(params)}"
 
-    @classmethod
-    def _ensure_tab_gate(cls) -> None:
-        with cls._tab_gate_lock:
-            if cls._tab_gate is not None:
+    def _ensure_tab_gate(self) -> None:
+        with self._tab_gate_lock:
+            if self._tab_gate is not None:
                 return
-            # Memory-safe default on Windows hosts. Can still be overridden by env.
-            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "2")
+            # Keep several tabs busy per browser while preserving a hard ceiling.
+            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4")
             try:
                 parsed_limit = int(str(raw_limit).strip())
             except Exception:
-                parsed_limit = 2
+                parsed_limit = 4
             # Hard safety ceiling: never allow more than 5 concurrent tabs.
-            cls._tab_limit = max(1, min(parsed_limit, 5))
-            cls._tab_gate = threading.BoundedSemaphore(cls._tab_limit)
+            self._tab_limit = max(1, min(parsed_limit, 5))
+            self._tab_gate = threading.BoundedSemaphore(self._tab_limit)
 
-    @classmethod
-    async def _acquire_tab_slot(cls, timeout_seconds: float = 120.0) -> None:
-        cls._ensure_tab_gate()
-        assert cls._tab_gate is not None
+    async def _acquire_tab_slot(self, timeout_seconds: float = 120.0) -> None:
+        self._ensure_tab_gate()
+        assert self._tab_gate is not None
         deadline = time.monotonic() + timeout_seconds
         while True:
-            if cls._tab_gate.acquire(blocking=False):
-                with cls._tab_gate_lock:
-                    cls._open_tab_count += 1
+            if self._tab_gate.acquire(blocking=False):
+                with self._tab_gate_lock:
+                    self._open_tab_count += 1
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"Timed out waiting for Playwright tab slot (limit={cls._tab_limit})"
+                    f"Timed out waiting for Playwright tab slot (limit={self._tab_limit})"
                 )
             await asyncio.sleep(0.05)
 
-    @classmethod
-    def _release_tab_slot(cls) -> None:
-        with cls._tab_gate_lock:
-            cls._open_tab_count = max(0, cls._open_tab_count - 1)
-        if cls._tab_gate is not None:
+    def _release_tab_slot(self) -> None:
+        with self._tab_gate_lock:
+            self._open_tab_count = max(0, self._open_tab_count - 1)
+        if self._tab_gate is not None:
             try:
-                cls._tab_gate.release()
+                self._tab_gate.release()
             except Exception:
                 pass
 
@@ -536,11 +533,14 @@ class PlaywrightScraper:
         clone = PlaywrightScraper.__new__(PlaywrightScraper)
         clone.config = copy.deepcopy(self.config)
         clone.base_url = self.base_url
+        clone.locale = self.locale
+        clone.currency = self.currency
         clone.session = requests.Session()
         clone.captured_search_req = copy.deepcopy(self.captured_search_req)
         clone.captured_pdp_req = copy.deepcopy(self.captured_pdp_req)
         clone.disable_map_search = self.disable_map_search
         clone.enable_ai_search = self.enable_ai_search
+        clone.use_hardcoded_stayspdp_template = self.use_hardcoded_stayspdp_template
         clone.cache_path = self.cache_path
         clone.session_max_age_seconds = self.session_max_age_seconds
         clone.refresh_cooldown_seconds = self.refresh_cooldown_seconds
@@ -559,6 +559,11 @@ class PlaywrightScraper:
         clone._browser = None
         clone._context = None
         clone._context_owned = False
+        clone._tab_gate_lock = threading.Lock()
+        clone._tab_gate = None
+        clone._tab_limit = 5
+        clone._open_tab_count = 0
+        clone._ensure_tab_gate()
         for c in self.session.cookies:
             clone.session.cookies.set(
                 c.name,
@@ -1563,7 +1568,10 @@ class PlaywrightScraper:
                         captured_data = payload
                         has_price = self._pdp_booking_has_price(payload)
                         dates_unavailable = self._pdp_dates_unavailable(payload)
-                        if has_price:
+                        if dates_unavailable:
+                            terminal_reason = "dates_unavailable"
+                            captured_data = self._build_minimal_pdp_payload(None)
+                        elif has_price:
                             terminal_reason = "price"
                         logger.info(
                             "Playwright PDP payload listing=%s status=%s has_price=%s dates_unavailable=%s terminal=%s",
@@ -1654,6 +1662,13 @@ class PlaywrightScraper:
                     if time.monotonic() >= phase2_deadline:
                         break
                     await page.wait_for_timeout(120)
+
+            if terminal_reason == "dates_unavailable":
+                logger.info(
+                    "Playwright PDP API shows unavailable dates listing=%s; returning no-price payload",
+                    listing_id,
+                )
+                return (captured_status or 200), self._build_minimal_pdp_payload(None)
 
             if terminal_reason is not None:
                 # Hold very briefly after terminal detection so last payload
@@ -1749,17 +1764,19 @@ class PlaywrightScraper:
                         listing_id,
                     )
                     return (captured_status or 200), self._build_minimal_pdp_payload(None)
+                html_read_attempts = 1
                 dom_price_text: Optional[str] = None
-                for attempt in range(1, 6):
+                for attempt in range(1, html_read_attempts + 1):
                     logger.info(
-                        "Playwright PDP HTML read attempt %s/5 listing=%s",
+                        "Playwright PDP HTML read attempt %s/%s listing=%s",
                         attempt,
+                        html_read_attempts,
                         listing_id,
                     )
                     dom_price_text = await self._read_dom_price_text(page, timeout_ms=1500)
                     if dom_price_text:
                         break
-                    if attempt < 5:
+                    if attempt < html_read_attempts:
                         await page.wait_for_timeout(1500)
                 if dom_price_text:
                     if captured_data is None:
@@ -1774,7 +1791,8 @@ class PlaywrightScraper:
                     )
                 else:
                     logger.info(
-                        "Playwright PDP HTML read exhausted (5 attempts) listing=%s; skipping day with no price",
+                        "Playwright PDP HTML read exhausted (%s attempt) listing=%s; skipping day with no price",
+                        html_read_attempts,
                         listing_id,
                     )
                     if captured_data is None:

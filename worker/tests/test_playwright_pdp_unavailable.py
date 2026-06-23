@@ -25,3 +25,34 @@ def test_rendered_html_without_unavailable_dates_marker_can_try_price_fallback()
     rendered_html = "<html><body><span>$321 CAD</span></body></html>"
 
     assert PlaywrightScraper._rendered_html_dates_unavailable(rendered_html) is False
+
+
+def test_pdp_api_unavailable_dates_marker_overrides_stale_price() -> None:
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": False,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$295 USD",
+                                            "accessibilityLabel": "$295 USD for 1 night",
+                                        }
+                                    },
+                                    "errorMessage": "Those dates are not available",
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    assert PlaywrightScraper._pdp_booking_has_price(payload) is True
+    assert PlaywrightScraper._pdp_dates_unavailable(payload) is True

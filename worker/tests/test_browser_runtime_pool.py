@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from worker.scraper import browser_runtime
+from worker.scraper.playwright_scraper import PlaywrightScraper
 
 
 class _FakeAirbnbClient:
@@ -58,3 +59,14 @@ def test_resolve_cdp_urls_discovers_ipv6_ports(monkeypatch) -> None:
         "http://[::1]:9225",
         "http://[::1]:9226",
     ]
+
+
+def test_playwright_tab_gate_is_per_instance_and_capped(monkeypatch) -> None:
+    monkeypatch.setenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "7")
+
+    first = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9222"})
+    second = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9223"})
+
+    assert first._tab_limit == 5
+    assert second._tab_limit == 5
+    assert first._tab_gate is not second._tab_gate

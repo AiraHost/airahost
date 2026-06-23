@@ -4,7 +4,9 @@ import logging
 import math
 import re
 import os
+import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +32,77 @@ from worker.scraper.target_extractor import (
 
 logger = logging.getLogger("worker.scraper.comp_collection")
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
+_PDP_STRUCTURAL_CACHE_LOCK = threading.Lock()
+_PDP_STRUCTURAL_CACHE: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+_PDP_STRUCTURAL_CACHE_LOADED = False
+
+
+def _pdp_structural_cache_path() -> str:
+    configured = os.getenv("AIRBNB_PDP_STRUCTURAL_CACHE_PATH")
+    if configured is not None:
+        return str(configured).strip()
+    worker_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(worker_dir, ".airbnb_pdp_structural_cache.json")
+
+
+def _ensure_pdp_structural_cache_loaded_locked() -> None:
+    global _PDP_STRUCTURAL_CACHE_LOADED
+    if _PDP_STRUCTURAL_CACHE_LOADED:
+        return
+    _PDP_STRUCTURAL_CACHE_LOADED = True
+
+    path = _pdp_structural_cache_path()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        logger.info("[comp_collection] PDP structural cache load skipped: %s", exc)
+        return
+    if not isinstance(raw, dict):
+        return
+    for listing_id, payload in raw.items():
+        if not isinstance(payload, dict):
+            continue
+        sid = str(listing_id).strip()
+        if not sid:
+            continue
+        accommodates = payload.get("accommodates")
+        baths = payload.get("baths")
+        property_type = payload.get("property_type")
+        amenities = payload.get("amenities")
+        _PDP_STRUCTURAL_CACHE[sid] = (
+            int(accommodates) if isinstance(accommodates, (int, float)) and int(accommodates) > 0 else None,
+            float(baths) if isinstance(baths, (int, float)) else None,
+            str(property_type or ""),
+            [str(a) for a in amenities if isinstance(a, str)] if isinstance(amenities, list) else [],
+        )
+
+
+def _save_pdp_structural_cache_locked() -> None:
+    path = _pdp_structural_cache_path()
+    if not path:
+        return
+    payload = {
+        str(listing_id): {
+            "accommodates": values[0],
+            "baths": values[1],
+            "property_type": values[2],
+            "amenities": values[3],
+        }
+        for listing_id, values in _PDP_STRUCTURAL_CACHE.items()
+    }
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.info("[comp_collection] PDP structural cache save skipped: %s", exc)
 
 
 def _build_debug_search_url(base_origin: str, overrides: Dict[str, Any]) -> str:
@@ -93,12 +166,12 @@ def _matches_structural_filters(
     """
     Hard filter for comp eligibility.
 
-    Current policy: guests/accommodates only.
+    Current policy: exact guests/accommodates only.
     Bedrooms/beds/baths remain signals for similarity scoring, but are not
     used to exclude candidates from the comp pool.
     """
     if target_accommodates is not None:
-        if comp.accommodates is None or int(comp.accommodates) < int(target_accommodates):
+        if comp.accommodates is None or int(comp.accommodates) != int(target_accommodates):
             return False
     return True
 
@@ -175,6 +248,14 @@ def _extract_listing_id_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _tabs_per_browser() -> int:
+    try:
+        value = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4"))
+    except Exception:
+        value = 4
+    return max(1, min(value, 5))
+
+
 def _enrich_comps_baths_and_property_type_from_pdp(
     client,
     comps: List[ListingSpec],
@@ -187,14 +268,16 @@ def _enrich_comps_baths_and_property_type_from_pdp(
     Enrich comps with PDP fields from individual listing-detail fetches.
     Uses full PDP parsing so amenities are populated for each compset listing.
     """
-    if not comps or not hasattr(client, "get_listing_details"):
+    detail_fetcher = (
+        getattr(client, "get_listing_details_fast", None)
+        or getattr(client, "get_listing_details", None)
+    )
+    if not comps or detail_fetcher is None:
         return
 
-    # Strict PDP-only mode for these two structural fields:
-    # discard any StaysSearch-derived values before enrichment.
-    for comp in comps:
-        comp.baths = None
-        comp.property_type = ""
+    # Pre-load cache once before starting enrichment work
+    with _PDP_STRUCTURAL_CACHE_LOCK:
+        _ensure_pdp_structural_cache_loaded_locked()
 
     work_items: List[Tuple[int, ListingSpec, str]] = []
     for idx, comp in enumerate(comps):
@@ -210,17 +293,28 @@ def _enrich_comps_baths_and_property_type_from_pdp(
     max_workers = max(1, min(int(os.getenv("PDP_DETAIL_MAX_WORKERS", str(MAX_SCRAPER_WORKERS))), MAX_SCRAPER_WORKERS))
     effective_workers = min(max_workers, attempted)
 
-    use_pool = hasattr(client, "config") and isinstance(getattr(client, "config", None), dict)
-    if use_pool:
+    use_fast_detail = hasattr(client, "get_listing_details_fast")
+    use_pool = (
+        (not use_fast_detail)
+        and hasattr(client, "config")
+        and isinstance(getattr(client, "config", None), dict)
+    )
+    if use_fast_detail:
+        browser_pool = [
+            client.fork() if hasattr(client, "fork") else client
+            for _ in range(effective_workers)
+        ]
+        browser_locks = [threading.BoundedSemaphore(_tabs_per_browser()) for _ in browser_pool]
+    elif use_pool:
         browser_pool = build_warmed_browser_client_pool(
             base_config=dict(client.config),  # type: ignore[attr-defined]
             requested_size=effective_workers,
             pool_name="comp_pdp_enrichment",
         )
-        browser_locks = [threading.Lock() for _ in browser_pool]
+        browser_locks = [threading.BoundedSemaphore(_tabs_per_browser()) for _ in browser_pool]
     else:
         browser_pool = [client]
-        browser_locks = [threading.Lock()]
+        browser_locks = [threading.BoundedSemaphore(_tabs_per_browser())]
 
     work_args: List[Dict[str, Any]] = []
     for i, item in enumerate(work_items):
@@ -231,14 +325,25 @@ def _enrich_comps_baths_and_property_type_from_pdp(
             }
         )
 
-    def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[float], str, List[str]]:
+    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+
+    def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[int], Optional[float], str, List[str]]:
         idx, _comp, lid = query_arg["item"]
+        cached = _PDP_STRUCTURAL_CACHE.get(str(lid))
+        if cached is not None:
+            a_val, b_val, p_val, amenities = cached
+            return idx, a_val, b_val, p_val, list(amenities)
+
         browser_slot = int(query_arg["browser_slot"])
         slot_client = browser_pool[browser_slot]
         slot_lock = browser_locks[browser_slot]
+        slot_fetcher = (
+            getattr(slot_client, "get_listing_details_fast", None)
+            or getattr(slot_client, "get_listing_details", None)
+        )
         try:
             with slot_lock:
-                pdp_data = slot_client.get_listing_details(
+                pdp_data = slot_fetcher(
                     lid,
                     checkin=checkin,
                     checkout=checkout,
@@ -252,12 +357,15 @@ def _enrich_comps_baths_and_property_type_from_pdp(
             baths = parsed.get("baths")
             ptype_raw = parsed.get("property_type")
             ptype_norm = normalize_property_type(str(ptype_raw or ""))
+            accommodates = parsed.get("accommodates")
+            a_val = int(accommodates) if isinstance(accommodates, (int, float)) and int(accommodates) > 0 else None
             b_val = float(baths) if isinstance(baths, (int, float)) else None
             p_val = ptype_norm.strip() if isinstance(ptype_norm, str) and ptype_norm.strip() else ""
             amenities = [a for a in (parsed.get("amenities") or []) if isinstance(a, str) and a.strip()]
-            return idx, b_val, p_val, amenities
+            cache_updates[str(lid)] = (a_val, b_val, p_val, list(amenities))
+            return idx, a_val, b_val, p_val, amenities
         except Exception:
-            return idx, None, "", []
+            return idx, None, None, "", []
 
     updated = 0
     amenities_populated = 0
@@ -265,9 +373,13 @@ def _enrich_comps_baths_and_property_type_from_pdp(
         with ThreadPoolExecutor(max_workers=effective_workers) as ex:
             futures = [ex.submit(_fetch, query_arg) for query_arg in work_args]
             for f in as_completed(futures):
-                idx, b_val, p_val, amenities = f.result()
+                idx, a_val, b_val, p_val, amenities = f.result()
                 comp = comps[idx]
                 changed = False
+                if isinstance(a_val, int):
+                    if comp.accommodates != int(a_val):
+                        comp.accommodates = int(a_val)
+                        changed = True
                 if isinstance(b_val, (int, float)):
                     if comp.baths != float(b_val):
                         comp.baths = float(b_val)
@@ -293,6 +405,12 @@ def _enrich_comps_baths_and_property_type_from_pdp(
     finally:
         if use_pool:
             close_browser_client_pool(browser_pool)  # type: ignore[arg-type]
+
+    # Batch update cache and persist once
+    if cache_updates:
+        with _PDP_STRUCTURAL_CACHE_LOCK:
+            _PDP_STRUCTURAL_CACHE.update(cache_updates)
+            _save_pdp_structural_cache_locked()
 
     if attempted:
         logger.info(
@@ -327,17 +445,21 @@ def collect_search_comps(
     target_beds: Optional[int] = None,
     target_baths: Optional[float] = None,
     pdp_structural_enrichment: bool = False,
+    pdp_structural_enrichment_limit: Optional[int] = None,
     prefer_two_night: bool = False,
     prefer_one_night: bool = False,
 ) -> Tuple[List[ListingSpec], int]:
+    collect_start = time.perf_counter()
     base_origin = safe_domain_base(str(base_origin or "https://www.airbnb.com"))
     checkin_str = date_i.isoformat()
+    page_size = max(1, int(max_cards))
     base_offsets = page_offsets or [0]
-    # Daily path usually calls with page_offsets=None (single-page).
-    # When priced comps are zero, retry one deeper pass to match fixed-pool depth better.
-    deep_offsets = [0, max(1, int(max_cards)), max(1, int(max_cards)) * 2]
+    # Daily path needs enough priced candidates for a 20-card display compset.
+    # Keep scanning a small bounded page window instead of returning after the
+    # first priced listing.
+    deep_offsets = [i * page_size for i in range(1, max(0, int(max_scroll_rounds)) + 1)]
     offset_sets: List[List[int]] = [base_offsets]
-    if page_offsets is None:
+    if page_offsets is None and deep_offsets:
         offset_sets.append(deep_offsets)
     fallback_unpriced_comps: List[ListingSpec] = []
     fallback_unpriced_query_nights: int = 1
@@ -367,17 +489,25 @@ def collect_search_comps(
     for query_nights in query_night_sequence:
         checkout_str = (date_i + timedelta(days=query_nights)).isoformat()
         last_reason = "unknown"
+        carry_listing_ids: List[str] = []
+        carry_context: Dict[str, Dict[str, Any]] = {}
+        carry_seen_ids: set[str] = set()
         for offset_set_idx, offsets in enumerate(offset_sets):
-            listing_ids: List[str] = []
-            context: Dict[str, Dict[str, Any]] = {}
-            seen_ids: set[str] = set()
+            listing_ids: List[str] = list(carry_listing_ids)
+            context: Dict[str, Dict[str, Any]] = dict(carry_context)
+            seen_ids: set[str] = set(carry_seen_ids)
             page_ok = False
 
             for offset in offsets:
+                search_adults = (
+                    int(target_accommodates)
+                    if target_accommodates is not None
+                    else int(adults)
+                )
                 overrides = {
                     "checkin": checkin_str,
                     "checkout": checkout_str,
-                    "adults": adults,
+                    "adults": search_adults,
                     "dailySearch": True,
                     "itemsPerGrid": max_cards,
                 }
@@ -430,6 +560,24 @@ def collect_search_comps(
 
                 page_ids = parse_search_response(search_data)
                 page_ctx = parse_search_listing_context(search_data)
+                priced_page_rows = sum(
+                    1
+                    for row in page_ctx.values()
+                    if (row.get("nightly_price") or 0) > 0
+                    or (row.get("total_price") or 0) > 0
+                )
+                logger.info(
+                    "[%s] %s: page_funnel query_nights=%s offset=%s "
+                    "ids=%s context=%s priced_rows=%s elapsed_ms=%s",
+                    log_prefix,
+                    checkin_str,
+                    query_nights,
+                    offset,
+                    len(page_ids),
+                    len(page_ctx),
+                    priced_page_rows,
+                    round((time.perf_counter() - collect_start) * 1000),
+                )
                 for lid in page_ids:
                     sid = str(lid)
                     row = page_ctx.get(sid, {})
@@ -479,29 +627,50 @@ def collect_search_comps(
                 parsed_comps.append(spec)
 
             comps = parsed_comps
+            rejected_log = []
             self_excluded = 0
             if exclude_url:
-                comps = [c for c in comps if not (c.url and comp_urls_match(c.url, exclude_url))]
-                self_excluded = len(parsed_comps) - len(comps)
+                new_comps = []
+                for c in comps:
+                    if c.url and comp_urls_match(c.url, exclude_url):
+                        rejected_log.append(f"{(c.url or '').rsplit('/', 1)[-1]}: self-excluded")
+                    else:
+                        new_comps.append(c)
+                self_excluded = len(comps) - len(new_comps)
+                comps = new_comps
+            if pdp_structural_enrichment and comps:
+                if pdp_structural_enrichment_limit is not None:
+                    comps = comps[: max(0, int(pdp_structural_enrichment_limit))]
+                _enrich_comps_baths_and_property_type_from_pdp(
+                    client,
+                    comps,
+                    checkin=checkin_str,
+                    checkout=checkout_str,
+                    adults=adults,
+                )
             structural_excluded = 0
             if target_accommodates is not None:
                 before = len(comps)
-                comps = [
-                    c for c in comps
+                new_comps = []
+                for c in comps:
                     if _matches_structural_filters(
                         c,
                         target_accommodates=target_accommodates,
                         target_bedrooms=target_bedrooms,
                         target_beds=target_beds,
                         target_baths=target_baths,
-                    )
-                ]
+                    ):
+                        new_comps.append(c)
+                    else:
+                        rejected_log.append(f"{(c.url or '').rsplit('/', 1)[-1]}: structural-excluded (acc={c.accommodates})")
+                comps = new_comps
                 structural_excluded = before - len(comps)
 
             # Keep only listings with a positive nightly price AND marked available.
             priced: List[ListingSpec] = []
             unavailable_count = 0
             min_stay_blocked_count = 0
+            no_price_count = 0
             for c in comps:
                 lid = c.url.rsplit("/", 1)[-1] if c.url else ""
                 row = context.get(str(lid), {})
@@ -509,24 +678,44 @@ def collect_search_comps(
                 min_nights = row.get("min_nights")
                 if isinstance(min_nights, int) and min_nights > int(query_nights):
                     min_stay_blocked_count += 1
-                if not is_available:
+                    rejected_log.append(f"{lid}: min-stay-blocked")
+                elif not is_available:
                     unavailable_count += 1
-                has_price = bool(c.nightly_price and c.nightly_price > 0)
-                # Availability heuristics can be noisy; if Airbnb returned a positive
-                # price for this card, keep it even when availability was mis-flagged.
-                effective_available = bool(is_available or has_price)
-                if c.url and has_price and effective_available:
+                    rejected_log.append(f"{lid}: unavailable")
+                elif not bool(c.nightly_price and c.nightly_price > 0):
+                    no_price_count += 1
+                    rejected_log.append(f"{lid}: no-price")
+                elif c.url:
                     priced.append(c)
+            
+            if rejected_log:
+                logger.debug("[%s] %s: Filtered candidates: %s", log_prefix, checkin_str, ", ".join(rejected_log))
 
-            if priced:
-                if pdp_structural_enrichment:
-                    _enrich_comps_baths_and_property_type_from_pdp(
-                        client,
-                        priced,
-                        checkin=checkin_str,
-                        checkout=checkout_str,
-                        adults=adults,
-                    )
+            logger.info(
+                "[%s] %s: candidate_funnel query_nights=%s offsets=%s "
+                "fetched=%s parsed=%s self_excluded=%s structural_excluded=%s "
+                "unavailable=%s min_stay_blocked=%s no_price=%s priced=%s "
+                "elapsed_ms=%s",
+                log_prefix,
+                checkin_str,
+                query_nights,
+                offsets,
+                len(listing_ids),
+                len(parsed_comps),
+                self_excluded,
+                structural_excluded,
+                unavailable_count,
+                min_stay_blocked_count,
+                no_price_count,
+                len(priced),
+                round((time.perf_counter() - collect_start) * 1000),
+            )
+
+            priced_target = page_size
+            enough_priced = len(priced) >= priced_target
+            exhausted_offsets = offset_set_idx >= len(offset_sets) - 1
+            explicit_offsets = page_offsets is not None
+            if priced and (enough_priced or exhausted_offsets or explicit_offsets):
                 if self_excluded > 0 or structural_excluded > 0:
                     logger.info(
                         "[%s] %s: exclusions self=%s structural=%s",
@@ -536,6 +725,16 @@ def collect_search_comps(
                         structural_excluded,
                     )
                 return priced, query_nights
+            if priced:
+                logger.info(
+                    "[%s] %s: only %s priced comps from offsets=%s; "
+                    "continuing deeper toward target=%s",
+                    log_prefix,
+                    checkin_str,
+                    len(priced),
+                    offsets,
+                    priced_target,
+                )
             if comps and not fallback_unpriced_comps:
                 # Keep first non-empty candidate set even when prices are missing,
                 # so downstream can still render a transparent report.
@@ -549,20 +748,26 @@ def collect_search_comps(
                 reason = "sold_out_or_unavailable_likely"
             last_reason = reason
 
-            # No priced comps from single-page daily query: retry once with deeper offsets.
+            # Sparse single-page daily query: retry once with deeper offsets.
             if (
-                query_nights == 1
-                and page_offsets is None
+                page_offsets is None
                 and len(offsets) == 1
                 and offset_set_idx == 0
+                and len(offset_sets) > 1
             ):
+                carry_listing_ids = list(listing_ids)
+                carry_context = dict(context)
+                carry_seen_ids = set(seen_ids)
                 logger.info(
-                    "[%s] %s: no priced comps on offset=0; retrying deeper offsets=%s "
-                    "(query_nights=%s, reason=%s)",
+                    "[%s] %s: priced comps below target on offset=0; "
+                    "retrying deeper offsets=%s (query_nights=%s, priced=%s, "
+                    "target=%s, reason=%s)",
                     log_prefix,
                     checkin_str,
                     deep_offsets,
                     query_nights,
+                    len(priced),
+                    priced_target,
                     reason,
                 )
                 continue

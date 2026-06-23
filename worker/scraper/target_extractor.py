@@ -1747,15 +1747,14 @@ def capture_target_live_price(
         if client is None:
             from worker.scraper.airbnb_client import AirbnbClient
             use_deepbnb_live = str(
-                os.getenv("AIRBNB_USE_DEEPBNB_FOR_LIVE_PRICE", "1")
+                os.getenv("AIRBNB_USE_DEEPBNB_FOR_LIVE_PRICE", "0")
             ).strip().lower() in ("1", "true", "yes", "on")
             client = AirbnbClient(
                 {
                     "CHECKIN": checkin,
                     "CHECKOUT": checkout,
                     "ADULTS": requested_adults,
-                    # Keep current behavior by default (Deepbnb enabled). This env switch
-                    # allows explicit Playwright-only live-capture debugging when needed.
+                    # Deepbnb is off by default; this env switch is only an explicit opt-in.
                     "USE_DEEPBNB_BACKEND": use_deepbnb_live,
                 }
             )

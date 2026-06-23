@@ -37,7 +37,7 @@ class AirbnbClient:
         use_deepbnb_cfg = self.config.get("USE_DEEPBNB_BACKEND", None)
         if use_deepbnb_cfg is None:
             self.use_deepbnb_backend = bool(
-                str(os.getenv("AIRBNB_USE_DEEPBNB_BACKEND", "1")).strip().lower() in ("1", "true", "yes", "on")
+                str(os.getenv("AIRBNB_USE_DEEPBNB_BACKEND", "0")).strip().lower() in ("1", "true", "yes", "on")
             )
         else:
             self.use_deepbnb_backend = bool(use_deepbnb_cfg)
@@ -214,6 +214,14 @@ class AirbnbClient:
         is_daily_search = bool((overrides or {}).get("dailySearch"))
         if not is_daily_search:
             return self._search_via_playwright(overrides)
+        if self.config.get("DEEPBNB_DAILY_SEARCH_NO_PLAYWRIGHT_FALLBACK"):
+            try:
+                if self.deepbnb_scraper is None:
+                    return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
+                return self.deepbnb_scraper.search_listings_with_overrides(overrides)
+            except Exception as exc:
+                logger.warning("DeepBnb daily search failed closed for fast path: %s", exc)
+                return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
         return self._run_deepbnb_with_fallback(
             op_name="search_listings_with_overrides",
             deepbnb_call=lambda: self.deepbnb_scraper.search_listings_with_overrides(overrides),  # type: ignore[union-attr]
@@ -239,3 +247,26 @@ class AirbnbClient:
             checkout=effective_checkout,
             adults=effective_adults,
         )
+
+    def get_listing_details_fast(
+        self,
+        listing_id: str,
+        checkin: Optional[str] = None,
+        checkout: Optional[str] = None,
+        adults: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        effective_checkin = checkin or self.config.get("CHECKIN", "")
+        effective_checkout = checkout or self.config.get("CHECKOUT", "")
+        effective_adults = int(adults if adults is not None else self.config.get("ADULTS", 1))
+        if self.deepbnb_scraper is None:
+            return {}
+        try:
+            return self.deepbnb_scraper.get_listing_details(
+                str(listing_id),
+                checkin=effective_checkin,
+                checkout=effective_checkout,
+                adults=effective_adults,
+            )
+        except Exception as exc:
+            logger.warning("DeepBnb listing details failed closed for fast path listing=%s: %s", listing_id, exc)
+            return {}

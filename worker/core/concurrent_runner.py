@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+import os
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-MAX_SCRAPER_WORKERS = 3
+try:
+    _configured_max_workers = int(os.getenv("MAX_SCRAPER_WORKERS", "12"))
+except Exception:
+    _configured_max_workers = 12
+MAX_SCRAPER_WORKERS = max(1, min(_configured_max_workers, 15))
 
 
 @dataclass

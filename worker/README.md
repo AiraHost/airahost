@@ -272,12 +272,14 @@ The `worker/logs/` directory is created automatically on first run.
 | `MAX_SCROLL_ROUNDS` | `12` | Max scroll iterations when collecting comps |
 | `MAX_CARDS` | `80` | Max comparable listings to collect |
 | `SCRAPE_RATE_LIMIT_SECONDS` | `1.0` | Sleep between external requests |
-| `DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for day-by-day scrape queries (min 1, max 3) |
-| `BENCHMARK_DAY_QUERY_MAX_WORKERS` | `2` | Parallel workers for benchmark-first day queries (min 1, max 3) |
-| `FIXED_POOL_MAX_WORKERS` | `3` | Parallel workers for fixed-pool setup anchor searches (min 1, max 3) |
-| `FIXED_POOL_PAGES` | `6` | Search pages scanned per fixed-pool anchor before ranking by similarity |
-| `FIXED_POOL_PER_ANCHOR` | `15` | Top-N most similar comps kept per fixed-pool anchor |
-| `FIXED_POOL_GLOBAL_LIMIT` | `15` | Final fixed compset cap; higher-similarity comps replace the current lowest |
+| `MAX_SCRAPER_WORKERS` | `12` | Global scraper thread ceiling (min 1, max 15) |
+| `AIRBNB_PLAYWRIGHT_MAX_TABS` | `4` | Concurrent tabs per Playwright browser client (min 1, max 5) |
+| `DAY_QUERY_MAX_WORKERS` | `12` | Parallel workers for day-by-day scrape queries (min 1, max `MAX_SCRAPER_WORKERS`) |
+| `BENCHMARK_DAY_QUERY_MAX_WORKERS` | `12` | Parallel workers for benchmark-first day queries (min 1, max `MAX_SCRAPER_WORKERS`) |
+| `FIXED_POOL_MAX_WORKERS` | `12` | Parallel workers for fixed-pool setup anchor searches (min 1, max `MAX_SCRAPER_WORKERS`) |
+| `MIN_DAILY_COMPS_PER_DAY` | `20` | Minimum visible comparable listings to fill per sampled day from fresh + fixed-pool reused comps |
+| `FIXED_COMP_POOL_STRIDE_DAYS` | `7` | Days between fixed-pool anchor searches used for reusable daily comp coverage |
+| `FIXED_COMP_POOL_GLOBAL_LIMIT` | `30` | Max reusable fixed-pool comps retained for daily coverage fill |
 | `AIRBNB_DISABLE_MAP_SEARCH` | `0` | Set `1` to disable map search payload path |
 | `AIRBNB_ENABLE_AI_SEARCH` | `0` | Set `1` to force `aiSearchEnabled=true` in search payload |
 

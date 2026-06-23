@@ -16,6 +16,8 @@ import logging
 import math
 import os
 import statistics
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,7 +65,7 @@ DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "50"))
 DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "25"))
 DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "25"))
 DAY_QUERY_PDP_REVALIDATE_TOP_N = max(
-    0, int(os.getenv("DAY_QUERY_PDP_REVALIDATE_TOP_N", "5"))
+    0, int(os.getenv("DAY_QUERY_PDP_REVALIDATE_TOP_N", "0"))
 )
 
 # Relaxed similarity floor — used when the strict floor yields zero comps for a day.
@@ -165,6 +167,18 @@ def _resolve_query_center(search_location: str, target: ListingSpec) -> Tuple[Op
         from worker.core.geocode_details import geocode_address_details
         result = geocode_address_details(str(search_location), timeout=3)
         if result and result.get("lat") is not None and result.get("lng") is not None:
+            city = str(result.get("city") or "")
+            display_name = str(result.get("display_name") or "")
+            if (
+                "county" in city.casefold()
+                and "county" not in str(search_location or "").casefold()
+            ):
+                logger.info(
+                    "[day_query] map center skipped: search_location=%r resolved to county-level geocode %r",
+                    search_location,
+                    display_name or city,
+                )
+                return None, None
             lat = float(result["lat"])
             lng = float(result["lng"])
             logger.info(
@@ -293,17 +307,43 @@ def estimate_base_price_for_date(
     preferred_comps: Optional[List[Dict[str, Any]]] = None,
     excluded_room_ids: Optional[set[str]] = None,
     max_radius_km: Optional[float] = None,
+    known_comp_pool: Optional[Dict[str, Dict[str, Any]]] = None,
+    allow_relaxed_similarity: bool = True,
+    pdp_structural_enrichment_limit: Optional[int] = None,
 ) -> DayResult:
     """
     Execute a 1-night Airbnb search for date_i -> date_i+1.
     Collect cards, filter by similarity to target, compute price distribution.
     """
     top_k = max(20, int(top_k))
+    day_start = time.perf_counter()
     min_scan_per_mode = max(1, math.ceil(max(1, DAY_MIN_SCAN_TOTAL) / 2))
     one_night_scan_target = max(DAY_ONE_NIGHT_COMP_TARGET, min_scan_per_mode)
     two_night_scan_target = max(DAY_TWO_NIGHT_COMP_TARGET, min_scan_per_mode)
     checkin_str = date_i.isoformat()
     is_weekend = date_i.weekday() >= 4  # Fri=4, Sat=5
+    use_known_pool = bool(known_comp_pool)
+
+    def _apply_known_pool_fields(comps_in: List[ListingSpec]) -> List[ListingSpec]:
+        if not known_comp_pool:
+            return comps_in
+        out: List[ListingSpec] = []
+        for comp in comps_in:
+            cid = build_comp_id(comp.url or "")
+            payload = (known_comp_pool or {}).get(str(cid or ""))
+            if not cid or not payload:
+                continue
+            comp.accommodates = payload.get("accommodates")
+            comp.bedrooms = payload.get("bedrooms")
+            comp.beds = payload.get("beds")
+            comp.baths = payload.get("baths")
+            comp.rating = payload.get("rating")
+            comp.reviews = payload.get("reviews")
+            comp.property_type = payload.get("property_type") or payload.get("propertyType") or comp.property_type
+            if payload.get("amenities"):
+                comp.amenities = list(payload.get("amenities") or [])
+            out.append(comp)
+        return out
 
     try:
         search_location = _get_locked_search_location(client, target) or target.location
@@ -316,42 +356,60 @@ def estimate_base_price_for_date(
             f"[day_query] {checkin_str}: scan targets one_night={one_night_scan_target} "
             f"two_night={two_night_scan_target} total_target={one_night_scan_target + two_night_scan_target}"
         )
-        one_night_comps, _one_qn = collect_search_comps(
-            client,
-            search_location,
-            base_origin,
-            date_i,
-            adults,
-            max_scroll_rounds=max_scroll_rounds,
-            max_cards=one_night_scan_target,
-            rate_limit_seconds=rate_limit_seconds,
-            timeout_ms=PER_DAY_TIMEOUT_S * 1000,
-            exclude_url=target.url,
-            log_prefix="everyday_scrape_one_night",
-            center_lat=query_center_lat,
-            center_lng=query_center_lng,
-            map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
-            target_accommodates=target.accommodates,
-            prefer_one_night=True,
-        )
-        two_night_comps, _two_qn = collect_search_comps(
-            client,
-            search_location,
-            base_origin,
-            date_i,
-            adults,
-            max_scroll_rounds=max_scroll_rounds,
-            max_cards=two_night_scan_target,
-            rate_limit_seconds=rate_limit_seconds,
-            timeout_ms=PER_DAY_TIMEOUT_S * 1000,
-            exclude_url=target.url,
-            log_prefix="everyday_scrape_two_night",
-            center_lat=query_center_lat,
-            center_lng=query_center_lng,
-            map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
-            target_accommodates=target.accommodates,
-            prefer_two_night=True,
-        )
+
+        def _collect_one_night():
+            return collect_search_comps(
+                client,
+                search_location,
+                base_origin,
+                date_i,
+                adults,
+                max_scroll_rounds=max_scroll_rounds,
+                max_cards=one_night_scan_target,
+                rate_limit_seconds=rate_limit_seconds,
+                timeout_ms=PER_DAY_TIMEOUT_S * 1000,
+                exclude_url=target.url,
+                log_prefix="everyday_scrape_one_night",
+                center_lat=query_center_lat,
+                center_lng=query_center_lng,
+                map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
+                target_accommodates=None if use_known_pool else target.accommodates,
+                pdp_structural_enrichment=not use_known_pool,
+                pdp_structural_enrichment_limit=pdp_structural_enrichment_limit,
+                prefer_one_night=True,
+            )
+
+        def _collect_two_night():
+            return collect_search_comps(
+                client,
+                search_location,
+                base_origin,
+                date_i,
+                adults,
+                max_scroll_rounds=max_scroll_rounds,
+                max_cards=two_night_scan_target,
+                rate_limit_seconds=rate_limit_seconds,
+                timeout_ms=PER_DAY_TIMEOUT_S * 1000,
+                exclude_url=target.url,
+                log_prefix="everyday_scrape_two_night",
+                center_lat=query_center_lat,
+                center_lng=query_center_lng,
+                map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
+                target_accommodates=None if use_known_pool else target.accommodates,
+                pdp_structural_enrichment=not use_known_pool,
+                pdp_structural_enrichment_limit=pdp_structural_enrichment_limit,
+                prefer_two_night=True,
+            )
+
+        # Execute both queries concurrently
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            one_night_future = executor.submit(_collect_one_night)
+            two_night_future = executor.submit(_collect_two_night)
+            one_night_comps, _one_qn = one_night_future.result()
+            two_night_comps, _two_qn = two_night_future.result()
+
+        one_night_comps = _apply_known_pool_fields(one_night_comps)
+        two_night_comps = _apply_known_pool_fields(two_night_comps)
 
         comps_by_id: Dict[str, ListingSpec] = {}
         for c in one_night_comps:
@@ -406,11 +464,33 @@ def estimate_base_price_for_date(
             )
 
         filtered_comps, filter_debug = filter_similar_candidates(target, comps)
+        logger.info(
+            "[day_query] %s: structural_funnel collected=%s filtered=%s "
+            "stage=%s total_candidates=%s elapsed_ms=%s",
+            checkin_str,
+            comps_collected,
+            len(filtered_comps),
+            filter_debug.get("stage", "unknown"),
+            filter_debug.get("total_candidates", comps_collected),
+            round((time.perf_counter() - day_start) * 1000),
+        )
 
         # Score and rank (raw scores stored separately before any boost).
-        comps_scored = [(c, similarity_score(target, c)) for c in filtered_comps]
-        # Capture raw scores keyed by object id before the boost step overwrites them.
-        raw_sim_scores: Dict[int, float] = {id(c): s for c, s in comps_scored}
+        comps_scored = []
+        raw_sim_scores: Dict[int, float] = {}
+        for c in filtered_comps:
+            score, breakdown = similarity_score(target, c, debug=True)
+            comps_scored.append((c, score))
+            raw_sim_scores[id(c)] = score
+            lid = c.url.rsplit("/", 1)[-1] if c.url else ""
+            logger.debug(
+                "[%s] %s: candidate similarity breakdown listing_id=%s score=%.4f breakdown=%s",
+                "day_query",
+                checkin_str,
+                lid,
+                score,
+                breakdown,
+            )
         comps_scored.sort(key=lambda x: x[1], reverse=True)
 
         # Build list of enabled preferred comp URLs for boost logic.
@@ -447,6 +527,30 @@ def estimate_base_price_for_date(
             if raw_sim_scores.get(id(c), 0.0) >= SIMILARITY_FLOOR
         ]
         below_floor_count = len(comps_scored) - len(above_floor)
+        score_buckets = {
+            "gte_0_75": sum(1 for c, s in comps_scored if raw_sim_scores.get(id(c), s) >= 0.75),
+            "gte_0_50": sum(1 for c, s in comps_scored if raw_sim_scores.get(id(c), s) >= 0.50),
+            "gte_floor": len(above_floor),
+            "below_floor": below_floor_count,
+        }
+        if comps_scored:
+            logger.info(
+                "[day_query] %s: similarity_funnel scored=%s buckets=%s "
+                "top_failed=%s elapsed_ms=%s",
+                checkin_str,
+                len(comps_scored),
+                score_buckets,
+                [
+                    {
+                        "url": c.url,
+                        "score": round(raw_sim_scores.get(id(c), s), 3),
+                        "title": (c.title or "")[:80],
+                    }
+                    for c, s in comps_scored
+                    if raw_sim_scores.get(id(c), s) < SIMILARITY_FLOOR
+                ][:5],
+                round((time.perf_counter() - day_start) * 1000),
+            )
         selection_mode = "strict"
         _using_fallback = False
 
@@ -477,7 +581,7 @@ def estimate_base_price_for_date(
         # "strict"          — normal path, used when strict floor has ≥1 comp
         # "fallback_relaxed"— strict floor empty, fallback floor has ≥1 comp
         # "strict_empty"    — both floors empty, day will have no price
-        if not above_floor and comps_scored:
+        if not above_floor and comps_scored and allow_relaxed_similarity:
             fallback_pool = [
                 (c, s) for c, s in comps_scored
                 if raw_sim_scores.get(id(c), 0.0) >= SIMILARITY_FLOOR_FALLBACK
@@ -503,6 +607,8 @@ def estimate_base_price_for_date(
                     f"day will have no price"
                 )
                 selection_mode = "strict_empty"
+        elif not above_floor and comps_scored:
+            selection_mode = "strict_empty"
 
         # Search-feed nightly prices can drift from PDP exact-night prices.
         # Revalidate top-ranked comps so comparable card prices stay accurate.
@@ -660,6 +766,7 @@ def estimate_base_price_for_date(
             f"used={comps_used} median=${dist['median']} "
             f"mode={selection_mode} confidence={pricing_confidence} "
             f"query_nights={query_nights_used}"
+            f" elapsed_ms={round((time.perf_counter() - day_start) * 1000)}"
         )
 
         return DayResult(

@@ -507,153 +507,151 @@ def _extract_structural_context_from_search_result(r: Dict[str, Any]) -> Dict[st
         "amenities": [],
     }
 
-    # First pass: read explicit typed fields if present in nested objects.
-    for d in _walk_dicts(r):
-        if out["accommodates"] is None:
-            for key in ("personCapacity", "maxGuestCapacity", "maxGuests", "guestCapacity", "accommodates"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and int(val) > 0:
-                    out["accommodates"] = int(val)
-                    break
-
-        if out["bedrooms"] is None:
-            for key in ("bedroomCount", "bedrooms", "numBedrooms"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and int(val) >= 0:
-                    out["bedrooms"] = int(val)
-                    break
-
-        if out["beds"] is None:
-            for key in ("bedCount", "beds", "numBeds"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and int(val) >= 0:
-                    out["beds"] = int(val)
-                    break
-
-        if out["baths"] is None:
-            for key in ("bathroomCount", "bathrooms", "numBathrooms"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and float(val) >= 0:
-                    out["baths"] = float(val)
-                    break
-
-        if not out["property_type"]:
-            for key in ("roomTypeCategory", "spaceType", "propertyType", "propertyTypeLabel", "typeName"):
-                val = d.get(key)
-                if isinstance(val, str) and val.strip():
-                    norm = _normalize_property_type_from_text(val)
-                    if norm:
-                        out["property_type"] = norm
+    def _walk_and_extract(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if out["accommodates"] is None:
+                for key in ("personCapacity", "maxGuestCapacity", "maxGuests", "guestCapacity", "accommodates"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and int(val) > 0:
+                        out["accommodates"] = int(val)
                         break
 
-        if out["rating"] is None:
-            for key in ("avgRating", "rating", "starRating", "averageRating"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and 0 < float(val) <= 5:
-                    out["rating"] = round(float(val), 2)
-                    break
+            if out["bedrooms"] is None:
+                for key in ("bedroomCount", "bedrooms", "numBedrooms"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and int(val) >= 0:
+                        out["bedrooms"] = int(val)
+                        break
 
-        if out["reviews"] is None:
-            for key in ("reviewCount", "reviewsCount", "numberOfReviews", "reviews"):
-                val = d.get(key)
-                if isinstance(val, (int, float)) and int(val) >= 0:
-                    out["reviews"] = int(val)
-                    break
+            if out["beds"] is None:
+                for key in ("bedCount", "beds", "numBeds"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and int(val) >= 0:
+                        out["beds"] = int(val)
+                        break
 
-        if not out["location"]:
-            city = d.get("city") if isinstance(d.get("city"), str) else None
-            state = d.get("state") if isinstance(d.get("state"), str) else None
-            country = d.get("country") if isinstance(d.get("country"), str) else None
-            parts = [p.strip() for p in (city, state, country) if isinstance(p, str) and p.strip()]
-            if parts:
-                out["location"] = ", ".join(parts)
+            if out["baths"] is None:
+                for key in ("bathroomCount", "bathrooms", "numBathrooms"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and float(val) >= 0:
+                        out["baths"] = float(val)
+                        break
 
-        if out["lat"] is None or out["lng"] is None:
-            lat = d.get("lat", d.get("latitude", d.get("locationLat")))
-            lng = d.get("lng", d.get("longitude", d.get("locationLng")))
-            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-                out["lat"] = float(lat)
-                out["lng"] = float(lng)
+            if not out["property_type"]:
+                for key in ("roomTypeCategory", "spaceType", "propertyType", "propertyTypeLabel", "typeName"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        norm = _normalize_property_type_from_text(val)
+                        if norm:
+                            out["property_type"] = norm
+                            break
 
-    # Second pass: parse text fragments (titles, subtitles, labels) for missing fields.
-    for s in _walk_strings(r):
-        if not isinstance(s, str):
-            continue
-        text = s.strip()
-        if not text:
-            continue
+            if out["rating"] is None:
+                for key in ("avgRating", "rating", "starRating", "averageRating"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and 0 < float(val) <= 5:
+                        out["rating"] = round(float(val), 2)
+                        break
 
-        if not out["property_type"]:
-            norm = _normalize_property_type_from_text(text)
-            if norm:
-                out["property_type"] = norm
+            if out["reviews"] is None:
+                for key in ("reviewCount", "reviewsCount", "numberOfReviews", "reviews"):
+                    val = obj.get(key)
+                    if isinstance(val, (int, float)) and int(val) >= 0:
+                        out["reviews"] = int(val)
+                        break
 
-        if out["accommodates"] is None:
-            m = _GUEST_RE.search(text)
-            if m:
-                try:
-                    out["accommodates"] = int(m.group(1))
-                except Exception:
-                    pass
+            if not out["location"]:
+                city = obj.get("city") if isinstance(obj.get("city"), str) else None
+                state = obj.get("state") if isinstance(obj.get("state"), str) else None
+                country = obj.get("country") if isinstance(obj.get("country"), str) else None
+                parts = [p.strip() for p in (city, state, country) if isinstance(p, str) and p.strip()]
+                if parts:
+                    out["location"] = ", ".join(parts)
 
-        if out["bedrooms"] is None:
-            m = _BEDROOM_RE.search(text)
-            if m:
-                try:
-                    out["bedrooms"] = int(m.group(1))
-                except Exception:
-                    pass
+            if out["lat"] is None or out["lng"] is None:
+                lat = obj.get("lat", obj.get("latitude", obj.get("locationLat")))
+                lng = obj.get("lng", obj.get("longitude", obj.get("locationLng")))
+                if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                    out["lat"] = float(lat)
+                    out["lng"] = float(lng)
 
-        if out["beds"] is None:
-            m = _BED_RE.search(text)
-            if m:
-                try:
-                    out["beds"] = int(m.group(1))
-                except Exception:
-                    pass
+            for v in obj.values():
+                _walk_and_extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk_and_extract(item)
+        elif isinstance(obj, str) and obj:
+            text = obj.strip()
+            if not text:
+                return
 
-        if out["baths"] is None:
-            m = _BATH_RE.search(text)
-            if m:
-                try:
-                    out["baths"] = float(m.group(1))
-                except Exception:
-                    pass
+            if not out["property_type"]:
+                norm = _normalize_property_type_from_text(text)
+                if norm:
+                    out["property_type"] = norm
 
-        if out["rating"] is None:
-            m = re.search(r"([0-5](?:\.\d+)?)\s*(?:out of 5|stars?)", text, re.I)
-            if m:
-                try:
-                    rv = float(m.group(1))
-                    if 0 < rv <= 5:
-                        out["rating"] = round(rv, 2)
-                except Exception:
-                    pass
+            if out["accommodates"] is None:
+                m = _GUEST_RE.search(text)
+                if m:
+                    try:
+                        out["accommodates"] = int(m.group(1))
+                    except Exception:
+                        pass
 
-        if out["reviews"] is None:
-            m = re.search(r"\b(\d{1,6})\s*(?:reviews?|ratings?)\b", text, re.I)
-            if m:
-                try:
-                    out["reviews"] = int(m.group(1))
-                except Exception:
-                    pass
+            if out["bedrooms"] is None:
+                m = _BEDROOM_RE.search(text)
+                if m:
+                    try:
+                        out["bedrooms"] = int(m.group(1))
+                    except Exception:
+                        pass
 
-        if not out["location"]:
-            # Common card text shapes:
-            # - "Home in Oceano"
-            # - "Guest suite in Belmont, CA"
-            # - "Cabin at Lake Tahoe, California"
-            m = re.search(
-                r"\b(?:in|at)\s+([A-Za-z][A-Za-z .'\-]*(?:,\s*[A-Za-z][A-Za-z .'\-]*){0,2})\s*$",
-                text,
-                re.I,
-            )
-            if m:
-                cand = m.group(1).strip(" .,-")
-                # Guard against obvious non-location tails.
-                if cand and not re.search(r"\b(night|guests?|beds?|baths?|reviews?)\b", cand, re.I):
-                    out["location"] = cand
+            if out["beds"] is None:
+                m = _BED_RE.search(text)
+                if m:
+                    try:
+                        out["beds"] = int(m.group(1))
+                    except Exception:
+                        pass
 
+            if out["baths"] is None:
+                m = _BATH_RE.search(text)
+                if m:
+                    try:
+                        out["baths"] = float(m.group(1))
+                    except Exception:
+                        pass
+
+            if out["rating"] is None:
+                m = re.search(r"([0-5](?:\.\d+)?)\s*(?:out of 5|stars?)", text, re.I)
+                if m:
+                    try:
+                        rv = float(m.group(1))
+                        if 0 < rv <= 5:
+                            out["rating"] = round(rv, 2)
+                    except Exception:
+                        pass
+
+            if out["reviews"] is None:
+                m = re.search(r"\b(\d{1,6})\s*(?:reviews?|ratings?)\b", text, re.I)
+                if m:
+                    try:
+                        out["reviews"] = int(m.group(1))
+                    except Exception:
+                        pass
+
+            if not out["location"]:
+                m = re.search(
+                    r"\b(?:in|at)\s+([A-Za-z][A-Za-z .'\-]*(?:,\s*[A-Za-z][A-Za-z .'\-]*){0,2})\s*$",
+                    text,
+                    re.I,
+                )
+                if m:
+                    cand = m.group(1).strip(" .,-")
+                    if cand and not re.search(r"\b(night|guests?|beds?|baths?|reviews?)\b", cand, re.I):
+                        out["location"] = cand
+
+    _walk_and_extract(r)
     return out
 
 
@@ -670,53 +668,56 @@ def _extract_availability_context_from_search_result(r: Dict[str, Any]) -> Dict[
         r"\bnot available\b",
     )
 
-    # Typed fields first.
-    for d in _walk_dicts(r):
-        for key in ("isAvailable", "available"):
-            v = d.get(key)
-            if isinstance(v, bool):
-                out["is_available"] = bool(v)
-                if not out["is_available"] and not out["availability_reason"]:
-                    out["availability_reason"] = "unavailable"
-        for key in ("isSoldOut", "soldOut", "isBooked"):
-            v = d.get(key)
-            if isinstance(v, bool) and v:
+    def _walk_and_extract(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in ("isAvailable", "available"):
+                v = obj.get(key)
+                if isinstance(v, bool):
+                    out["is_available"] = bool(v)
+                    if not out["is_available"] and not out["availability_reason"]:
+                        out["availability_reason"] = "unavailable"
+            for key in ("isSoldOut", "soldOut", "isBooked"):
+                v = obj.get(key)
+                if isinstance(v, bool) and v:
+                    out["is_available"] = False
+                    out["availability_reason"] = "sold_out"
+
+            for v in obj.values():
+                _walk_and_extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk_and_extract(item)
+        elif isinstance(obj, str) and obj:
+            txt = obj.strip()
+            if not txt:
+                return
+            txt_l = txt.lower()
+
+            if out["min_nights"] is None:
+                m = _MIN_NIGHTS_RE.search(txt)
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        if n > 0:
+                            out["min_nights"] = n
+                    except Exception:
+                        pass
+
+            is_strong_unavailable = any(
+                re.search(pattern, txt_l) for pattern in strong_unavailable_patterns
+            )
+            if is_strong_unavailable:
                 out["is_available"] = False
-                out["availability_reason"] = "sold_out"
+                if "sold out" in txt_l:
+                    out["availability_reason"] = "sold_out"
+                elif not out["availability_reason"]:
+                    out["availability_reason"] = "unavailable"
 
-    # Text fallback for availability/min-stay.
-    for s in _walk_strings(r):
-        if not isinstance(s, str):
-            continue
-        txt = s.strip()
-        if not txt:
-            continue
-        txt_l = txt.lower()
+            if "minimum stay" in txt_l or ("at least" in txt_l and "night" in txt_l):
+                if not out["availability_reason"]:
+                    out["availability_reason"] = "minimum_nights_not_met"
 
-        if out["min_nights"] is None:
-            m = _MIN_NIGHTS_RE.search(txt)
-            if m:
-                try:
-                    n = int(m.group(1))
-                    if n > 0:
-                        out["min_nights"] = n
-                except Exception:
-                    pass
-
-        is_strong_unavailable = any(
-            re.search(pattern, txt_l) for pattern in strong_unavailable_patterns
-        )
-        if is_strong_unavailable:
-            out["is_available"] = False
-            if "sold out" in txt_l:
-                out["availability_reason"] = "sold_out"
-            elif not out["availability_reason"]:
-                out["availability_reason"] = "unavailable"
-
-        if "minimum stay" in txt_l or ("at least" in txt_l and "night" in txt_l):
-            if not out["availability_reason"]:
-                out["availability_reason"] = "minimum_nights_not_met"
-
+    _walk_and_extract(r)
     return out
 
 
@@ -1045,7 +1046,9 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
         # Applied only for missing values in skinny listing cards. Search-level
         # location is useful when Airbnb returns SkinnyListingItem rows without
         # any per-card location text; it never overwrites a card-derived value.
-        for key in ("location", "accommodates", "bedrooms", "beds", "baths", "property_type"):
+        # Do not backfill accommodates from request-level guests: v2 exact guest
+        # matching must use listing-level capacity only.
+        for key in ("location", "bedrooms", "beds", "baths", "property_type"):
             if row.get(key) in (None, "", 0):
                 v = global_ctx.get(key)
                 if v not in (None, "", 0):
@@ -1415,7 +1418,7 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             sec = entry.get("section")
             if not isinstance(sec, dict):
                 return False
-            if require_available and sec.get("available") is not True:
+            if sec.get("available") is False:
                 return False
             sdp = sec.get("structuredDisplayPrice")
             if not isinstance(sdp, dict):
@@ -1482,14 +1485,11 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
                 result["currency"] = ccy
             return True
         parsed_price = False
-        for require_available in (True, False):
-            if parsed_price:
+        for sid in section_priority:
+            entry = section_by_id.get(sid)
+            if isinstance(entry, dict) and _apply_booking_price_from_entry(entry, require_available=True):
+                parsed_price = True
                 break
-            for sid in section_priority:
-                entry = section_by_id.get(sid)
-                if isinstance(entry, dict) and _apply_booking_price_from_entry(entry, require_available=require_available):
-                    parsed_price = True
-                    break
 
         if not parsed_price:
             priority_set = set(section_priority)
@@ -1497,13 +1497,12 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
                 e for e in all_entries
                 if not isinstance(e.get("sectionId"), str) or e.get("sectionId") not in priority_set
             ]
-            for require_available in (True, False):
+            for entry in fallback_entries:
                 if parsed_price:
                     break
-                for entry in fallback_entries:
-                    if _apply_booking_price_from_entry(entry, require_available=require_available):
-                        parsed_price = True
-                        break
+                if _apply_booking_price_from_entry(entry, require_available=True):
+                    parsed_price = True
+                    break
 
     # 6) Amenities from common shapes (exclude "not included"/unavailable amenities).
     amenity_names = set()

@@ -452,7 +452,7 @@ def test_parse_search_context_falls_back_to_stayssearch_filter_state_and_search_
     ctx = parse_search_listing_context(payload)
     row = ctx["958866016198543537"]
     assert row["location"] == "Belmont, California"
-    assert row["accommodates"] == 3
+    assert row["accommodates"] is None
     assert row["baths"] == 1.0
     assert row["property_type"] == "entire_home"
 
@@ -593,7 +593,7 @@ def test_parse_pdp_response_falls_back_to_any_section_with_structured_display_pr
     assert out["currency"] == "CAD"
 
 
-def test_parse_pdp_response_uses_primary_line_price_even_if_available_is_false():
+def test_parse_pdp_response_returns_no_price_when_booking_section_unavailable():
     payload = {
         "data": {
             "presentation": {
@@ -620,9 +620,43 @@ def test_parse_pdp_response_uses_primary_line_price_even_if_available_is_false()
     }
 
     out = parse_pdp_response(payload, "1629301846268091180", "https://www.airbnb.ca")
-    assert out["total_price"] == 295.0
-    assert out["nightly_price"] == 295.0
-    assert out["currency"] == "CAD"
+    assert out["total_price"] is None
+    assert out["nightly_price"] is None
+    assert out["currency"] is None
+
+
+def test_parse_pdp_response_blocks_ghost_price_for_unavailable_july_2_room():
+    payload = {
+        "data": {
+            "presentation": {
+                "stayProductDetailPage": {
+                    "sections": {
+                        "sections": [
+                            {
+                                "sectionId": "BOOK_IT_SIDEBAR",
+                                "section": {
+                                    "available": False,
+                                    "structuredDisplayPrice": {
+                                        "primaryLine": {
+                                            "price": "$295 USD",
+                                            "accessibilityLabel": "$295 USD for 1 night",
+                                            "qualifier": "total",
+                                        }
+                                    },
+                                    "errorMessage": "Those dates are not available",
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    out = parse_pdp_response(payload, "797454009048233847", "https://www.airbnb.com")
+    assert out["total_price"] is None
+    assert out["nightly_price"] is None
+    assert out["currency"] is None
 
 
 def test_parse_pdp_response_falls_back_to_primary_accessibility_label():

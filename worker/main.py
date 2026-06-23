@@ -66,12 +66,12 @@ WORKER_LANE = os.getenv("WORKER_LANE", "interactive")
 MAX_SCROLL_ROUNDS = int(os.getenv("MAX_SCROLL_ROUNDS", "12"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "80"))
 RATE_LIMIT_SECONDS = float(os.getenv("SCRAPE_RATE_LIMIT_SECONDS", "1.0"))
-# Memory-safe defaults: keep fan-out conservative unless explicitly overridden.
-DAY_QUERY_MAX_WORKERS = max(1, min(int(os.getenv("DAY_QUERY_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS))
+# Keep several browser tabs busy by default while preserving the global cap.
+DAY_QUERY_MAX_WORKERS = max(1, min(int(os.getenv("DAY_QUERY_MAX_WORKERS", "12")), MAX_SCRAPER_WORKERS))
 BENCHMARK_DAY_QUERY_MAX_WORKERS = max(
-    1, min(int(os.getenv("BENCHMARK_DAY_QUERY_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS)
+    1, min(int(os.getenv("BENCHMARK_DAY_QUERY_MAX_WORKERS", "12")), MAX_SCRAPER_WORKERS)
 )
-FIXED_POOL_MAX_WORKERS = max(1, min(int(os.getenv("FIXED_POOL_MAX_WORKERS", "1")), MAX_SCRAPER_WORKERS))
+FIXED_POOL_MAX_WORKERS = max(1, min(int(os.getenv("FIXED_POOL_MAX_WORKERS", "12")), MAX_SCRAPER_WORKERS))
 AIRBNB_DISABLE_MAP_SEARCH = bool(
     str(os.getenv("AIRBNB_DISABLE_MAP_SEARCH", "0")).strip().lower() in ("1", "true", "yes", "on")
 )
@@ -932,7 +932,12 @@ def _capture_user_listing_prices_for_range(
         requested_size=max(1, min(worker_count, total_days)),
         pool_name="self_price_capture",
     )
-    browser_locks = [threading.Lock() for _ in browser_pool]
+    try:
+        tabs_per_browser = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4"))
+    except Exception:
+        tabs_per_browser = 4
+    tabs_per_browser = max(1, min(tabs_per_browser, 5))
+    browser_locks = [threading.BoundedSemaphore(tabs_per_browser) for _ in browser_pool]
     browser_count = len(browser_pool)
     query_args = [
         {"day_index": i, "browser_slot": i % browser_count}
@@ -2600,6 +2605,13 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
     finally:
         hb_stop.set()
         hb_thread.join(timeout=5)
+
+        import datetime
+        end_time = time.time()
+        start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+        end_str = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+        total_used = end_time - start_time
+        logger.info(f"[{report_id}] Whole report generated. Start: {start_str}, Finish: {end_str}, Total time used: {total_used:.2f}s")
 
 
 # ---------------------------------------------------------------------------

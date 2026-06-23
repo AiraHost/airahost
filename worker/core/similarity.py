@@ -1,4 +1,4 @@
-﻿"""
+"""
 Similarity scoring and filtering for comparable listings.
 
 Compares candidate listings against a target listing using weighted
@@ -148,7 +148,104 @@ def comp_urls_match(url_a: str, url_b: str) -> bool:
     return _norm(url_a) == _norm(url_b)
 
 
-def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
+def similarity_score_with_breakdown(target: ListingSpec, cand: ListingSpec) -> Tuple[float, Dict[str, Any]]:
+    score = 0.0
+    weight_sum = 0.0
+    breakdown: Dict[str, Any] = {}
+
+    def norm_city(spec: ListingSpec) -> str:
+        city = (spec.city or "").strip().lower()
+        if city:
+            return city
+        location = (spec.location or "").strip()
+        if not location:
+            return ""
+        return location.split(",")[0].strip().lower()
+
+    def add_num(name: str, t, c, w: float, tol: float):
+        nonlocal score, weight_sum
+        weight_sum += w
+        if t is None or c is None:
+            contrib = 0.35 * w
+            score += contrib
+            breakdown[name] = {"weight": w, "raw_score": 0.35, "contribution": contrib, "target_val": t, "cand_val": c}
+            return
+        diff = abs(float(t) - float(c))
+        s = max(0.0, 1.0 - diff / tol)
+        contrib = s * w
+        score += contrib
+        breakdown[name] = {"weight": w, "raw_score": s, "contribution": contrib, "target_val": t, "cand_val": c}
+
+    def add_reviews(name: str, t, c, w: float):
+        nonlocal score, weight_sum
+        weight_sum += w
+        if t is None or c is None:
+            contrib = 0.35 * w
+            score += contrib
+            breakdown[name] = {"weight": w, "raw_score": 0.35, "contribution": contrib, "target_val": t, "cand_val": c}
+            return
+        try:
+            t_log = math.log1p(max(0.0, float(t)))
+            c_log = math.log1p(max(0.0, float(c)))
+        except Exception:
+            contrib = 0.35 * w
+            score += contrib
+            breakdown[name] = {"weight": w, "raw_score": 0.35, "contribution": contrib, "target_val": t, "cand_val": c}
+            return
+        hi = max(t_log, c_log)
+        lo = min(t_log, c_log)
+        s = 1.0 if hi <= 0 else (lo / hi)
+        s = max(0.0, min(1.0, s))
+        contrib = s * w
+        score += contrib
+        breakdown[name] = {"weight": w, "raw_score": s, "contribution": contrib, "target_val": t, "cand_val": c}
+
+    add_num("beds", target.beds, cand.beds, w=2.5, tol=3.0)
+    add_num("accommodates", target.accommodates, cand.accommodates, w=2.5, tol=3.0)
+    add_num("bedrooms", target.bedrooms, cand.bedrooms, w=2.5, tol=2.0)
+    add_num("baths", target.baths, cand.baths, w=2.0, tol=1.5)
+    add_num("rating", target.rating, cand.rating, w=2.0, tol=1.0)
+    add_reviews("reviews", target.reviews, cand.reviews, w=2.0)
+
+    # Property-type
+    weight_sum += 3.0
+    pt_s = 0.35
+    if target.property_type and cand.property_type:
+        pt_s = 1.0 if target.property_type == cand.property_type else 0.0
+    contrib = pt_s * 3.0
+    score += contrib
+    breakdown["property_type"] = {"weight": 3.0, "raw_score": pt_s, "contribution": contrib, "target_val": target.property_type, "cand_val": cand.property_type}
+
+    # Amenity overlap
+    weight_sum += _AMENITY_SIMILARITY_WEIGHT
+    t_set = _normalize_amenity_set(list(target.amenities or []))
+    c_set = _normalize_amenity_set(list(cand.amenities or []))
+    am_s = 0.35
+    if t_set and c_set:
+        am_s = _weighted_amenity_overlap(t_set, c_set)
+    contrib = am_s * _AMENITY_SIMILARITY_WEIGHT
+    score += contrib
+    breakdown["amenities"] = {"weight": _AMENITY_SIMILARITY_WEIGHT, "raw_score": am_s, "contribution": contrib, "overlap_count": len(t_set & c_set) if t_set and c_set else 0, "union_count": len(t_set | c_set) if t_set and c_set else 0}
+
+    # Address/city
+    weight_sum += _LOCATION_SIMILARITY_WEIGHT
+    t_city = norm_city(target)
+    c_city = norm_city(cand)
+    loc_s = 0.0
+    if t_city and c_city and t_city == c_city:
+        loc_s = 1.0
+    contrib = loc_s * _LOCATION_SIMILARITY_WEIGHT
+    score += contrib
+    breakdown["location"] = {"weight": _LOCATION_SIMILARITY_WEIGHT, "raw_score": loc_s, "contribution": contrib, "target_city": t_city, "cand_city": c_city, "match": loc_s == 1.0}
+
+    final_score = 0.0 if weight_sum <= 0 else score / weight_sum
+    breakdown["total_score"] = final_score
+    breakdown["weight_sum"] = weight_sum
+
+    return final_score, breakdown
+
+
+def similarity_score(target: ListingSpec, cand: ListingSpec, debug: bool = False) -> float | Tuple[float, Dict[str, Any]]:
     """
     Compute a 0-1 similarity score between target and candidate listings.
 
@@ -167,89 +264,10 @@ def similarity_score(target: ListingSpec, cand: ListingSpec) -> float:
     filter_similar_candidates already blocks clear type conflicts; this
     ensures the score accurately reflects structural similarity.
     """
-    score = 0.0
-    weight_sum = 0.0
-
-    def norm_city(spec: ListingSpec) -> str:
-        city = (spec.city or "").strip().lower()
-        if city:
-            return city
-        location = (spec.location or "").strip()
-        if not location:
-            return ""
-        return location.split(",")[0].strip().lower()
-
-    def add_num(t, c, w: float, tol: float):
-        nonlocal score, weight_sum
-        weight_sum += w
-        if t is None or c is None:
-            score += 0.35 * w
-            return
-        diff = abs(float(t) - float(c))
-        s = max(0.0, 1.0 - diff / tol)
-        score += s * w
-
-    def add_reviews(t, c, w: float):
-        """
-        Review-count similarity on a log scale so 10 vs 30 is meaningful, while
-        300 vs 600 is not treated as a massive mismatch.
-        """
-        nonlocal score, weight_sum
-        weight_sum += w
-        if t is None or c is None:
-            score += 0.35 * w
-            return
-        try:
-            t_log = math.log1p(max(0.0, float(t)))
-            c_log = math.log1p(max(0.0, float(c)))
-        except Exception:
-            score += 0.35 * w
-            return
-        hi = max(t_log, c_log)
-        lo = min(t_log, c_log)
-        s = 1.0 if hi <= 0 else (lo / hi)
-        score += max(0.0, min(1.0, s)) * w
-
-    add_num(target.beds, cand.beds, w=2.5, tol=3.0)
-    add_num(target.accommodates, cand.accommodates, w=2.5, tol=3.0)
-    add_num(target.bedrooms, cand.bedrooms, w=2.5, tol=2.0)
-    add_num(target.baths, cand.baths, w=2.0, tol=1.5)
-    add_num(target.rating, cand.rating, w=2.0, tol=1.0)
-    add_reviews(target.reviews, cand.reviews, w=2.0)
-
-    # Property-type: strongest categorical signal.
-    # Both known → exact match scores 1.0, mismatch scores 0.0.
-    # Either unknown → partial credit (0.35) since we can't penalise what we can't read.
-    weight_sum += 3.0
-    if target.property_type and cand.property_type:
-        score += (1.0 if target.property_type == cand.property_type else 0.0) * 3.0
-    else:
-        score += 0.35 * 3.0
-
-    # Amenity overlap: strong signal.
-    # Uses premium-heavy weighted overlap so high-value amenities
-    # (for example beach access) affect similarity far more than common ones.
-    # If either side has no amenities, give partial credit rather than zero.
-    weight_sum += _AMENITY_SIMILARITY_WEIGHT
-    t_set = _normalize_amenity_set(list(target.amenities or []))
-    c_set = _normalize_amenity_set(list(cand.amenities or []))
-    if t_set and c_set:
-        overlap = _weighted_amenity_overlap(t_set, c_set)
-        score += overlap * _AMENITY_SIMILARITY_WEIGHT
-    else:
-        score += 0.35 * _AMENITY_SIMILARITY_WEIGHT
-
-    # Address/city: strict binary signal requested.
-    # City match gets full credit; all non-matches (including unknown) get zero.
-    weight_sum += _LOCATION_SIMILARITY_WEIGHT
-    t_city = norm_city(target)
-    c_city = norm_city(cand)
-    if t_city and c_city and t_city == c_city:
-        score += _LOCATION_SIMILARITY_WEIGHT
-
-    if weight_sum <= 0:
-        return 0.0
-    return score / weight_sum
+    final_score, breakdown = similarity_score_with_breakdown(target, cand)
+    if debug:
+        return final_score, breakdown
+    return final_score
 
 
 def _within_tolerance(

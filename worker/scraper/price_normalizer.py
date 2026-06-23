@@ -89,12 +89,12 @@ def normalize_raw_price(
     )
 
     if is_total:
-        if round_direct_nightly_to_whole and price_nights == 1:
-            total = _airbnb_display_whole_dollar(raw_amount)
-            nightly = total if produce_nightly_from_total else None
-        else:
-            total = round(raw_amount, 2)
-            nightly = round(raw_amount / max(1, price_nights), 2) if produce_nightly_from_total else None
+        total = (
+            _airbnb_display_whole_dollar(raw_amount)
+            if round_direct_nightly_to_whole
+            else round(raw_amount, 2)
+        )
+        nightly = round(total / max(1, price_nights), 2) if produce_nightly_from_total else None
         return NormalizedPrice(
             nightly_price=nightly,
             total_price=total,

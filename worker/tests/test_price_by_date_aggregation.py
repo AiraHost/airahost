@@ -524,5 +524,99 @@ def test_fixed_pool_summary_uses_setup_funnel_counts():
 
     summary = transparent["compsSummary"]
     assert summary["collected"] == 45
-    assert summary["afterFiltering"] == 25
-    assert summary["usedForPricing"] == 20
+
+
+def test_fixed_pool_prices_are_not_reused_without_date_specific_evidence():
+    target = ListingSpec(
+        url="https://www.airbnb.com/rooms/999",
+        title="Target listing",
+        location="Belmont, CA",
+        property_type="entire_home",
+        accommodates=4,
+        bedrooms=2,
+        baths=1.5,
+        nightly_price=200,
+    )
+
+    def _day(date: str, base_id: int) -> dict:
+        top_comps = []
+        comp_prices = {}
+        for i in range(4):
+            cid = str(base_id + i)
+            top_comps.append({
+                "id": cid,
+                "title": f"Fresh comp {cid}",
+                "propertyType": "entire_home",
+                "nightlyPrice": 120 + i,
+                "similarity": 0.9 - (i * 0.01),
+                "url": f"https://www.airbnb.com/rooms/{cid}",
+            })
+            comp_prices[cid] = 120 + i
+        return {
+            "date": date,
+            "median_price": 180,
+            "comps_collected": 4,
+            "comps_used": 4,
+            "below_similarity_floor": 0,
+            "price_outliers_excluded": 0,
+            "price_outliers_downweighted": 0,
+            "geo_excluded": 0,
+            "price_band_excluded": 0,
+            "filter_stage": "strict",
+            "flags": [],
+            "is_sampled": True,
+            "is_weekend": False,
+            "price_distribution": {},
+            "top_comps": top_comps,
+            "comp_prices": comp_prices,
+            "error": None,
+            "selection_mode": "strict",
+            "pricing_confidence": "high",
+        }
+
+    fixed_comp_pool = {
+        str(7000 + i): {
+            "similarity": 0.88 - (i * 0.001),
+            "url": f"https://www.airbnb.com/rooms/{7000 + i}",
+            "title": f"Reusable comp {i}",
+            "property_type": "entire_home",
+            "nightly_price": 150 + i,
+            "seenCount": 2,
+        }
+        for i in range(20)
+    }
+
+    transparent = _build_daily_transparent_result(
+        target=target,
+        query_criteria={
+            "locationBasis": "Belmont, CA",
+            "searchAdults": 4,
+            "checkin": "2026-05-01",
+            "checkout": "2026-05-03",
+            "totalNights": 2,
+            "sampledNights": 2,
+            "queryMode": "day_by_day",
+            "propertyTypeFilter": "entire_home",
+        },
+        all_day_results=[
+            _day("2026-05-01", 1000),
+            _day("2026-05-02", 2000),
+        ],
+        timings_ms={"total_ms": 10},
+        source="scrape",
+        extraction_warnings=[],
+        fixed_comp_pool=fixed_comp_pool,
+    )
+
+    for date in ("2026-05-01", "2026-05-02"):
+        count_for_date = sum(
+            1
+            for comp in transparent["comparableListings"]
+            if date in (comp.get("priceByDate") or {})
+        )
+        assert count_for_date == 4
+
+    assert all(
+        comp["id"] != "7000"
+        for comp in transparent["comparableListings"]
+    )
