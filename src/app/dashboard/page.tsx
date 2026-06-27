@@ -1179,6 +1179,7 @@ export default function DashboardPage() {
                         listings={activeComparableListings}
                         comps={activeSummary?.compsSummary ?? null}
                         benchmarkInfo={activeBenchmarkInfo}
+                        targetSpec={activeSummary?.targetSpec ?? null}
                         embedded={true}
                         pinnedRoomIds={activePinnedRoomIds}
                         excludedRoomIds={activeExcludedRoomIds}

@@ -8,12 +8,13 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from worker.core.similarity import comp_urls_match
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
+from worker.core.geo_filter import apply_geo_filter
 from worker.scraper.browser_runtime import (
     build_warmed_browser_client_pool,
     close_browser_client_pool,
@@ -35,6 +36,10 @@ _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
 _PDP_STRUCTURAL_CACHE_LOCK = threading.Lock()
 _PDP_STRUCTURAL_CACHE: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
 _PDP_STRUCTURAL_CACHE_LOADED = False
+
+_SUPABASE_STRUCT_LOCK = threading.Lock()
+_SUPABASE_STRUCT_CLIENT: Optional[Any] = None
+_SUPABASE_STRUCT_CLIENT_INIT_DONE: bool = False
 
 
 def _pdp_structural_cache_path() -> str:
@@ -103,6 +108,88 @@ def _save_pdp_structural_cache_locked() -> None:
         os.replace(tmp_path, path)
     except Exception as exc:
         logger.info("[comp_collection] PDP structural cache save skipped: %s", exc)
+
+
+def _get_supabase_struct_client() -> Optional[Any]:
+    global _SUPABASE_STRUCT_CLIENT, _SUPABASE_STRUCT_CLIENT_INIT_DONE
+    with _SUPABASE_STRUCT_LOCK:
+        if _SUPABASE_STRUCT_CLIENT_INIT_DONE:
+            return _SUPABASE_STRUCT_CLIENT
+        _SUPABASE_STRUCT_CLIENT_INIT_DONE = True
+        try:
+            from worker.core.db import get_client
+            _SUPABASE_STRUCT_CLIENT = get_client()
+        except Exception as exc:
+            logger.info("[comp_collection] Supabase structural cache unavailable: %s", exc)
+            _SUPABASE_STRUCT_CLIENT = None
+        return _SUPABASE_STRUCT_CLIENT
+
+
+def _batch_load_supabase_structural_cache(lids: List[str]) -> None:
+    """Fetch listing_structural_cache rows from Supabase and warm the local cache."""
+    if not lids:
+        return
+    sb = _get_supabase_struct_client()
+    if sb is None:
+        return
+    try:
+        result = (
+            sb.table("listing_structural_cache")
+            .select("airbnb_listing_id,accommodates,baths,property_type,amenities")
+            .in_("airbnb_listing_id", lids)
+            .execute()
+        )
+        rows = result.data or []
+        updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+        for row in rows:
+            lid = str(row.get("airbnb_listing_id") or "").strip()
+            if not lid:
+                continue
+            accommodates = row.get("accommodates")
+            baths = row.get("baths")
+            property_type = row.get("property_type")
+            amenities = row.get("amenities")
+            a_val = int(accommodates) if isinstance(accommodates, (int, float)) and int(accommodates) > 0 else None
+            b_val = float(baths) if isinstance(baths, (int, float)) else None
+            p_val = str(property_type or "").strip()
+            am_list = [str(a) for a in (amenities or []) if isinstance(a, str)] if isinstance(amenities, list) else []
+            updates[lid] = (a_val, b_val, p_val, am_list)
+        if updates:
+            with _PDP_STRUCTURAL_CACHE_LOCK:
+                for lid, entry in updates.items():
+                    if lid not in _PDP_STRUCTURAL_CACHE:
+                        _PDP_STRUCTURAL_CACHE[lid] = entry
+            logger.info("[comp_collection] Supabase structural cache: loaded %s/%s entries", len(updates), len(lids))
+    except Exception as exc:
+        logger.info("[comp_collection] Supabase structural cache batch load failed: %s", exc)
+
+
+def _batch_upsert_supabase_structural_cache(
+    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]],
+) -> None:
+    """Upsert freshly scraped structural data into Supabase listing_structural_cache."""
+    if not cache_updates:
+        return
+    sb = _get_supabase_struct_client()
+    if sb is None:
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {
+                "airbnb_listing_id": lid,
+                "accommodates": vals[0],
+                "baths": vals[1],
+                "property_type": vals[2] or None,
+                "amenities": vals[3],
+                "updated_at": now,
+            }
+            for lid, vals in cache_updates.items()
+        ]
+        sb.table("listing_structural_cache").upsert(rows).execute()
+        logger.info("[comp_collection] Supabase structural cache: upserted %s entries", len(rows))
+    except Exception as exc:
+        logger.info("[comp_collection] Supabase structural cache batch upsert failed: %s", exc)
 
 
 def _build_debug_search_url(base_origin: str, overrides: Dict[str, Any]) -> str:
@@ -249,11 +336,13 @@ def _extract_listing_id_from_url(url: str) -> Optional[str]:
 
 
 def _tabs_per_browser() -> int:
+    # Default tabs-per-browser to the worker cap so tab concurrency matches the
+    # configured worker count; keep an 8-tab ceiling to limit anti-bot challenges.
     try:
-        value = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4"))
+        value = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", str(MAX_SCRAPER_WORKERS)))
     except Exception:
-        value = 4
-    return max(1, min(value, 5))
+        value = MAX_SCRAPER_WORKERS
+    return max(1, min(value, 8))
 
 
 def _enrich_comps_baths_and_property_type_from_pdp(
@@ -329,6 +418,10 @@ def _enrich_comps_baths_and_property_type_from_pdp(
 
     def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[int], Optional[float], str, List[str]]:
         idx, _comp, lid = query_arg["item"]
+        # Skip PDP if the search phase already populated all essential structural fields
+        # (amenities, property_type, baths). Ratings/reviews from search are preserved as-is.
+        if _comp.amenities and _comp.property_type and _comp.baths is not None:
+            return idx, _comp.accommodates, _comp.baths, _comp.property_type, list(_comp.amenities)
         cached = _PDP_STRUCTURAL_CACHE.get(str(lid))
         if cached is not None:
             a_val, b_val, p_val, amenities = cached
@@ -366,6 +459,16 @@ def _enrich_comps_baths_and_property_type_from_pdp(
             return idx, a_val, b_val, p_val, amenities
         except Exception:
             return idx, None, None, "", []
+
+    # Batch-load Supabase for lids not in local cache and not already fully known.
+    with _PDP_STRUCTURAL_CACHE_LOCK:
+        lids_needing_supabase = [
+            lid for _, comp_item, lid in work_items
+            if str(lid) not in _PDP_STRUCTURAL_CACHE
+            and not (comp_item.amenities and comp_item.property_type and comp_item.baths is not None)
+        ]
+    if lids_needing_supabase:
+        _batch_load_supabase_structural_cache(lids_needing_supabase)
 
     updated = 0
     amenities_populated = 0
@@ -406,11 +509,12 @@ def _enrich_comps_baths_and_property_type_from_pdp(
         if use_pool:
             close_browser_client_pool(browser_pool)  # type: ignore[arg-type]
 
-    # Batch update cache and persist once
+    # Batch update local cache, persist to file, and upsert to Supabase.
     if cache_updates:
         with _PDP_STRUCTURAL_CACHE_LOCK:
             _PDP_STRUCTURAL_CACHE.update(cache_updates)
             _save_pdp_structural_cache_locked()
+        _batch_upsert_supabase_structural_cache(cache_updates)
 
     if attempted:
         logger.info(
@@ -530,6 +634,16 @@ def collect_search_comps(
                 overrides["guestFavorite"] = False
                 if target_accommodates is not None:
                     overrides["guests"] = int(target_accommodates)
+                # Structural filter boundaries based on Medium-tier similarity tolerances
+                # (bedrooms ±2, beds ±3, baths -1.5). Keeps results broad enough for
+                # borderline comps while pushing low-similarity listings off the first pages.
+                if target_bedrooms is not None:
+                    overrides["minBedrooms"] = max(0, int(target_bedrooms) - 2)
+                    overrides["maxBedrooms"] = int(target_bedrooms) + 2
+                if target_beds is not None:
+                    overrides["minBeds"] = max(0, int(target_beds) - 3)
+                if target_baths is not None:
+                    overrides["minBathrooms"] = max(0.0, float(target_baths) - 1.5)
                 if offset > 0:
                     overrides["itemsOffset"] = offset
                 debug_search_url = _build_debug_search_url(base_origin, overrides)
@@ -627,6 +741,32 @@ def collect_search_comps(
                 parsed_comps.append(spec)
 
             comps = parsed_comps
+
+            # Hard geographic cutoff (priority #1): the map search uses a square
+            # bounding box, so corner results can sit well beyond the intended
+            # radius. Drop any comp whose haversine distance from the query center
+            # exceeds map_radius_km. Comps without coordinates pass through
+            # (location unknown, not "too far"). Sets distance_to_target_km too.
+            if (
+                center_lat is not None
+                and center_lng is not None
+                and isinstance(map_radius_km, (int, float))
+                and float(map_radius_km) > 0
+            ):
+                before_geo = len(comps)
+                comps, geo_excluded = apply_geo_filter(
+                    comps, float(center_lat), float(center_lng), float(map_radius_km)
+                )
+                if geo_excluded:
+                    logger.info(
+                        "[%s] %s: geo_excluded=%s (>%.2fkm from center) retained=%s",
+                        log_prefix,
+                        checkin_str,
+                        geo_excluded,
+                        float(map_radius_km),
+                        len(comps),
+                    )
+
             rejected_log = []
             self_excluded = 0
             if exclude_url:

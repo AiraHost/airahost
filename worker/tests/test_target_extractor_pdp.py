@@ -111,56 +111,6 @@ def test_extract_target_spec_prefers_pdp_payload_and_keeps_amenities():
     assert "Guest favorite" in spec.amenities
 
 
-class _FakeDeepBnbScraper:
-    def __init__(self, payload):
-        self._payload = payload
-        self.calls = 0
-
-    def get_listing_details(self, listing_id: str, *, checkin: str, checkout: str, adults: int):
-        self.calls += 1
-        assert listing_id == "1305899249107196055"
-        assert checkin == "2026-04-24"
-        assert checkout == "2026-04-25"
-        assert adults == 1
-        return self._payload
-
-
-class _FakeClientPrefersDeepBnbPayload:
-    def __init__(self, payload):
-        self.config = {
-            "CHECKIN": "2026-04-24",
-            "CHECKOUT": "2026-04-25",
-            "ADULTS": 1,
-        }
-        self.deepbnb_scraper = _FakeDeepBnbScraper(payload)
-        self.browser_payload_used = False
-        self.browser_bridge_used = False
-
-    def get_listing_details(self, listing_id: str, checkin=None, checkout=None, adults=None):
-        self.browser_payload_used = True
-        raise AssertionError("browser PDP payload should not be used when Deepbnb payload is sufficient")
-
-    def _get_playwright_scraper(self):
-        self.browser_bridge_used = True
-        raise AssertionError("browser bridge should not be used when Deepbnb payload is sufficient")
-
-
-def test_extract_target_spec_prefers_deepbnb_payload_when_available():
-    client = _FakeClientPrefersDeepBnbPayload(_make_sample_pdp_payload())
-    spec, warnings = extract_target_spec(
-        client,
-        "https://www.airbnb.com/rooms/1305899249107196055",
-    )
-
-    assert client.deepbnb_scraper.calls == 1
-    assert client.browser_payload_used is False
-    assert client.browser_bridge_used is False
-    assert warnings == []
-    assert spec.property_type == "entire_home"
-    assert "Allows pets" in spec.amenities
-    assert "Waterfront" in spec.amenities
-    assert "Guest favorite" in spec.amenities
-
 
 def test_extract_target_spec_marks_guest_favorite_from_brand_accessibility_label():
     payload = _make_sample_pdp_payload()

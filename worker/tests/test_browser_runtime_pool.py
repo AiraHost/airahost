@@ -62,11 +62,27 @@ def test_resolve_cdp_urls_discovers_ipv6_ports(monkeypatch) -> None:
 
 
 def test_playwright_tab_gate_is_per_instance_and_capped(monkeypatch) -> None:
+    # AIRBNB_PLAYWRIGHT_MAX_TABS is honored up to the 8-tab safety ceiling.
     monkeypatch.setenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "7")
 
     first = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9222"})
     second = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9223"})
 
-    assert first._tab_limit == 5
-    assert second._tab_limit == 5
+    assert first._tab_limit == 7
+    assert second._tab_limit == 7
     assert first._tab_gate is not second._tab_gate
+
+
+def test_playwright_tab_gate_capped_at_ceiling(monkeypatch) -> None:
+    # Requests above the ceiling are clamped to 8.
+    monkeypatch.setenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "20")
+    scraper = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9222"})
+    assert scraper._tab_limit == 8
+
+
+def test_playwright_tab_gate_defaults_to_worker_cap(monkeypatch) -> None:
+    # With no explicit tab override, tabs default to the worker cap (clamped to 8)
+    # so tab concurrency matches the configured worker count.
+    monkeypatch.delenv("AIRBNB_PLAYWRIGHT_MAX_TABS", raising=False)
+    scraper = PlaywrightScraper({"CDP_URL": "http://127.0.0.1:9222"})
+    assert scraper._tab_limit == 8

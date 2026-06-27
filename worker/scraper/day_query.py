@@ -40,7 +40,11 @@ from worker.core.similarity import (
 from worker.scraper.comp_collection import collect_search_comps
 from worker.scraper.parsers import parse_pdp_response, parse_search_listing_context
 from worker.scraper.price_normalizer import nightly_price_from_parsed_pdp
-from worker.scraper.target_extractor import ListingSpec, safe_domain_base
+from worker.scraper.target_extractor import (
+    ListingSpec,
+    location_looks_like_placeholder,
+    safe_domain_base,
+)
 
 logger = logging.getLogger("worker.scraper.day_query")
 
@@ -55,12 +59,13 @@ SAMPLE_THRESHOLD = int(os.getenv("SAMPLE_THRESHOLD_NIGHTS", "14"))
 MAX_SAMPLE_QUERIES = 20
 PER_DAY_TIMEOUT_S = 15
 PER_DAY_MAX_RETRIES = 2
-DAY_SCROLL_ROUNDS = int(os.getenv("DAY_QUERY_SCROLL_ROUNDS", "2"))
+DAY_SCROLL_ROUNDS = max(0, int(os.getenv("DAY_QUERY_SCROLL_ROUNDS", "1")))
 DAY_MAX_CARDS = int(os.getenv("DAY_QUERY_MAX_CARDS", "30"))
 FIXED_COMP_DEEP_PAGES = int(os.getenv("FIXED_COMP_DEEP_PAGES", "3"))
 FIXED_COMP_DEEP_MIN_HITS = int(os.getenv("FIXED_COMP_DEEP_MIN_HITS", "4"))
 FIXED_COMP_MIN_PRICED = int(os.getenv("FIXED_COMP_MIN_PRICED", "4"))
-MAP_RADIUS_CAP_KM = 5.0 * 1.609344  # exactly 5 miles
+MAP_RADIUS_CAP_KM = 8.0 * 1.609344  # exactly 8 miles
+MIN_DAILY_COMPS_PER_DAY = max(1, int(os.getenv("MIN_DAILY_COMPS_PER_DAY", "10")))
 DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "50"))
 DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "25"))
 DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "25"))
@@ -73,7 +78,11 @@ DAY_QUERY_PDP_REVALIDATE_TOP_N = max(
 # the strict pool is empty, and the result is tagged selection_mode="fallback_relaxed"
 # with pricing_confidence="low".  Property-type hard gate and price-sanity outlier
 # rejection are both retained in fallback mode.  Price-band is skipped (sparse pool).
-SIMILARITY_FLOOR_FALLBACK: float = 0.25
+#
+# Pinned to SIMILARITY_FLOOR: the "above 50% similarity" requirement (priority #2)
+# outranks reaching the 20-comp target (priority #3), so we never relax below the
+# 50% floor to backfill a sparse day — a day simply returns fewer comps instead.
+SIMILARITY_FLOOR_FALLBACK: float = SIMILARITY_FLOOR
 
 
 # ── Data structures ──────────────────────────────────────────────
@@ -144,11 +153,21 @@ def _derive_canonical_search_location(target: ListingSpec) -> str:
         return f"{float(target.lat):.5f},{float(target.lng):.5f}"
     city = str(target.city or "").strip()
     state = str(target.state or "").strip()
-    if city and state:
-        return f"{city}, {state}"
-    if city:
+    if city and not location_looks_like_placeholder(city):
+        if state and not location_looks_like_placeholder(state):
+            return f"{city}, {state}"
         return city
-    return str(target.location or "").strip()
+    location = str(target.location or "").strip()
+    if location and not location_looks_like_placeholder(location):
+        return location
+    # Only a listing-title placeholder is available — return "" so the search is
+    # anchored by coordinates instead of firing a junk title query.
+    if location:
+        logger.info(
+            "[day_query] dropping placeholder search_location=%r; relying on coords/geocode",
+            location,
+        )
+    return ""
 
 
 def _resolve_query_center(search_location: str, target: ListingSpec) -> Tuple[Optional[float], Optional[float]]:
@@ -408,6 +427,10 @@ def estimate_base_price_for_date(
             one_night_comps, _one_qn = one_night_future.result()
             two_night_comps, _two_qn = two_night_future.result()
 
+        # Save raw search results before pool filtering for fallback use.
+        raw_one_night = list(one_night_comps)
+        raw_two_night = list(two_night_comps)
+
         one_night_comps = _apply_known_pool_fields(one_night_comps)
         two_night_comps = _apply_known_pool_fields(two_night_comps)
 
@@ -421,10 +444,35 @@ def estimate_base_price_for_date(
             if cid and cid not in comps_by_id:
                 comps_by_id[cid] = c
         comps = list(comps_by_id.values())
+
+        # Fallback: if the fixed pool doesn't yield MIN_DAILY_COMPS_PER_DAY available
+        # listings for this day, supplement with fresh daily-search results.
+        pool_fallback_added = 0
+        if use_known_pool and len(comps) < MIN_DAILY_COMPS_PER_DAY:
+            raw_combined: Dict[str, ListingSpec] = {}
+            for c in raw_one_night + raw_two_night:
+                cid = build_comp_id(c.url or "")
+                if cid and cid not in comps_by_id and cid not in raw_combined:
+                    raw_combined[cid] = c
+            for cid, c in raw_combined.items():
+                comps_by_id[cid] = c
+                pool_fallback_added += 1
+            comps = list(comps_by_id.values())
+            logger.info(
+                "[day_query] %s: fixed-pool shortfall (pool_comps=%s < min=%s); "
+                "supplemented with %s fresh-search comps, total=%s",
+                checkin_str,
+                len(comps) - pool_fallback_added,
+                MIN_DAILY_COMPS_PER_DAY,
+                pool_fallback_added,
+                len(comps),
+            )
+
         query_nights_used = 1 if one_night_comps else (2 if two_night_comps else 1)
         logger.info(
             f"[day_query] {checkin_str}: daily pools one_night={len(one_night_comps)} "
-            f"two_night={len(two_night_comps)} merged={len(comps)}"
+            f"two_night={len(two_night_comps)} merged={len(comps)} "
+            f"pool_fallback_added={pool_fallback_added}"
         )
 
         # ── User blacklist filter (per-listing excludedComps) ─────

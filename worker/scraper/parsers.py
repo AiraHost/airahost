@@ -359,8 +359,11 @@ def _parse_pdp_booking_breakdown_nightly(
             primary_nights = _infer_price_nights_from_context(candidate, qualifier, primary_context)
             if primary_nights is not None and int(primary_nights) != int(price_nights):
                 continue
-            if abs(float(primary_amount) - float(raw_total)) <= 1.0:
-                return float(primary_amount), primary_currency or fallback_currency
+            # primaryLine is what Airbnb shows the guest — use it directly.
+            # raw_total from explanationData may be the undiscounted base rate;
+            # do not reject the display price just because it differs from the breakdown total.
+            logger.info("[price_breakdown] _matching_primary_display_total using primary_amount=%s (raw_total=%s) candidate=%r", primary_amount, raw_total, str(candidate))
+            return float(primary_amount), primary_currency or fallback_currency
         return None
 
     for detail in price_details:
@@ -1004,6 +1007,19 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                         price_text = accessibility_label
                     else:
                         price_text = primary.get("price")
+                        # accessibilityLabel is what Airbnb renders on the search card.
+                        # When it contains "for N nights" and its amount differs from
+                        # primaryLine.price, prefer it — primaryLine.price can be an
+                        # accommodation-only subtotal that omits small per-night charges
+                        # folded into the displayed total (e.g. $1,394 vs $1,403).
+                        if (
+                            isinstance(accessibility_label, str)
+                            and re.search(r"\bfor\s+\d+\s+nights?\b", accessibility_label, re.I)
+                        ):
+                            al_val, _ = _parse_dollar_amount_currency(accessibility_label)
+                            pt_val, _ = _parse_dollar_amount_currency(price_text or "")
+                            if isinstance(al_val, float) and al_val > 0 and al_val != pt_val:
+                                price_text = accessibility_label
 
                 # Exact payload rule:
                 # if available=true and primaryLine.price is '$<num> <ccy>',

@@ -466,6 +466,7 @@ export function HowWeEstimated({
                 listings={comparableListings ?? null}
                 comps={comps ?? null}
                 benchmarkInfo={benchmarkInfo}
+                targetSpec={target ?? null}
                 pinnedUrls={pinnedUrls}
                 selectedDate={selectedDate ?? null}
                 clickedDate={clickedDate ?? null}

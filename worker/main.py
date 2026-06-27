@@ -926,17 +926,16 @@ def _capture_user_listing_prices_for_range(
             "CHECKIN": start_date,
             "CHECKOUT": end_date,
             "ADULTS": adults,
-            "USE_DEEPBNB_BACKEND": False,
             "CDP_URL": CDP_URL,
         },
         requested_size=max(1, min(worker_count, total_days)),
         pool_name="self_price_capture",
     )
     try:
-        tabs_per_browser = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4"))
+        tabs_per_browser = int(os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", str(MAX_SCRAPER_WORKERS)))
     except Exception:
-        tabs_per_browser = 4
-    tabs_per_browser = max(1, min(tabs_per_browser, 5))
+        tabs_per_browser = MAX_SCRAPER_WORKERS
+    tabs_per_browser = max(1, min(tabs_per_browser, 8))
     browser_locks = [threading.BoundedSemaphore(tabs_per_browser) for _ in browser_pool]
     browser_count = len(browser_pool)
     query_args = [
@@ -2034,7 +2033,9 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 # Unified Playwright Retry & Fallback Block
                 scrape_err = ((transparent_result or {}).get("debug") or {}).get("error") or "No results"
                 valid_prices = [r["median_price"] for r in daily_results if r.get("median_price")]
-                
+                summary = None
+                calendar = None
+
                 if daily_results and valid_prices:
                     result = _build_scrape_calendar(
                         daily_results, start_date, end_date, discount_policy, transparent_result,

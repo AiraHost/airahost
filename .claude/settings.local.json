@@ -17,7 +17,16 @@
       "Bash(cmd /c:*)",
       "Bash(git log:*)",
       "Bash(wc:*)",
-      "Bash(ls -la \"c:\\\\Users\\\\Spencer\\\\OneDrive\\\\文件\\\\GitHub\\\\ariahost\\\\src\\\\app\\\\dashboard\"\" 2>/dev/null | findstr /V \"^d \")"
+      "Bash(ls -la \"c:\\\\Users\\\\Spencer\\\\OneDrive\\\\文件\\\\GitHub\\\\ariahost\\\\src\\\\app\\\\dashboard\"\" 2>/dev/null | findstr /V \"^d \")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k: d[k] for k in ['scripts','dependencies','devDependencies'] if k in d}, indent=2\\)\\)\")",
+      "PowerShell(Get-Content *)",
+      "PowerShell($start = Get-Date; while \\(\\(Get-Date\\) - $start -lt [TimeSpan]::FromMinutes\\(4\\)\\) { Start-Sleep 15; $tail = Get-Content \"$env:TEMP\\\\diag_out.txt\" -Tail 5 -ErrorAction SilentlyContinue; if \\($tail -match \"STAGE 2 PASSED|STAGE 2 FAILED|EXCEPTION\"\\) { Write-Host \"DONE:\"; $tail; break } elseif \\($tail\\) { Write-Host \"Still running... last line: $\\($tail[-1]\\)\" } })",
+      "PowerShell(Tee-Object *)",
+      "Bash(python -m unittest worker.tests.test_live_price_listing_902765689081684330_e2e)",
+      "Bash(python -m worker.temp_price_test)",
+      "Bash(timeout 15)",
+      "Read(//c/Users/limue/AppData/Local/Temp/**)",
+      "PowerShell(Out-File *)"
     ]
   }
 }

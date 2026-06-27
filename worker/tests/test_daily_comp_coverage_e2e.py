@@ -145,7 +145,7 @@ def test_run_scrape_uses_dynamic_day_query_when_fixed_yield_is_under_ten(monkeyp
     monkeypatch.setattr(
         price_estimator,
         "_build_fixed_comp_pool_by_stride",
-        lambda *_args, **_kwargs: (fixed_pool, ["2026-06-01"]),
+        lambda *_args, **_kwargs: (fixed_pool, ["2026-06-01"], len(fixed_pool), len(fixed_pool)),
     )
     monkeypatch.setattr(
         price_estimator,

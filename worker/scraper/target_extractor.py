@@ -153,6 +153,32 @@ def normalize_country_code(value: Any) -> str:
     return COUNTRY_NAME_TO_CODE.get(text.casefold(), "")
 
 
+def location_looks_like_placeholder(value: Any) -> bool:
+    """
+    True when a "location" string is actually a listing-title placeholder rather
+    than a geographic location.
+
+    Airbnb returns generic share titles like
+    ``"Airbnb Listing #1596737613274892756 · Entire home"`` for listings without a
+    custom title.  If such a string leaks into the search ``query``, comp searches
+    return junk (the bad URL we are fixing).  Property-type phrases on their own
+    ("Entire home", "Private room", "Shared room") are also not locations.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lower = text.casefold()
+    if "airbnb listing #" in lower or "popular in airbnb listing" in lower:
+        return True
+    if re.search(r"(?i)\bentire home\b", text):
+        return True
+    if re.search(r"(?i)\bprivate room\b", text):
+        return True
+    if re.search(r"(?i)\bshared room\b", text):
+        return True
+    return False
+
+
 def derive_location_parts(location: str) -> Tuple[str, str, str]:
     parts = [part.strip() for part in clean(location).split(",") if part.strip()]
     if len(parts) >= 3:
@@ -237,8 +263,13 @@ def check_cdp_endpoint(cdp_url: str, timeout_seconds: float = 2.0) -> Tuple[bool
         return False, str(exc)
 
 
+# Matches any Airbnb host across ccTLDs/localized subdomains so they can be
+# rewritten to www.airbnb.com — e.g. airbnb.com, www.airbnb.ca, zh-t.airbnb.com,
+# www.airbnb.com.tw, airbnb.co.uk. The TLD labels are constrained to 2-3 letters
+# (com, ca, tw, uk, au, …) so non-Airbnb hosts like "airbnb.example.com" and
+# "notairbnb.com" are left untouched.
 _AIRBNB_HOST_RE = re.compile(
-    r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.(?:com|ca)$", re.IGNORECASE
+    r"^(?:[a-z0-9-]+\.)*airbnb\.[a-z]{2,3}(?:\.[a-z]{2,3})?$", re.IGNORECASE
 )
 _CANONICAL_AIRBNB_HOST = "www.airbnb.com"
 
@@ -289,6 +320,15 @@ def map_pdp_to_listing_spec(parsed: Dict[str, Any], listing_url: str) -> Listing
     state = clean(str(parsed.get("state") or ""))
     country = clean(str(parsed.get("country") or ""))
     country_code = normalize_country_code(parsed.get("country_code") or country)
+    # Never let a listing-title placeholder ("Airbnb Listing #... · Entire home")
+    # masquerade as a location or contaminate city/state — that would leak into the
+    # comp-search query.  Drop it so DOM/geocode fallbacks can supply a real location.
+    if location_looks_like_placeholder(location):
+        location = ""
+    if location_looks_like_placeholder(city):
+        city = ""
+    if location_looks_like_placeholder(state):
+        state = ""
     if location and (not city or not state or not country):
         _city, _state, _country = derive_location_parts(location)
         city = city or _city
@@ -473,27 +513,6 @@ def _extract_target_spec_via_client_payloads(
     except Exception:
         effective_adults = 1
 
-    deepbnb_scraper = getattr(client, "deepbnb_scraper", None)
-    if deepbnb_scraper is not None and effective_checkin and effective_checkout:
-        try:
-            spec = _map_client_pdp_payload_to_spec(
-                deepbnb_scraper.get_listing_details(
-                    str(listing_id),
-                    checkin=effective_checkin,
-                    checkout=effective_checkout,
-                    adults=effective_adults,
-                ),
-                listing_id,
-                listing_url,
-            )
-            if _listing_spec_has_usable_fields(spec):
-                return spec, payload_warnings
-            payload_warnings.append(
-                "Deepbnb PDP payload extraction returned no usable fields; trying browser PDP payload"
-            )
-        except Exception as exc:
-            payload_warnings.append(f"Deepbnb PDP payload extraction failed: {exc}")
-
     client_payload_kwargs: Dict[str, Any] = {}
     if effective_checkin:
         client_payload_kwargs["checkin"] = effective_checkin
@@ -501,9 +520,15 @@ def _extract_target_spec_via_client_payloads(
         client_payload_kwargs["checkout"] = effective_checkout
     client_payload_kwargs["adults"] = effective_adults
 
+    # Prefer the direct-HTTP detail fetch (no browser tab) when available; the
+    # target spec only needs structural metadata, not a bookable price.
+    detail_fetcher = (
+        getattr(client, "get_listing_details_fast", None)
+        or getattr(client, "get_listing_details", None)
+    )
     try:
         spec = _map_client_pdp_payload_to_spec(
-            client.get_listing_details(str(listing_id), **client_payload_kwargs),
+            detail_fetcher(str(listing_id), **client_payload_kwargs),
             listing_id,
             listing_url,
         )
@@ -1491,55 +1516,7 @@ def extract_nightly_price_from_listing_page(
     except Exception:
         pass  # Timeout or price genuinely absent — proceed to extraction layers
 
-    # ── Layer 1: ld+json structured data (high confidence) ────────────────
-    # Airbnb's LodgingBusiness schema includes rating and address but deliberately
-    # omits per-night pricing. This layer is a forward-looking check: if Airbnb
-    # ever adds priceSpecification to their ld+json, we capture it at high confidence.
-    # In current practice this layer almost always falls through to L2.
-    try:
-        ld_texts: List[str] = page.evaluate(
-            """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-                         .map(s => s.textContent || '')
-                         .filter(Boolean)"""
-        )
-        for blob in (ld_texts or []):
-            try:
-                obj = json.loads(blob)
-                items = obj if isinstance(obj, list) else [obj]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    ld_candidates = item.get("priceSpecification") or item.get("offers") or []
-                    if isinstance(ld_candidates, dict):
-                        ld_candidates = [ld_candidates]
-                    for spec in (ld_candidates if isinstance(ld_candidates, list) else []):
-                        if not isinstance(spec, dict):
-                            continue
-                        for key in ("price", "lowPrice", "minPrice"):
-                            raw = spec.get(key)
-                            if raw is None:
-                                continue
-                            try:
-                                price = float(str(raw).replace(",", ""))
-                                if 10 <= price <= 10000:
-                                    logger.info(
-                                        f"[benchmark] ld+json price=${price} "
-                                        f"from {listing_url}"
-                                    )
-                                    return price, "high"
-                                else:
-                                    logger.warning(
-                                        f"[benchmark] ld+json price ${price} out of range "
-                                        f"(raw={raw!r}), skipping"
-                                    )
-                            except Exception:
-                                continue
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # ── Layer 2: DOM price-candidate classification (medium confidence) ────
+    # ── Layer 1: DOM price-candidate classification (medium confidence) ────
     # Runs _BOOKING_WIDGET_PRICE_JS to find price elements near the "/night"
     # label and classify each as strikethrough (original/crossed-out) or
     # current (discounted or standard).  select_nightly_price_from_candidates()
@@ -1732,7 +1709,6 @@ def capture_target_live_price(
     captured_at = datetime.now(timezone.utc).isoformat()
 
     _CONFIDENCE_TO_SOURCE = {
-        "high": "ld_json",
         "medium": "booking_widget",
         "low": "body_text",
     }
@@ -1746,16 +1722,11 @@ def capture_target_live_price(
     try:
         if client is None:
             from worker.scraper.airbnb_client import AirbnbClient
-            use_deepbnb_live = str(
-                os.getenv("AIRBNB_USE_DEEPBNB_FOR_LIVE_PRICE", "0")
-            ).strip().lower() in ("1", "true", "yes", "on")
             client = AirbnbClient(
                 {
                     "CHECKIN": checkin,
                     "CHECKOUT": checkout,
                     "ADULTS": requested_adults,
-                    # Deepbnb is off by default; this env switch is only an explicit opt-in.
-                    "USE_DEEPBNB_BACKEND": use_deepbnb_live,
                 }
             )
 
@@ -1913,7 +1884,6 @@ def capture_target_live_price(
                                 "CHECKIN": _checkin,
                                 "CHECKOUT": _checkout,
                                 "ADULTS": _adults,
-                                "USE_DEEPBNB_BACKEND": False,
                             }
                         )
                     _fb_nightly, _fb_total, _fb_section_ids, _fb_has_errors = _extract_with_client(

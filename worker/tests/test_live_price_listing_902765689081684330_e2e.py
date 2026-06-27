@@ -171,7 +171,6 @@ def test_live_e2e_listing_902765689081684330_usd_discount_price_is_selected():
             "CHECKOUT": checkout,
             "ADULTS": adults,
             "CDP_URL": cdp_url,
-            "USE_DEEPBNB_BACKEND": False,
             "CURRENCY": "USD",
             "LOCALE": "en-US",
         }

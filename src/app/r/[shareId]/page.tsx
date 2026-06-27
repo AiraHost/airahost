@@ -1175,6 +1175,7 @@ export default function ResultsPage({
                     listings={compsListings as ComparableListing[]}
                     comps={comps}
                     benchmarkInfo={contextualBenchmarkInfo}
+                    targetSpec={report.targetSpec ?? null}
                     embedded={true}
                     pinnedUrls={contextualPinnedUrls}
                     selectedDate={snappedDate}

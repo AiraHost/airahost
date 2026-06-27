@@ -36,9 +36,17 @@ def resolve_cdp_urls(config: Dict[str, Any]) -> List[str]:
     if not urls:
         urls = _parse_cdp_urls(os.getenv("CDP_URLS", ""))
 
-    fallback = str(
+    # Support comma-separated URLs in CDP_URL (e.g. "http://...:9222,http://...:9223,http://...:9224")
+    if not urls:
+        cdp_url_val = str(config.get("CDP_URL") or os.getenv("CDP_URL", "")).strip()
+        if "," in cdp_url_val:
+            urls = _parse_cdp_urls(cdp_url_val)
+
+    cdp_url_raw = str(
         config.get("CDP_URL") or os.getenv("CDP_URL", "http://127.0.0.1:9222")
     ).strip() or "http://127.0.0.1:9222"
+    # If CDP_URL contains commas (multi-URL), use only the first for single-endpoint fallback
+    fallback = cdp_url_raw.split(",")[0].strip() or "http://127.0.0.1:9222"
 
     if urls:
         return _dedupe_urls(urls)[:MAX_BROWSER_CLIENTS]
@@ -202,20 +210,30 @@ def build_warmed_browser_client_pool(
                 idx,
                 client.cdp_url,
             )
+            pool.append(client)
         except Exception as exc:
             logger.warning(
-                "[%s] browser slot=%s warmup failed cdp=%s err=%s",
+                "[%s] browser slot=%s warmup failed cdp=%s err=%s — skipping slot",
                 pool_name,
                 idx,
                 client.cdp_url,
                 exc,
             )
-        pool.append(client)
+    # Always return at least one browser even if warmup failed for all.
+    if not pool:
+        cfg = dict(base_config)
+        cfg["CDP_URL"] = cdp_urls[0]
+        pool.append(AirbnbClient(cfg))
+        logger.warning("[%s] all warmups failed; falling back to primary endpoint %s", pool_name, cdp_urls[0])
     return pool
 
 
 def close_browser_client_pool(pool: List[AirbnbClient]) -> None:
     for idx, client in enumerate(pool):
+        try:
+            client.close_extra_tabs()
+        except Exception as exc:
+            logger.debug("browser pool tab close failed slot=%s err=%s", idx, exc)
         try:
             client.close_browser()
         except Exception as exc:

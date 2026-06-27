@@ -6,31 +6,55 @@ import logging
 import os
 import random
 import re
+import string
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import requests
 from playwright.async_api import async_playwright
+from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
+from worker.core.rate_limiter import get_airbnb_rate_limiter
 from worker.scraper.stayspdp_template import HARDCODED_STAYS_PDP_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
 
+class AirbnbRateLimited(RuntimeError):
+    """Raised when Airbnb responds with a rate-limit status (503/429)."""
+
+
+def _is_rate_limited_status(status: Any) -> bool:
+    try:
+        return int(status) in (429, 503)
+    except (TypeError, ValueError):
+        return False
+
+
 class PlaywrightScraper:
-    """Legacy Playwright capture/replay strategy restored from pre-deepbnb history."""
+    """Playwright capture/replay strategy using Chrome CDP."""
     _refresh_lock = threading.Lock()
+    # Canonical = any subdomain of airbnb.com (NOT .ca/.com.tw/etc.), so a
+    # redirect that lands on a non-.com host is detected as non-canonical and
+    # retried back onto .com.
     _CANONICAL_AIRBNB_HOST_RE = re.compile(
-        r"^(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.com$",
+        r"^(?:[a-z0-9-]+\.)*airbnb\.com$",
         re.IGNORECASE,
     )
 
     def __init__(self, config: dict):
         self.config = config
         self.base_url = self._normalize_base_url(self.config.get("AIRBNB_BASE_URL", "https://www.airbnb.com"))
-        self.locale = str(self.config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA")
-        self.currency = str(self.config.get("CURRENCY", os.getenv("AIRBNB_CURRENCY", "USD")) or "USD")
+        # Hard requirements: Airbnb content must always be English and prices
+        # always USD, regardless of config/env. Any non-English locale is coerced
+        # to English; currency is pinned to USD outright.
+        _configured_locale = str(
+            self.config.get("LOCALE", os.getenv("AIRBNB_LOCALE", "en-CA")) or "en-CA"
+        ).strip()
+        self.locale = _configured_locale if _configured_locale.lower().startswith("en") else "en-CA"
+        self.currency = "USD"
         self.session = requests.Session()
         self.captured_search_req = None
         self.captured_pdp_req = None
@@ -62,8 +86,8 @@ class PlaywrightScraper:
         hardcoded_pdp_cfg = self.config.get("USE_HARDCODED_STAYSPDP_TEMPLATE", None)
         if hardcoded_pdp_cfg is None:
             self.use_hardcoded_stayspdp_template = bool(
-                str(os.getenv("AIRBNB_USE_HARDCODED_STAYSPDP_TEMPLATE", "0")).strip().lower()
-                in ("1", "true", "yes", "on")
+                str(os.getenv("AIRBNB_USE_HARDCODED_STAYSPDP_TEMPLATE", "1")).strip().lower()
+                not in ("0", "false", "no", "off")
             )
         else:
             self.use_hardcoded_stayspdp_template = bool(hardcoded_pdp_cfg)
@@ -87,7 +111,7 @@ class PlaywrightScraper:
         self._context_owned = False
         self._tab_gate_lock = threading.Lock()
         self._tab_gate = None
-        self._tab_limit = 5
+        self._tab_limit = 8
         self._open_tab_count = 0
         self._ensure_tab_gate()
         if self.use_hardcoded_stayspdp_template:
@@ -102,7 +126,9 @@ class PlaywrightScraper:
             parsed = urlparse(raw)
             if parsed.scheme in ("http", "https") and parsed.netloc:
                 host = str(parsed.hostname or "").strip().lower()
-                if re.fullmatch(r"(?:[a-z]{2,5}(?:-[a-z]{1,5})?\.)?airbnb\.(?:com|ca)", host):
+                # Any Airbnb host (any ccTLD / localized subdomain) collapses to
+                # the canonical .com so every search/PDP request stays on .com.
+                if re.fullmatch(r"(?:[a-z0-9-]+\.)*airbnb\.[a-z]{2,3}(?:\.[a-z]{2,3})?", host):
                     return "https://www.airbnb.com"
                 return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         except Exception:
@@ -132,14 +158,17 @@ class PlaywrightScraper:
         with self._tab_gate_lock:
             if self._tab_gate is not None:
                 return
-            # Keep several tabs busy per browser while preserving a hard ceiling.
-            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", "4")
+            # Default tabs-per-browser to the configured worker cap so tab
+            # concurrency matches DAY_QUERY/MAX_SCRAPER_WORKERS instead of
+            # bottlenecking below it; AIRBNB_PLAYWRIGHT_MAX_TABS still overrides.
+            raw_limit = os.getenv("AIRBNB_PLAYWRIGHT_MAX_TABS", str(MAX_SCRAPER_WORKERS))
             try:
                 parsed_limit = int(str(raw_limit).strip())
             except Exception:
-                parsed_limit = 4
-            # Hard safety ceiling: never allow more than 5 concurrent tabs.
-            self._tab_limit = max(1, min(parsed_limit, 5))
+                parsed_limit = MAX_SCRAPER_WORKERS
+            # Hard safety ceiling: never allow more than 8 concurrent tabs per
+            # browser, to limit Airbnb anti-bot challenges under heavy load.
+            self._tab_limit = max(1, min(parsed_limit, 8))
             self._tab_gate = threading.BoundedSemaphore(self._tab_limit)
 
     async def _acquire_tab_slot(self, timeout_seconds: float = 120.0) -> None:
@@ -424,26 +453,32 @@ class PlaywrightScraper:
         template = copy.deepcopy(HARDCODED_STAYS_PDP_TEMPLATE)
         safe_base = self._normalize_base_url(self.base_url)
         currency = str(self.currency or "USD").upper()
+        locale = str(self.locale or "en-CA")
 
-        def _normalize_query_currency(query: str) -> str:
+        def _force_param(query: str, name: str, value: str) -> str:
             q = str(query or "")
             if not q:
-                return f"currency={currency}"
-            if re.search(r"(^|&)currency=", q, flags=re.I):
+                return f"{name}={value}"
+            if re.search(rf"(^|&){re.escape(name)}=", q, flags=re.I):
                 return re.sub(
-                    r"(^|&)currency=[^&]*",
-                    lambda m: f"{m.group(1)}currency={currency}",
+                    rf"(^|&){re.escape(name)}=[^&]*",
+                    lambda m: f"{m.group(1)}{name}={value}",
                     q,
                     count=1,
                     flags=re.I,
                 )
-            return f"{q}&currency={currency}"
+            return f"{q}&{name}={value}"
+
+        def _normalize_query(query: str) -> str:
+            # Pin both currency=USD and an English locale on the replayed request
+            # so direct HTTP PDP fetches return English content priced in USD.
+            return _force_param(_force_param(query, "currency", currency), "locale", locale)
 
         try:
             raw_url = str(template.get("url") or "").strip()
             if raw_url:
                 parsed = urlparse(raw_url)
-                normalized_query = _normalize_query_currency(parsed.query)
+                normalized_query = _normalize_query(parsed.query)
                 query = f"?{normalized_query}" if normalized_query else ""
                 template["url"] = f"{safe_base}{parsed.path}{query}"
             headers = template.get("headers")
@@ -451,7 +486,7 @@ class PlaywrightScraper:
                 raw_referer = str(headers.get("referer") or "").strip()
                 if raw_referer:
                     parsed_ref = urlparse(raw_referer)
-                    normalized_query_ref = _normalize_query_currency(parsed_ref.query)
+                    normalized_query_ref = _normalize_query(parsed_ref.query)
                     query_ref = f"?{normalized_query_ref}" if normalized_query_ref else ""
                     headers["referer"] = f"{safe_base}{parsed_ref.path}{query_ref}"
         except Exception:
@@ -561,7 +596,7 @@ class PlaywrightScraper:
         clone._context_owned = False
         clone._tab_gate_lock = threading.Lock()
         clone._tab_gate = None
-        clone._tab_limit = 5
+        clone._tab_limit = 8
         clone._open_tab_count = 0
         clone._ensure_tab_gate()
         for c in self.session.cookies:
@@ -1034,22 +1069,34 @@ class PlaywrightScraper:
 
     def search_listings(self) -> Tuple[int, Dict[str, Any]]:
         """Browser-only StaysSearch (no API replay)."""
+        limiter = get_airbnb_rate_limiter()
         last_exc: Optional[Exception] = None
         for attempt in range(1, 3):
             try:
-                status_code, response_data = self._run_async(
-                    self._search_via_browser(),
-                    op_name="search_listings",
-                )
+                with limiter.slot():
+                    status_code, response_data = self._run_async(
+                        self._search_via_browser(),
+                        op_name="search_listings",
+                    )
                 if response_data.get("errors") and self._response_looks_auth_or_challenge_error(status_code, response_data):
                     raise RuntimeError("Browser StaysSearch returned auth/challenge-like GraphQL error")
                 return status_code, response_data
             except Exception as exc:
                 last_exc = exc
-                logger.warning("Browser StaysSearch attempt %s/2 failed: %s", attempt, exc)
+                is_rate_limited = isinstance(exc, AirbnbRateLimited)
+                logger.warning(
+                    "Browser StaysSearch attempt %s/2 failed%s: %s",
+                    attempt,
+                    " (rate-limited)" if is_rate_limited else "",
+                    exc,
+                )
                 if attempt < 2:
-                    self._reset_browser_connection_after_failure(exc, op_name="search_listings")
-                    time.sleep(1.0)
+                    if is_rate_limited:
+                        limiter.penalize()
+                        time.sleep(2.0 + random.random() * 2.0)
+                    else:
+                        self._reset_browser_connection_after_failure(exc, op_name="search_listings")
+                        time.sleep(1.0)
         raise RuntimeError(f"Playwright browser search failed after 2 attempts: {last_exc}")
 
     @staticmethod
@@ -1094,6 +1141,75 @@ class PlaywrightScraper:
             map_req["metadataOnly"] = True
             map_req["rawParams"] = []
 
+    @staticmethod
+    def _sanitize_captured_headers(headers: Dict[str, Any]) -> Dict[str, str]:
+        """Drop HTTP/2 pseudo-headers and hop-by-hop headers before replay."""
+        drop = {"content-length", "host", "connection", "accept-encoding"}
+        clean: Dict[str, str] = {}
+        for key, value in (headers or {}).items():
+            k = str(key or "")
+            if k.startswith(":"):
+                continue
+            if k.lower() in drop:
+                continue
+            clean[k] = str(value)
+        return clean
+
+    async def _capture_search_request_template(self, req, resp_url: str) -> None:
+        """
+        Persist the live StaysSearch POST request as a replayable template so
+        subsequent searches can use direct HTTP (fetch_search_direct) instead of
+        opening a browser tab. Mirrors the hardcoded PDP template approach.
+        """
+        try:
+            method = str(getattr(req, "method", "") or "").upper()
+            if method != "POST":
+                return
+            post_data = getattr(req, "post_data", None)
+            if not post_data:
+                return
+            parsed_post = json.loads(post_data)
+            if not isinstance(parsed_post, dict):
+                return
+            try:
+                headers = await req.all_headers()
+            except Exception:
+                headers = dict(getattr(req, "headers", {}) or {})
+            template = {
+                "url": str(getattr(req, "url", "") or resp_url),
+                "method": "POST",
+                "headers": self._sanitize_captured_headers(headers),
+                "post_data": parsed_post,
+            }
+            self.captured_search_req = template
+            logger.info(
+                "Captured StaysSearch request template for direct-HTTP replay url=%s",
+                template["url"],
+            )
+        except Exception as exc:
+            logger.debug("StaysSearch template capture skipped: %s", exc)
+
+    @staticmethod
+    def _force_url_query_params(url: str, **params: str) -> str:
+        """Force query params onto a URL, overwriting any existing values."""
+        try:
+            parsed = urlparse(str(url or ""))
+        except Exception:
+            return url
+        q = parsed.query
+        for name, value in params.items():
+            if re.search(rf"(^|&){re.escape(name)}=", q, flags=re.I):
+                q = re.sub(
+                    rf"(^|&){re.escape(name)}=[^&]*",
+                    lambda m, n=name, v=value: f"{m.group(1)}{n}={v}",
+                    q,
+                    count=1,
+                    flags=re.I,
+                )
+            else:
+                q = f"{q}&{name}={value}" if q else f"{name}={value}"
+        return urlunparse(parsed._replace(query=q))
+
     def _build_search_navigation_url(self, overrides: Optional[Dict[str, Any]] = None) -> str:
         ov = overrides or {}
         query_raw = (
@@ -1117,6 +1233,10 @@ class PlaywrightScraper:
             "adults": ov.get("adults", ov.get("guests", self.config.get("ADULTS", 1))),
             "query": normalized_display_query,
             "search_type": "AUTOSUGGEST",
+            # Force English content + USD pricing on the search page (and on any
+            # StaysSearch request template captured from it).
+            "locale": self.locale,
+            "currency": self.currency,
         }
         if "itemsPerGrid" in ov and ov.get("itemsPerGrid") is not None:
             params["items_per_grid"] = ov.get("itemsPerGrid")
@@ -1205,13 +1325,23 @@ class PlaywrightScraper:
         if not self._cdp_url:
             raise RuntimeError("CDP_URL is required; Playwright scraper must attach to existing browser.")
         self._pw = await async_playwright().start()
-        logger.info(
-            "Connecting Playwright to existing browser via CDP: %s [thread=%s]",
-            self._cdp_url,
-            threading.get_ident(),
+        candidates = [u.strip() for u in self._cdp_url.split(",") if u.strip()]
+        last_exc: Optional[Exception] = None
+        for cdp_url in candidates:
+            logger.info(
+                "Connecting Playwright to existing browser via CDP: %s [thread=%s]",
+                cdp_url,
+                threading.get_ident(),
+            )
+            try:
+                self._browser = await self._pw.chromium.connect_over_cdp(cdp_url, timeout=15000)
+                return self._browser
+            except Exception as exc:
+                logger.warning("CDP connect failed for %s: %s", cdp_url, exc)
+                last_exc = exc
+        raise RuntimeError(
+            f"Could not connect to any CDP endpoint ({self._cdp_url}): {last_exc}"
         )
-        self._browser = await self._pw.chromium.connect_over_cdp(self._cdp_url, timeout=15000)
-        return self._browser
 
     async def _get_thread_context(self):
         if self._context is not None:
@@ -1279,6 +1409,37 @@ class PlaywrightScraper:
                     domain=cookie["domain"],
                     path=cookie["path"],
                 )
+
+    async def _close_extra_tabs_async(self) -> None:
+        """Close all pages in the browser context except the first (blank) one."""
+        context = self._context
+        if context is None:
+            return
+        try:
+            pages = context.pages
+            # Keep at most one page open; close everything else.
+            for page in pages[1:]:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Reset the tab counter so the gate stays accurate.
+        with self._tab_gate_lock:
+            self._open_tab_count = 0
+            self._tab_gate = threading.BoundedSemaphore(self._tab_limit)
+
+    def close_extra_tabs(self) -> None:
+        """Sync wrapper: close all but one tab in the browser context after a task."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._close_extra_tabs_async(), loop)
+            future.result(timeout=10)
+        except Exception:
+            pass
 
     async def _close_browser_async(self) -> None:
         try:
@@ -1352,6 +1513,7 @@ class PlaywrightScraper:
             captured_data: Optional[Dict[str, Any]] = None
             captured_url: str = ""
             saw_stayssearch_response = False
+            saw_rate_limit = False
             latest_nav_html: str = ""
             latest_nav_url: str = ""
             challenge_detected = False
@@ -1359,10 +1521,9 @@ class PlaywrightScraper:
             response_tasks: set[asyncio.Task] = set()
 
             async def _handle_response(resp):
-                nonlocal captured_status, captured_data, captured_url, saw_stayssearch_response
+                nonlocal captured_status, captured_data, captured_url
+                nonlocal saw_stayssearch_response, saw_rate_limit
                 try:
-                    if captured_data is not None:
-                        return
                     req = resp.request
                     req_method = str(getattr(req, "method", "") or "").upper()
                     if req_method not in ("POST", "GET"):
@@ -1373,11 +1534,18 @@ class PlaywrightScraper:
                     if "stayssearch" not in resp_url.lower():
                         return
                     saw_stayssearch_response = True
+                    if _is_rate_limited_status(resp.status):
+                        saw_rate_limit = True
+                    if captured_data is not None:
+                        return
                     captured_status = int(resp.status)
                     payload = await resp.json()
                     if isinstance(payload, dict):
                         captured_data = payload
                         captured_url = resp_url
+                        # Capture the request template for direct-HTTP replay
+                        # (fetch_search_direct), mirroring the PDP template path.
+                        await self._capture_search_request_template(req, resp_url)
                 except Exception:
                     return
 
@@ -1512,6 +1680,10 @@ class PlaywrightScraper:
                     )
                 if challenge_detected and challenge_reason:
                     raise RuntimeError(challenge_reason)
+                if saw_rate_limit:
+                    raise AirbnbRateLimited(
+                        "Playwright browser search received HTTP 429/503 from StaysSearch"
+                    )
                 if saw_stayssearch_response:
                     raise RuntimeError(
                         "Playwright browser search saw StaysSearch traffic but could not parse JSON payload"
@@ -1570,7 +1742,8 @@ class PlaywrightScraper:
                         dates_unavailable = self._pdp_dates_unavailable(payload)
                         if dates_unavailable:
                             terminal_reason = "dates_unavailable"
-                            captured_data = self._build_minimal_pdp_payload(None)
+                            # Keep captured_data = payload so location/metadata are still
+                            # extractable. Only the booking price will be missing (correct).
                         elif has_price:
                             terminal_reason = "price"
                         logger.info(
@@ -1638,6 +1811,10 @@ class PlaywrightScraper:
             )
             if str((nav or {}).get("final_url") or "").lower().startswith("about:blank"):
                 raise RuntimeError(f"Playwright PDP landed on about:blank for listing={listing_id}")
+            if _is_rate_limited_status((nav or {}).get("status")):
+                raise AirbnbRateLimited(
+                    f"Playwright PDP nav returned HTTP {(nav or {}).get('status')} for listing={listing_id}"
+                )
             await page.wait_for_timeout(int(random.uniform(900, 1600)))
             if self._page_looks_challenged(str((nav or {}).get("html") or ""), str((nav or {}).get("final_url") or "")):
                 challenged_at_nav = True
@@ -1665,10 +1842,12 @@ class PlaywrightScraper:
 
             if terminal_reason == "dates_unavailable":
                 logger.info(
-                    "Playwright PDP API shows unavailable dates listing=%s; returning no-price payload",
+                    "Playwright PDP API shows unavailable dates listing=%s; returning full payload (no price) for metadata extraction",
                     listing_id,
                 )
-                return (captured_status or 200), self._build_minimal_pdp_payload(None)
+                # Return the full payload so location/title/accommodates can be extracted.
+                # The BOOK_IT sections have available=False so price parsing will correctly yield None.
+                return (captured_status or 200), (captured_data or self._build_minimal_pdp_payload(None))
 
             if terminal_reason is not None:
                 # Hold very briefly after terminal detection so last payload
@@ -1693,10 +1872,10 @@ class PlaywrightScraper:
                 )
             if self._rendered_html_dates_unavailable(rendered_html):
                 logger.info(
-                    "Playwright PDP rendered HTML shows unavailable dates listing=%s; returning no-price payload",
+                    "Playwright PDP rendered HTML shows unavailable dates listing=%s; returning captured payload (no price) for metadata",
                     listing_id,
                 )
-                return (captured_status or 200), self._build_minimal_pdp_payload(None)
+                return (captured_status or 200), (captured_data or self._build_minimal_pdp_payload(None))
 
             has_api_price = bool(captured_data and self._pdp_booking_has_price(captured_data))
             if noncanonical_pdp_host and has_api_price:
@@ -1760,10 +1939,10 @@ class PlaywrightScraper:
                     )
                 if self._rendered_html_dates_unavailable(rendered_html):
                     logger.info(
-                        "Playwright PDP post-hydration HTML shows unavailable dates listing=%s; returning no-price payload",
+                        "Playwright PDP post-hydration HTML shows unavailable dates listing=%s; returning captured payload (no price) for metadata",
                         listing_id,
                     )
-                    return (captured_status or 200), self._build_minimal_pdp_payload(None)
+                    return (captured_status or 200), (captured_data or self._build_minimal_pdp_payload(None))
                 html_read_attempts = 1
                 dom_price_text: Optional[str] = None
                 for attempt in range(1, html_read_attempts + 1):
@@ -1831,31 +2010,92 @@ class PlaywrightScraper:
         finally:
             await self._close_capped_page(page)
 
+    @staticmethod
+    def _count_search_results(data: Dict[str, Any]) -> int:
+        try:
+            results = (
+                (((data.get("data") or {}).get("presentation") or {}).get("staysSearch") or {})
+                .get("results")
+                or {}
+            )
+            sr = results.get("searchResults")
+            if isinstance(sr, list):
+                return len(sr)
+        except Exception:
+            pass
+        return 0
+
+    def _try_direct_search(
+        self, overrides: Dict[str, Any]
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """Attempt StaysSearch via direct HTTP; return None to signal browser fallback."""
+        if not isinstance(self.captured_search_req, dict):
+            return None
+        try:
+            result = self.fetch_search_direct(overrides)
+        except Exception as exc:
+            logger.debug("[direct_search] raised; falling back to browser: %s", exc)
+            return None
+        if result is None:
+            return None
+        status_code, data = result
+        if not isinstance(data, dict):
+            return None
+        if data.get("errors") and self._response_looks_auth_or_challenge_error(status_code, data):
+            logger.info("[direct_search] challenge-like response; falling back to browser")
+            return None
+        count = self._count_search_results(data)
+        if count <= 0:
+            logger.info("[direct_search] empty results; falling back to browser")
+            return None
+        logger.info(
+            "[direct_search] StaysSearch served via direct HTTP status=%s results=%s",
+            status_code,
+            count,
+        )
+        return status_code, data
+
     def search_listings_with_overrides(
         self,
         overrides: Dict[str, Any],
         _already_retried: bool = False,
     ) -> Tuple[int, Dict[str, Any]]:
-        """Browser-only StaysSearch with overrides (no API replay)."""
+        """StaysSearch with overrides — direct HTTP replay first, browser fallback."""
+        direct = self._try_direct_search(overrides)
+        if direct is not None:
+            return direct
+
+        limiter = get_airbnb_rate_limiter()
         last_exc: Optional[Exception] = None
         for attempt in range(1, 3):
             try:
-                status_code, response_data = self._run_async(
-                    self._search_via_browser(overrides),
-                    op_name="search_listings_with_overrides",
-                )
+                with limiter.slot():
+                    status_code, response_data = self._run_async(
+                        self._search_via_browser(overrides),
+                        op_name="search_listings_with_overrides",
+                    )
                 if response_data.get("errors") and self._response_looks_auth_or_challenge_error(status_code, response_data):
                     raise RuntimeError("Browser StaysSearch(with overrides) returned auth/challenge-like GraphQL error")
                 return status_code, response_data
             except Exception as exc:
                 last_exc = exc
-                logger.warning("Browser StaysSearch(with overrides) attempt %s/2 failed: %s", attempt, exc)
+                is_rate_limited = isinstance(exc, AirbnbRateLimited)
+                logger.warning(
+                    "Browser StaysSearch(with overrides) attempt %s/2 failed%s: %s",
+                    attempt,
+                    " (rate-limited)" if is_rate_limited else "",
+                    exc,
+                )
                 if attempt < 2:
-                    self._reset_browser_connection_after_failure(
-                        exc,
-                        op_name="search_listings_with_overrides",
-                    )
-                    time.sleep(1.0)
+                    if is_rate_limited:
+                        limiter.penalize()
+                        time.sleep(2.0 + random.random() * 2.0)
+                    else:
+                        self._reset_browser_connection_after_failure(
+                            exc,
+                            op_name="search_listings_with_overrides",
+                        )
+                        time.sleep(1.0)
         raise RuntimeError(f"Playwright browser search(with overrides) failed after 2 attempts: {last_exc}")
 
     @staticmethod
@@ -1875,7 +2115,403 @@ class PlaywrightScraper:
             for item in payload:
                 self._replace_listing_ids(item, listing_id, stay_gid, demand_gid)
 
+    def fetch_pdp_price_direct(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Direct HTTP POST to StaysPdpSections using session cookies — no browser tab opened.
+        ~200-500ms per call vs 5-15s for browser navigation.
+        Returns raw GraphQL response dict, or None on failure.
+        """
+        if not self.captured_pdp_req:
+            return None
+        tmpl = copy.deepcopy(self.captured_pdp_req)
+        lid = str(listing_id)
+        stay_gid = self._to_global_id("StayListing", lid)
+        demand_gid = self._to_global_id("DemandStayListing", lid)
+        self._replace_listing_ids(tmpl["post_data"], lid, stay_gid, demand_gid)
+        pdp_req = tmpl["post_data"]["variables"]["pdpSectionsRequest"]
+        pdp_req["checkIn"] = checkin
+        pdp_req["checkOut"] = checkout
+        pdp_req["adults"] = str(adults)
+        date_range = tmpl["post_data"]["variables"].get("dateRange")
+        if isinstance(date_range, dict):
+            date_range["startDate"] = checkin
+            date_range["endDate"] = checkout
+        headers = dict(tmpl["headers"])
+        safe_base = self._normalize_base_url(self.base_url)
+        headers["referer"] = f"{safe_base}/rooms/{lid}?check_in={checkin}&check_out={checkout}"
+        rand_str = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+        headers["x-client-request-id"] = rand_str(30)
+        headers["x-client-trace-id"] = rand_str(30)
+        headers["x-airbnb-client-action-id"] = str(uuid.uuid4())
+        p3_id = f"p3_{int(time.time())}_{rand_str(8)}"
+        pdp_req["p3ImpressionId"] = p3_id
+        if "p3ImpressionId" in tmpl["post_data"]["variables"]:
+            tmpl["post_data"]["variables"]["p3ImpressionId"] = p3_id
+        limiter = get_airbnb_rate_limiter()
+        for attempt in range(3):
+            try:
+                with limiter.slot():
+                    resp = self.session.post(
+                        tmpl["url"],
+                        headers=headers,
+                        json=tmpl["post_data"],
+                        timeout=8,
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data
+                    return None
+                if resp.status_code in (503, 429):
+                    limiter.penalize()
+                    wait = 1.0 + attempt * 1.5 + random.random()
+                    logger.debug(
+                        "[direct_pdp] listing=%s checkin=%s HTTP %s, retry in %.1fs (attempt %s/3)",
+                        lid, checkin, resp.status_code, wait, attempt + 1,
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.debug(
+                    "[direct_pdp] listing=%s checkin=%s HTTP %s", lid, checkin, resp.status_code
+                )
+                return None
+            except Exception as exc:
+                logger.debug(
+                    "[direct_pdp] listing=%s checkin=%s error: %s", lid, checkin, str(exc)[:120]
+                )
+                if attempt < 2:
+                    time.sleep(0.5 + attempt * 0.5)
+        return None
+
+    def _apply_search_overrides_to_template(
+        self, post_data: Dict[str, Any], overrides: Dict[str, Any]
+    ) -> None:
+        """
+        Mutate a captured StaysSearch GraphQL payload in place to reflect the
+        requested date window / location / pagination, reusing the rawParams
+        helpers. Only fields present in ``overrides`` are changed; everything else
+        is inherited from the captured live request.
+        """
+        variables = post_data.get("variables")
+        if not isinstance(variables, dict):
+            return
+        ov = overrides or {}
+
+        raw_targets: List[list] = []
+        sr = variables.get("staysSearchRequest")
+        if isinstance(sr, dict) and isinstance(sr.get("rawParams"), list):
+            raw_targets.append(sr["rawParams"])
+        mr = variables.get("staysMapSearchRequestV2")
+        if isinstance(mr, dict) and isinstance(mr.get("rawParams"), list):
+            raw_targets.append(mr["rawParams"])
+
+        def _set_all(name: str, values: list) -> None:
+            for rp in raw_targets:
+                self._set_raw_param(rp, name, values)
+
+        if ov.get("checkin"):
+            _set_all("checkin", [str(ov["checkin"])])
+        if ov.get("checkout"):
+            _set_all("checkout", [str(ov["checkout"])])
+        adults = ov.get("adults", ov.get("guests"))
+        if adults is not None:
+            try:
+                _set_all("adults", [str(int(adults))])
+            except (TypeError, ValueError):
+                pass
+        query = ov.get("query") or ov.get("locationSearch") or ov.get("location")
+        if query:
+            _set_all("query", [str(query)])
+        if ov.get("itemsPerGrid") is not None:
+            try:
+                _set_all("itemsPerGrid", [str(int(ov["itemsPerGrid"]))])
+            except (TypeError, ValueError):
+                pass
+        if ov.get("itemsOffset") is not None:
+            try:
+                _set_all("itemsOffset", [str(int(ov["itemsOffset"]))])
+            except (TypeError, ValueError):
+                pass
+        if ov.get("searchByMap"):
+            _set_all("searchByMap", ["true"])
+            for key in ("neLat", "neLng", "swLat", "swLng"):
+                if ov.get(key) is not None:
+                    _set_all(key, [str(ov[key])])
+
+        # Honor the disable-map-search toggle the same way the browser path would.
+        self._apply_disable_map_search({"variables": variables})
+
+    def fetch_search_direct(
+        self, overrides: Dict[str, Any]
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """
+        Direct HTTP POST to StaysSearch using a captured request template and
+        session cookies — no browser tab. Returns (status, data) on success, or
+        None when no template is available or the request failed (caller should
+        then fall back to the browser path).
+        """
+        tmpl = self.captured_search_req
+        if not isinstance(tmpl, dict) or not tmpl.get("url") or not isinstance(
+            tmpl.get("post_data"), dict
+        ):
+            return None
+        tmpl = copy.deepcopy(tmpl)
+        # Pin currency=USD and an English locale on the replayed StaysSearch URL
+        # so results stay priced in USD and returned in English even if the
+        # captured/cached template predates these settings.
+        tmpl["url"] = self._force_url_query_params(
+            str(tmpl.get("url") or ""), currency="USD", locale=self.locale
+        )
+        post_data = tmpl["post_data"]
+        try:
+            self._apply_search_overrides_to_template(post_data, overrides)
+        except Exception as exc:
+            logger.debug("[direct_search] override application failed: %s", exc)
+            return None
+
+        headers = self._sanitize_captured_headers(dict(tmpl.get("headers") or {}))
+        rand_str = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+        headers["x-client-request-id"] = rand_str(30)
+        headers["x-client-trace-id"] = rand_str(30)
+        headers["x-airbnb-client-action-id"] = str(uuid.uuid4())
+
+        limiter = get_airbnb_rate_limiter()
+        for attempt in range(3):
+            try:
+                with limiter.slot():
+                    resp = self.session.post(
+                        tmpl["url"],
+                        headers=headers,
+                        json=post_data,
+                        timeout=12,
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return resp.status_code, data
+                    return None
+                if resp.status_code in (503, 429):
+                    limiter.penalize()
+                    wait = 1.0 + attempt * 1.5 + random.random()
+                    logger.debug(
+                        "[direct_search] HTTP %s, retry in %.1fs (attempt %s/3)",
+                        resp.status_code, wait, attempt + 1,
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.debug("[direct_search] HTTP %s", resp.status_code)
+                return None
+            except Exception as exc:
+                logger.debug("[direct_search] error: %s", str(exc)[:120])
+                if attempt < 2:
+                    time.sleep(0.5 + attempt * 0.5)
+        return None
+
+    def copy_session_from(self, source: "PlaywrightScraper") -> None:
+        """Copy session cookies and PDP template from another scraper instance."""
+        with source._session_cookie_lock:
+            src_cookies = list(source.session.cookies)
+            src_pdp = copy.deepcopy(source.captured_pdp_req)
+        with self._session_cookie_lock:
+            self.session.cookies.clear()
+            for c in src_cookies:
+                self.session.cookies.set(
+                    c.name, c.value, domain=c.domain, path=c.path,
+                )
+        self.captured_pdp_req = src_pdp
+
+    def _resolve_pdp_window(
+        self,
+        checkin: Optional[str],
+        checkout: Optional[str],
+        adults: Optional[int],
+    ) -> Tuple[str, str, int]:
+        eff_checkin = checkin or self.config.get("CHECKIN", "")
+        eff_checkout = checkout or self.config.get("CHECKOUT", "")
+        try:
+            eff_adults = int(adults if adults is not None else self.config.get("ADULTS", 1))
+        except Exception:
+            eff_adults = 1
+        return eff_checkin, eff_checkout, eff_adults
+
+    def _try_direct_listing_details(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int,
+        *,
+        require_price: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Satisfy a PDP detail fetch via direct HTTP replay of the captured
+        StaysPdpSections request (no browser tab, ~300ms vs several seconds of
+        browser navigation). Returns the raw GraphQL payload when it is a usable
+        PDP response, or None to signal the caller should fall back to the
+        browser path.
+
+        require_price=True  -> only accept payloads that carry a bookable price
+                               or are explicitly dates-unavailable; otherwise
+                               defer to the browser so its DOM price fallback can
+                               recover prices the API omits (price paths).
+        require_price=False -> accept any structurally-complete PDP payload
+                               regardless of price (metadata/enrichment paths).
+        """
+        if not self.captured_pdp_req:
+            return None
+        # Direct replay relies on authenticated session cookies; without them the
+        # request would be challenged, so let the browser path handle it instead.
+        if len(self.session.cookies) == 0:
+            return None
+        try:
+            data = self.fetch_pdp_price_direct(
+                listing_id=str(listing_id),
+                checkin=checkin,
+                checkout=checkout,
+                adults=adults,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[direct_pdp] listing=%s replay raised; browser fallback: %s",
+                listing_id,
+                str(exc)[:120],
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("errors") and self._response_looks_auth_or_challenge_error(200, data):
+            logger.info(
+                "[direct_pdp] listing=%s challenge-like response; browser fallback",
+                listing_id,
+            )
+            return None
+        if not self._extract_pdp_sections(data) and not self._pdp_payload_has_amenity_groups(data):
+            # Empty/degraded payload — not a real PDP response.
+            return None
+        if require_price:
+            if self._pdp_dates_unavailable(data) or self._pdp_booking_has_price(data):
+                logger.info(
+                    "[direct_pdp] listing=%s served via direct HTTP (price path)",
+                    listing_id,
+                )
+                return data
+            return None
+        logger.info(
+            "[direct_pdp] listing=%s served via direct HTTP (detail path)",
+            listing_id,
+        )
+        return data
+
     def get_listing_details(
+        self,
+        listing_id: str,
+        checkin: Optional[str] = None,
+        checkout: Optional[str] = None,
+        adults: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        PDP detail fetch — direct HTTP replay first, browser capture fallback.
+
+        The price-aware gate defers no-price/bookable responses to the browser so
+        its DOM price fallback can recover prices the StaysPdpSections API omits.
+        """
+        eff_checkin, eff_checkout, eff_adults = self._resolve_pdp_window(
+            checkin, checkout, adults
+        )
+        direct = self._try_direct_listing_details(
+            str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=True
+        )
+        if direct is not None:
+            return direct
+        return self._get_listing_details_browser(listing_id, checkin, checkout, adults)
+
+    def _fetch_listing_page_html_direct(self, listing_id: str) -> Optional[str]:
+        """
+        Direct HTTP GET to the Airbnb listing page to extract server-rendered HTML.
+
+        Airbnb SSR embeds the full amenity list (previewAmenitiesGroups +
+        seeAllAmenitiesGroups) inside <script type="application/json"> blocks as
+        data.node.pdpPresentation.amenities.  A plain session.get is ~200-500ms
+        versus 5-15s for a full browser navigation, making it viable as a fast
+        amenity enrichment step after a direct GraphQL PDP fetch.
+
+        Returns the raw HTML string, or None on any error.
+        """
+        url = f"{self.base_url}/rooms/{listing_id}"
+        try:
+            resp = self.session.get(
+                url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.text
+            logger.debug(
+                "[direct_pdp_html] listing=%s HTTP %s", listing_id, resp.status_code
+            )
+        except Exception as exc:
+            logger.debug(
+                "[direct_pdp_html] listing=%s GET failed: %s", listing_id, str(exc)[:120]
+            )
+        return None
+
+    def get_listing_details_fast(
+        self,
+        listing_id: str,
+        checkin: Optional[str] = None,
+        checkout: Optional[str] = None,
+        adults: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Metadata-oriented PDP fetch — direct HTTP replay first (accepts no-price
+        payloads), browser capture fallback. Used for comp/target structural
+        detail where amenities/capacity/baths/type matter but the booking price
+        does not, so we never pay for a browser navigation just to recover a price.
+
+        When the GraphQL response lacks amenity groups (the normal case for the
+        booking-section-only template), we fall back to a direct HTTP GET of the
+        listing page HTML to extract the SSR-embedded amenity data.
+        """
+        eff_checkin, eff_checkout, eff_adults = self._resolve_pdp_window(
+            checkin, checkout, adults
+        )
+        direct = self._try_direct_listing_details(
+            str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=False
+        )
+        if direct is not None:
+            if not self._pdp_payload_has_amenity_groups(direct):
+                html = self._fetch_listing_page_html_direct(str(listing_id))
+                if html:
+                    html_amenities = self._extract_pdp_amenities_from_rendered_html(html)
+                    if isinstance(html_amenities, dict):
+                        self._inject_pdp_presentation_amenities(direct, html_amenities)
+                        preview = html_amenities.get("previewAmenitiesGroups")
+                        see_all = html_amenities.get("seeAllAmenitiesGroups")
+                        logger.info(
+                            "[direct_pdp] listing=%s amenities enriched from page HTML "
+                            "preview_groups=%s see_all_groups=%s",
+                            listing_id,
+                            len(preview) if isinstance(preview, list) else 0,
+                            len(see_all) if isinstance(see_all, list) else 0,
+                        )
+            return direct
+        return self._get_listing_details_browser(listing_id, checkin, checkout, adults)
+
+    def _get_listing_details_browser(
         self,
         listing_id: str,
         checkin: Optional[str] = None,
@@ -1903,22 +2539,36 @@ class PlaywrightScraper:
             )
         except Exception:
             pdp_attempt_timeout_seconds = 45.0
+        limiter = get_airbnb_rate_limiter()
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
-                _, response_data = self._run_async(
-                    self._get_listing_details_via_browser(
-                        listing_id=str(listing_id),
-                        checkin=effective_checkin,
-                        checkout=effective_checkout,
-                        adults=effective_adults,
-                    ),
-                    op_name="get_listing_details",
-                    timeout_seconds=pdp_attempt_timeout_seconds,
-                )
+                with limiter.slot():
+                    _, response_data = self._run_async(
+                        self._get_listing_details_via_browser(
+                            listing_id=str(listing_id),
+                            checkin=effective_checkin,
+                            checkout=effective_checkout,
+                            adults=effective_adults,
+                        ),
+                        op_name="get_listing_details",
+                        timeout_seconds=pdp_attempt_timeout_seconds,
+                    )
                 return response_data
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, AirbnbRateLimited):
+                    limiter.penalize()
+                    logger.warning(
+                        "Browser PDP attempt %s rate-limited for listing=%s: %s",
+                        attempt,
+                        listing_id,
+                        exc,
+                    )
+                    if attempt < max_attempts:
+                        time.sleep(2.0 + random.random() * 2.0)
+                        continue
+                    break
                 will_retry = (
                     attempt < max_attempts
                     and self._reset_browser_connection_after_failure(
