@@ -973,15 +973,33 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
 
         # Title source from search payload:
         # prefer subtitle/nameLocalized over generic title ("Guest suite in ...")
-        subtitle = r.get("subtitle")
-        name_localized = r.get("nameLocalized", {})
+        listing_obj = r.get("listing") or {}
+        demand = r.get("demandStayListing") or {}
+        
+        subtitle = r.get("subtitle") or listing_obj.get("subtitle") or demand.get("subtitle")
+        name_localized = r.get("nameLocalized") or listing_obj.get("nameLocalized") or demand.get("nameLocalized") or {}
         localized = name_localized.get("localizedStringWithTranslationPreference") if isinstance(name_localized, dict) else None
+        
         if isinstance(localized, str) and localized.strip():
             row["title"] = localized.strip()
         elif isinstance(subtitle, str) and subtitle.strip():
             row["title"] = subtitle.strip()
         elif isinstance(r.get("title"), str) and r.get("title", "").strip():
             row["title"] = r["title"].strip()
+        elif isinstance(listing_obj.get("title"), str) and listing_obj.get("title", "").strip():
+            row["title"] = listing_obj.get("title").strip()
+        elif isinstance(listing_obj.get("name"), str) and listing_obj.get("name", "").strip():
+            row["title"] = listing_obj.get("name").strip()
+        elif isinstance(demand.get("title"), str) and demand.get("title", "").strip():
+            row["title"] = demand.get("title").strip()
+        elif isinstance(demand.get("name"), str) and demand.get("name", "").strip():
+            row["title"] = demand.get("name").strip()
+
+        listing_id_log = str(r.get("id") or "").strip()
+        logger.debug(
+            "[search_title] listing_id=%s title=%r subtitle=%r localized=%r raw_title=%r",
+            listing_id_log, row.get("title"), subtitle, localized, r.get("title"),
+        )
 
         # Availability/min-stay context for filtering and diagnostics.
         avail = _extract_availability_context_from_search_result(r)
@@ -1278,6 +1296,8 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             "country": None,
             "property_type": None,
             "accommodates": None,
+            "title": None,
+            "seo_title": None,
         }
 
         metadata_obj: Optional[Dict[str, Any]] = None
@@ -1323,9 +1343,19 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
         if not isinstance(metadata_obj, dict):
             return out
 
+        seo = metadata_obj.get("seoFeatures")
+        if isinstance(seo, dict):
+            seo_title = seo.get("title")
+            if isinstance(seo_title, str) and seo_title.strip():
+                out["seo_title"] = seo_title.strip()
+
         sharing = metadata_obj.get("sharingConfig")
         if not isinstance(sharing, dict):
             return out
+
+        title = sharing.get("title")
+        if isinstance(title, str) and title.strip():
+            out["title"] = title.strip()
 
         loc = sharing.get("location")
         if isinstance(loc, str) and loc.strip():
@@ -1360,6 +1390,17 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
         if value not in (None, "", 0):
             result[key] = value
 
+    if metadata_ctx.get("seo_title"):
+        # The SEO title is generally reliable and formatted well, e.g. "Take a Dip in Heated Pool at Lux SoCo Retreat..."
+        # Sometimes sharingConfig.title has "Home in Austin - 4.94 - 2 bedrooms", so seoTitle is better if available.
+        seo = metadata_ctx["seo_title"]
+        if " - " in seo:
+            result["title"] = seo.split(" - ")[0].strip()
+        else:
+            result["title"] = seo
+    elif metadata_ctx.get("title"):
+        result["title"] = metadata_ctx["title"]
+
     # 0b) Structural/location extraction from SBUI overview section.
     # This is where Airbnb commonly exposes "3 guests · 1 bedroom · 2 beds · 1 bath".
     overview_ctx = _extract_overview_v2_context(data)
@@ -1369,39 +1410,42 @@ def parse_pdp_response(data: Dict[str, Any], listing_id: str, base_url: str) -> 
             if value not in (None, "", 0):
                 result[key] = value
 
+    if not result["title"]:
+        if isinstance(sections_root, list):
+            for entry in sections_root:
+                if not isinstance(entry, dict):
+                    continue
+                sec = entry.get("section")
+                if not isinstance(sec, dict):
+                    continue
+                title_from_path = sec.get("listingTitle")
+                if isinstance(title_from_path, str) and title_from_path.strip():
+                    result["title"] = title_from_path.strip()
+                    break
 
-    if isinstance(sections_root, list):
-        for entry in sections_root:
-            if not isinstance(entry, dict):
-                continue
-            sec = entry.get("section")
-            if not isinstance(sec, dict):
-                continue
-            title_from_path = sec.get("listingTitle")
-            if isinstance(title_from_path, str) and title_from_path.strip():
-                result["title"] = title_from_path.strip()
+        # 1b) Fallback title extraction with filtering.
+        for d in _walk_dicts(data):
+            if result["title"]:
                 break
-
-    # 1b) Fallback title extraction with filtering.
-    for d in _walk_dicts(data):
-        if result["title"]:
-            break
-        for key in ("listingName", "name", "title", "heading", "seoTitle"):
-            value = d.get(key)
-            if not isinstance(value, str):
-                continue
-            cleaned = value.strip()
-            if len(cleaned) < 8:
-                continue
-            if cleaned.lower() in generic_titles:
-                continue
-            if cleaned.startswith("http") or "$" in cleaned:
-                continue
-            if re.search(r"[A-Za-z]", cleaned):
-                result["title"] = cleaned
+            for key in ("listingName", "name", "title", "heading"):
+                value = d.get(key)
+                if not isinstance(value, str):
+                    continue
+                cleaned = value.strip()
+                if len(cleaned) < 8:
+                    continue
+                if cleaned.lower() in generic_titles:
+                    continue
+                # Reject strings that look like "Jul 11-13" or just dates
+                if re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+(.*)$", cleaned, re.I):
+                    continue
+                if cleaned.startswith("http") or "$" in cleaned:
+                    continue
+                if re.search(r"[A-Za-z]", cleaned):
+                    result["title"] = cleaned
+                    break
+            if result["title"]:
                 break
-        if result["title"]:
-            break
 
     # 2) Minimal metadata extraction (postal/country codes only).
     # Core structural/location fields are intentionally sourced ONLY from:

@@ -34,7 +34,7 @@ from worker.scraper.target_extractor import (
 logger = logging.getLogger("worker.scraper.comp_collection")
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
 _PDP_STRUCTURAL_CACHE_LOCK = threading.Lock()
-_PDP_STRUCTURAL_CACHE: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+_PDP_STRUCTURAL_CACHE: Dict[str, Tuple[Optional[int], Optional[float], str, List[str], str]] = {}
 _PDP_STRUCTURAL_CACHE_LOADED = False
 
 _SUPABASE_STRUCT_LOCK = threading.Lock()
@@ -77,11 +77,13 @@ def _ensure_pdp_structural_cache_loaded_locked() -> None:
         baths = payload.get("baths")
         property_type = payload.get("property_type")
         amenities = payload.get("amenities")
+        title = payload.get("title")
         _PDP_STRUCTURAL_CACHE[sid] = (
             int(accommodates) if isinstance(accommodates, (int, float)) and int(accommodates) > 0 else None,
             float(baths) if isinstance(baths, (int, float)) else None,
             str(property_type or ""),
             [str(a) for a in amenities if isinstance(a, str)] if isinstance(amenities, list) else [],
+            str(title or ""),
         )
 
 
@@ -95,6 +97,7 @@ def _save_pdp_structural_cache_locked() -> None:
             "baths": values[1],
             "property_type": values[2],
             "amenities": values[3],
+            "title": values[4],
         }
         for listing_id, values in _PDP_STRUCTURAL_CACHE.items()
     }
@@ -135,12 +138,12 @@ def _batch_load_supabase_structural_cache(lids: List[str]) -> None:
     try:
         result = (
             sb.table("listing_structural_cache")
-            .select("airbnb_listing_id,accommodates,baths,property_type,amenities")
+            .select("airbnb_listing_id,accommodates,baths,property_type,amenities,title")
             .in_("airbnb_listing_id", lids)
             .execute()
         )
         rows = result.data or []
-        updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+        updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str], str]] = {}
         for row in rows:
             lid = str(row.get("airbnb_listing_id") or "").strip()
             if not lid:
@@ -149,11 +152,12 @@ def _batch_load_supabase_structural_cache(lids: List[str]) -> None:
             baths = row.get("baths")
             property_type = row.get("property_type")
             amenities = row.get("amenities")
+            title = row.get("title")
             a_val = int(accommodates) if isinstance(accommodates, (int, float)) and int(accommodates) > 0 else None
             b_val = float(baths) if isinstance(baths, (int, float)) else None
             p_val = str(property_type or "").strip()
             am_list = [str(a) for a in (amenities or []) if isinstance(a, str)] if isinstance(amenities, list) else []
-            updates[lid] = (a_val, b_val, p_val, am_list)
+            updates[lid] = (a_val, b_val, p_val, am_list, str(title or ""))
         if updates:
             with _PDP_STRUCTURAL_CACHE_LOCK:
                 for lid, entry in updates.items():
@@ -165,7 +169,7 @@ def _batch_load_supabase_structural_cache(lids: List[str]) -> None:
 
 
 def _batch_upsert_supabase_structural_cache(
-    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]],
+    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str], str]],
 ) -> None:
     """Upsert freshly scraped structural data into Supabase listing_structural_cache."""
     if not cache_updates:
@@ -182,6 +186,7 @@ def _batch_upsert_supabase_structural_cache(
                 "baths": vals[1],
                 "property_type": vals[2] or None,
                 "amenities": vals[3],
+                "title": vals[4] or None,
                 "updated_at": now,
             }
             for lid, vals in cache_updates.items()
@@ -414,18 +419,21 @@ def _enrich_comps_baths_and_property_type_from_pdp(
             }
         )
 
-    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str]]] = {}
+    cache_updates: Dict[str, Tuple[Optional[int], Optional[float], str, List[str], str]] = {}
 
-    def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[int], Optional[float], str, List[str]]:
+    def _fetch(query_arg: Dict[str, Any]) -> Tuple[int, Optional[int], Optional[float], str, List[str], str]:
         idx, _comp, lid = query_arg["item"]
         # Skip PDP if the search phase already populated all essential structural fields
-        # (amenities, property_type, baths). Ratings/reviews from search are preserved as-is.
-        if _comp.amenities and _comp.property_type and _comp.baths is not None:
-            return idx, _comp.accommodates, _comp.baths, _comp.property_type, list(_comp.amenities)
+        # (amenities, property_type, baths) and we have a valid title.
+        # Ratings/reviews from search are preserved as-is.
+        if _comp.amenities and _comp.property_type and _comp.baths is not None and _comp.title:
+            return idx, _comp.accommodates, _comp.baths, _comp.property_type, list(_comp.amenities), ""
+        
         cached = _PDP_STRUCTURAL_CACHE.get(str(lid))
         if cached is not None:
-            a_val, b_val, p_val, amenities = cached
-            return idx, a_val, b_val, p_val, list(amenities)
+            a_val, b_val, p_val, amenities, cached_title = cached
+            if _comp.title or cached_title:
+                return idx, a_val, b_val, p_val, list(amenities), cached_title
 
         browser_slot = int(query_arg["browser_slot"])
         slot_client = browser_pool[browser_slot]
@@ -455,17 +463,22 @@ def _enrich_comps_baths_and_property_type_from_pdp(
             b_val = float(baths) if isinstance(baths, (int, float)) else None
             p_val = ptype_norm.strip() if isinstance(ptype_norm, str) and ptype_norm.strip() else ""
             amenities = [a for a in (parsed.get("amenities") or []) if isinstance(a, str) and a.strip()]
-            cache_updates[str(lid)] = (a_val, b_val, p_val, list(amenities))
-            return idx, a_val, b_val, p_val, amenities
+            # Extract title for comps that had no title from the search API.
+            # Avoid the generic "Listing {id}" fallback that parse_pdp_response synthesises.
+            pdp_title = str(parsed.get("title") or "").strip()
+            if pdp_title == f"Listing {lid}":
+                pdp_title = ""
+            cache_updates[str(lid)] = (a_val, b_val, p_val, list(amenities), pdp_title)
+            return idx, a_val, b_val, p_val, amenities, pdp_title
         except Exception:
-            return idx, None, None, "", []
+            return idx, None, None, "", [], ""
 
     # Batch-load Supabase for lids not in local cache and not already fully known.
     with _PDP_STRUCTURAL_CACHE_LOCK:
         lids_needing_supabase = [
             lid for _, comp_item, lid in work_items
             if str(lid) not in _PDP_STRUCTURAL_CACHE
-            and not (comp_item.amenities and comp_item.property_type and comp_item.baths is not None)
+            and not (comp_item.amenities and comp_item.property_type and comp_item.baths is not None and comp_item.title)
         ]
     if lids_needing_supabase:
         _batch_load_supabase_structural_cache(lids_needing_supabase)
@@ -476,9 +489,13 @@ def _enrich_comps_baths_and_property_type_from_pdp(
         with ThreadPoolExecutor(max_workers=effective_workers) as ex:
             futures = [ex.submit(_fetch, query_arg) for query_arg in work_args]
             for f in as_completed(futures):
-                idx, a_val, b_val, p_val, amenities = f.result()
+                idx, a_val, b_val, p_val, amenities, pdp_title = f.result()
                 comp = comps[idx]
                 changed = False
+                # Backfill title from PDP when search API returned nothing.
+                if pdp_title and not comp.title:
+                    comp.title = pdp_title
+                    changed = True
                 if isinstance(a_val, int):
                     if comp.accommodates != int(a_val):
                         comp.accommodates = int(a_val)

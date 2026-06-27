@@ -379,9 +379,16 @@ def similarity_score_with_breakdown(target: ListingSpec, cand: ListingSpec) -> T
     )
 
     # Amenities (3.0) — premium-weighted Jaccard overlap.
+    # If the target has no amenities defined (e.g. criteria-mode with no amenity selection),
+    # skip this dimension entirely (full credit) rather than penalising every comp equally.
     t_set = _normalize_amenity_set(list(target.amenities or []))
     c_set = _normalize_amenity_set(list(cand.amenities or []))
-    am_raw = _weighted_amenity_overlap(t_set, c_set) if (t_set and c_set) else _PARTIAL_MISSING
+    if not t_set:
+        am_raw = 1.0  # target amenities unknown — dimension skipped
+    elif not c_set:
+        am_raw = _PARTIAL_MISSING  # comp amenities unknown
+    else:
+        am_raw = _weighted_amenity_overlap(t_set, c_set)
     add(
         "amenities", _W_AMENITIES, am_raw,
         {"overlap_count": len(t_set & c_set), "union_count": len(t_set | c_set)},

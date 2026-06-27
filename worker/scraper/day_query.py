@@ -361,6 +361,13 @@ def estimate_base_price_for_date(
             comp.property_type = payload.get("property_type") or payload.get("propertyType") or comp.property_type
             if payload.get("amenities"):
                 comp.amenities = list(payload.get("amenities") or [])
+            pool_title = str(payload.get("title") or "").strip()
+            if pool_title:
+                comp.title = pool_title
+            logger.debug(
+                "[day_query] pool_apply cid=%s pool_title=%r comp_title=%r",
+                cid, pool_title, comp.title,
+            )
             out.append(comp)
         return out
 
