@@ -1719,6 +1719,21 @@ def capture_target_live_price(
 
     listing_url = normalize_airbnb_url(listing_url)
 
+    locally_created_client = False
+    playwright_client = None
+
+    def _cleanup():
+        if locally_created_client and client is not None:
+            try:
+                client.close_browser()
+            except Exception:
+                pass
+        if playwright_client is not None:
+            try:
+                playwright_client.close_browser()
+            except Exception:
+                pass
+
     try:
         if client is None:
             from worker.scraper.airbnb_client import AirbnbClient
@@ -1729,6 +1744,8 @@ def capture_target_live_price(
                     "ADULTS": requested_adults,
                 }
             )
+            locally_created_client = True
+
 
         listing_id = extract_listing_id_from_url(listing_url)
         if not listing_id:
@@ -1756,6 +1773,7 @@ def capture_target_live_price(
                     _CONFIDENCE_TO_SOURCE.get(_html_conf, "unknown"),
                     _html_conf,
                 )
+                _cleanup()
                 return {
                     "observedListingPrice": round(float(_html_price)),
                     "observedListingPriceDate": checkin,
@@ -1772,6 +1790,7 @@ def capture_target_live_price(
             pass
 
         if not allow_retry_matrix:
+            _cleanup()
             return {
                 "observedListingPrice": None,
                 "observedListingPriceDate": checkin,
@@ -1785,7 +1804,7 @@ def capture_target_live_price(
                 ),
             }
 
-        playwright_client: Optional[Any] = None
+        playwright_client = None
 
         def _extract_price_for_window(
             _checkin: str,
@@ -1997,6 +2016,7 @@ def capture_target_live_price(
             )
     except Exception as exc:
         logger.warning(f"[target_live_price] HTTP extraction failed: {exc}")
+        _cleanup()
         return {
             "observedListingPrice": None,
             "observedListingPriceDate": checkin,
@@ -2007,6 +2027,7 @@ def capture_target_live_price(
             "livePriceStatusReason": str(exc)[:300],
         }
 
+    _cleanup()
     if price is None:
         return {
             "observedListingPrice": None,

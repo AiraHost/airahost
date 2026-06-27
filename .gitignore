@@ -67,3 +67,7 @@ ml_sidecar/reports/
 /tests/e2e/playwright-report/
 /playwright-report/
 /test-results/
+
+# Local monitoring and restart logs
+scripts/*.log
+
