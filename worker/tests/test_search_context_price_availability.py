@@ -367,6 +367,45 @@ def test_parse_search_context_ceils_direct_nightly_api_decimal_to_display_price(
     assert row["price_nights"] == 1
 
 
+def test_parse_search_context_prefers_primary_line_price_over_accessibility_total():
+    """
+    primaryLine.price is the displayed per-night value and the most accurate one.
+    accessibilityLabel folds small per-night fees into the figure ("$432 for 1
+    night"), shifting the parsed nightly by a few dollars. The parser must use
+    primaryLine.price (430), not the accessibilityLabel amount (432).
+    """
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "price": "$430 USD",
+                                        "accessibilityLabel": "$432 USD for 1 night",
+                                        "qualifier": "night",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] == 430
+    assert row["price_nights"] == 1
+
+
 def test_parse_search_context_ceils_decimal_two_night_total_to_display_price():
     payload = {
         "data": {

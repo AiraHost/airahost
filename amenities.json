@@ -1,0 +1,69 @@
+{
+  "amenities": [
+    {
+      "name": "Hot Tub",
+      "category": "High-Impact Premium Drivers",
+      "description": "Commands a 20-50% price premium in many markets, especially nature or cold-weather destinations."
+    },
+    {
+      "name": "Private Pool",
+      "category": "High-Impact Premium Drivers",
+      "description": "Major driver of high nightly rates in warm climates or summer destinations."
+    },
+    {
+      "name": "EV Charger",
+      "category": "High-Impact Premium Drivers",
+      "description": "Strong differentiator for affluent travelers with electric vehicles."
+    },
+    {
+      "name": "Fire Pits / Outdoor Living Space",
+      "category": "High-Impact Premium Drivers",
+      "description": "Extends usable space and boosts perceived value."
+    },
+    {
+      "name": "Air Conditioning & Heating",
+      "category": "Table Stakes",
+      "description": "Essential for competitive rates, especially central AC in warm climates."
+    },
+    {
+      "name": "Fast, Reliable Wi-Fi",
+      "category": "Table Stakes",
+      "description": "Crucial for almost all travelers; exact high speeds convert bookings."
+    },
+    {
+      "name": "Full Kitchen & Essentials",
+      "category": "Table Stakes",
+      "description": "Allows guests to save on dining, making them willing to spend more on accommodation."
+    },
+    {
+      "name": "In-Unit Washer & Dryer",
+      "category": "Table Stakes",
+      "description": "Non-negotiable filter for guests staying longer than a few days."
+    },
+    {
+      "name": "King-Size Bed & Premium Bedding",
+      "category": "Experience & Niche Boosters",
+      "description": "High ROI investment; appeals to couples and improves sleep ratings."
+    },
+    {
+      "name": "Dedicated Workspace",
+      "category": "Experience & Niche Boosters",
+      "description": "Essential for digital nomads and business travelers booking longer stays."
+    },
+    {
+      "name": "Pet-Friendly",
+      "category": "Experience & Niche Boosters",
+      "description": "Opens listing to massive segment; allows for pet fees or higher rates."
+    },
+    {
+      "name": "Family/Kid Essentials",
+      "category": "Experience & Niche Boosters",
+      "description": "Items like Pack 'n Play and high chair drive conversions for family bookings."
+    },
+    {
+      "name": "Smart Locks & Self Check-in",
+      "category": "Experience & Niche Boosters",
+      "description": "Reduces friction and appeals to guests who prefer privacy or arrive late."
+    }
+  ]
+}

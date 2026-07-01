@@ -84,6 +84,11 @@ AUTO_APPLY_STALE_MINUTES = int(os.getenv("AUTO_APPLY_STALE_MINUTES", "15"))
 AUTO_APPLY_MAX_ATTEMPTS = int(os.getenv("AUTO_APPLY_MAX_ATTEMPTS", "3"))
 AUTO_APPLY_CDP_URL = os.getenv("AUTO_APPLY_CDP_URL", CDP_URL)
 AIRBNB_AUTH_CHECK_EVERY_TASKS = max(0, int(os.getenv("AIRBNB_AUTH_CHECK_EVERY_TASKS", "50")))
+# Startup auto-login retries: re-run the login flow and re-verify login state up
+# to N times per browser slot before giving up (login can fail transiently —
+# slow hydration, delayed code email, a submit that didn't advance).
+AIRBNB_AUTOLOGIN_MAX_ATTEMPTS = max(1, int(os.getenv("AIRBNB_AUTOLOGIN_MAX_ATTEMPTS", "3")))
+AIRBNB_AUTOLOGIN_RETRY_SLEEP_SECONDS = max(0, int(os.getenv("AIRBNB_AUTOLOGIN_RETRY_SLEEP_SECONDS", "6")))
 
 NIGHTLY_QUEUE_ML_FORECAST = str(
     os.getenv("NIGHTLY_QUEUE_ML_FORECAST", "1")
@@ -326,6 +331,7 @@ def _maybe_run_startup_auto_login() -> None:
         cdp_urls,
     )
 
+    _state_label = {True: "logged_in", False: "logged_out", None: "unavailable"}
     all_slots_verified = True
     for idx, cdp_url in enumerate(cdp_urls):
         auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
@@ -336,44 +342,48 @@ def _maybe_run_startup_auto_login() -> None:
                 cdp_url,
             )
             continue
-        if auth_state is None:
-            logger.warning(
-                "Startup Airbnb auth probe: slot=%s cdp=%s unavailable; cannot verify login state.",
-                idx + 1,
-                cdp_url,
-            )
-            all_slots_verified = False
-            continue
 
+        # Not confirmed logged in (logged out, or probe unavailable) — attempt the
+        # auto-login flow with retries, re-verifying login state after each try.
         logger.warning(
-            "Startup Airbnb auth probe: slot=%s cdp=%s appears logged out. Running auto-login flow.",
+            "Startup Airbnb auth probe: slot=%s cdp=%s state=%s. Running auto-login (up to %s attempts).",
             idx + 1,
             cdp_url,
+            _state_label.get(auth_state, "unknown"),
+            AIRBNB_AUTOLOGIN_MAX_ATTEMPTS,
         )
-        ran = _run_startup_auto_login_for_cdp(cdp_url, idx)
-        if not ran:
-            all_slots_verified = False
-            continue
+        logged_in = False
+        for attempt in range(1, AIRBNB_AUTOLOGIN_MAX_ATTEMPTS + 1):
+            ran = _run_startup_auto_login_for_cdp(cdp_url, idx)
+            post_auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
+            if post_auth_state is True:
+                logger.info(
+                    "Startup auto-login succeeded: slot=%s cdp=%s on attempt=%s/%s.",
+                    idx + 1,
+                    cdp_url,
+                    attempt,
+                    AIRBNB_AUTOLOGIN_MAX_ATTEMPTS,
+                )
+                logged_in = True
+                break
+            logger.warning(
+                "Startup auto-login not verified: slot=%s cdp=%s attempt=%s/%s ran=%s post_state=%s.",
+                idx + 1,
+                cdp_url,
+                attempt,
+                AIRBNB_AUTOLOGIN_MAX_ATTEMPTS,
+                ran,
+                _state_label.get(post_auth_state, "unknown"),
+            )
+            if attempt < AIRBNB_AUTOLOGIN_MAX_ATTEMPTS and AIRBNB_AUTOLOGIN_RETRY_SLEEP_SECONDS > 0:
+                time.sleep(AIRBNB_AUTOLOGIN_RETRY_SLEEP_SECONDS)
 
-        post_auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
-        if post_auth_state is True:
-            logger.info(
-                "Startup auto-login completed: slot=%s cdp=%s now appears logged in.",
-                idx + 1,
-                cdp_url,
-            )
-        elif post_auth_state is False:
+        if not logged_in:
             logger.warning(
-                "Startup auto-login completed: slot=%s cdp=%s still appears logged out.",
+                "Startup auto-login: slot=%s cdp=%s could not be logged in after %s attempts.",
                 idx + 1,
                 cdp_url,
-            )
-            all_slots_verified = False
-        else:
-            logger.warning(
-                "Startup auto-login completed: slot=%s cdp=%s state not verifiable.",
-                idx + 1,
-                cdp_url,
+                AIRBNB_AUTOLOGIN_MAX_ATTEMPTS,
             )
             all_slots_verified = False
 

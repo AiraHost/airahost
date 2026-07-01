@@ -5,7 +5,7 @@ import unittest
 from typing import Any, Dict, List
 
 from worker.scraper.parsers import parse_search_response
-from worker.scraper.playwright_scraper import PlaywrightScraper
+from worker.scraper.playwright_scraper import PUBLIC_AIRBNB_API_KEY, PlaywrightScraper
 
 
 def _make_template() -> Dict[str, Any]:
@@ -111,7 +111,71 @@ class FetchSearchDirectTest(unittest.TestCase):
     def test_no_template_returns_none(self):
         scraper = _new_scraper()
         scraper.captured_search_req = None
+        scraper.hardcoded_search_req = None
         self.assertIsNone(scraper.fetch_search_direct({"checkin": "2026-06-27"}))
+
+    def test_hardcoded_template_used_when_no_capture(self):
+        # Browser-free cold start: no live capture, fall back to the hardcoded
+        # template so comparable search still runs (stl-scraper technique).
+        scraper = _new_scraper()
+        scraper.captured_search_req = None
+        scraper.hardcoded_search_req = _make_template()
+        scraper.session = _FakeSession([_FakeResponse(200, _ok_payload(["555"]))])
+        result = scraper.fetch_search_direct({"checkin": "2026-06-27", "checkout": "2026-06-28"})
+        self.assertIsNotNone(result)
+        _status, data = result
+        self.assertEqual(parse_search_response(data), ["555"])
+
+    def test_template_generalized_strips_pinned_location_and_realigns_cursor(self):
+        # A recorded template carries the captured search's placeId/session/flex
+        # params and a page-N cursor. Replaying for a different location/offset
+        # must strip those (placeId wins over query at Airbnb) and rebuild the
+        # cursor, else every replay echoes the captured city/page.
+        scraper = _new_scraper()
+        tmpl = _make_template()
+        sr = tmpl["post_data"]["variables"]["staysSearchRequest"]
+        sr["cursor"] = "OLD_PAGE_2_CURSOR"
+        sr["rawParams"].extend(
+            [
+                {"filterName": "placeId", "filterValues": ["AUSTIN_PLACE_ID"]},
+                {"filterName": "federatedSearchSessionId", "filterValues": ["sess-123"]},
+                {"filterName": "flexibleTripLengths", "filterValues": ["one_week"]},
+            ]
+        )
+        scraper.captured_search_req = tmpl
+        scraper.session = _FakeSession(
+            [_FakeResponse(200, _ok_payload(["1"])), _FakeResponse(200, _ok_payload(["2"]))]
+        )
+
+        # First page: pinned params dropped, cursor reset to None.
+        scraper.fetch_search_direct({"query": "Seattle, Washington"})
+        sent = scraper.session.calls[0]["json"]["variables"]["staysSearchRequest"]
+        by_name = {p["filterName"]: p["filterValues"] for p in sent["rawParams"]}
+        self.assertNotIn("placeId", by_name)
+        self.assertNotIn("federatedSearchSessionId", by_name)
+        self.assertNotIn("flexibleTripLengths", by_name)
+        self.assertEqual(by_name["query"], ["Seattle, Washington"])
+        self.assertIsNone(sent["cursor"])
+
+        # Deep offset: cursor encodes the requested items_offset.
+        scraper.fetch_search_direct({"query": "Seattle, Washington", "itemsOffset": 40})
+        sent2 = scraper.session.calls[1]["json"]["variables"]["staysSearchRequest"]
+        import base64
+        import json as _json
+
+        decoded = _json.loads(base64.b64decode(sent2["cursor"]))
+        self.assertEqual(decoded["items_offset"], 40)
+
+    def test_public_api_key_header_forced(self):
+        scraper = _new_scraper()
+        # Template carries a stale/wrong api key; the sent request must override it.
+        template = _make_template()
+        template["headers"]["x-airbnb-api-key"] = "stale-key"
+        scraper.captured_search_req = template
+        scraper.session = _FakeSession([_FakeResponse(200, _ok_payload(["111"]))])
+        scraper.fetch_search_direct({"checkin": "2026-06-27"})
+        sent_headers = scraper.session.calls[0]["headers"]
+        self.assertEqual(sent_headers["x-airbnb-api-key"], PUBLIC_AIRBNB_API_KEY)
 
     def test_try_direct_search_falls_back_on_challenge(self):
         scraper = _new_scraper()

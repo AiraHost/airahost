@@ -312,21 +312,34 @@ function ComparableCard({
   const hasDisplayPrice =
     typeof displayPrice === "number" && Number.isFinite(displayPrice) && displayPrice > 0;
   const detailForDate = selectedDate ? listing.priceByDateDetails?.[selectedDate] : undefined;
-  const queryNights =
-    selectedDate && detailForDate?.queryNights != null
-      ? detailForDate.queryNights
-      : listing.queryNights != null
-        ? listing.queryNights
-        : 1;
+  // When a date is selected, the shown price is that date's scraped price, so its
+  // query window must come from that date's own detail. Falling back to the
+  // listing-level queryNights (a max across all sampled days) would apply a
+  // 2-night window to a date priced from a 1-night query and render
+  // "price × 2" as the total — e.g. a $507 1-night price shown as $1,014 for
+  // 2 nights, when the real discounted 2-night booking total is lower. A date
+  // whose detail carries no queryNights is a 1-night price.
+  // The listing-level value is only used for the no-date general view.
+  const queryNights = selectedDate
+    ? detailForDate?.queryNights ?? 1
+    : listing.queryNights ?? 1;
+  // Prefer an explicit trip total for the resolved window; only fall back to
+  // price × nights when the per-night value genuinely came from that N-night
+  // query (so price × N == the real total). Never mix a 1-night price with a
+  // multi-night window.
+  const resolvedTotalPrice = selectedDate
+    ? typeof detailForDate?.queryTotalPrice === "number" && detailForDate.queryTotalPrice > 0
+      ? detailForDate.queryTotalPrice
+      : null
+    : typeof listing.queryTotalPrice === "number" && listing.queryTotalPrice > 0
+      ? listing.queryTotalPrice
+      : null;
   const queryTotalPrice =
     queryNights > 1
-      ? typeof detailForDate?.queryTotalPrice === "number" && detailForDate.queryTotalPrice > 0
-        ? detailForDate.queryTotalPrice
-        : typeof listing.queryTotalPrice === "number" && listing.queryTotalPrice > 0
-          ? listing.queryTotalPrice
-        : typeof displayPrice === "number" && displayPrice > 0
+      ? resolvedTotalPrice ??
+        (typeof displayPrice === "number" && displayPrice > 0
           ? Number((displayPrice * queryNights).toFixed(2))
-          : null
+          : null)
       : null;
 
   // When a specific date is selected, append checkin/checkout so the Airbnb

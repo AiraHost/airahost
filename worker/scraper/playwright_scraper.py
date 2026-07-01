@@ -18,8 +18,15 @@ from playwright.async_api import async_playwright
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.rate_limiter import get_airbnb_rate_limiter
 from worker.scraper.stayspdp_template import HARDCODED_STAYS_PDP_TEMPLATE
+from worker.scraper.stayssearch_template import HARDCODED_STAYS_SEARCH_TEMPLATE
 
 logger = logging.getLogger(__name__)
+
+# Airbnb's public web API key — the same value the browser sends on every
+# GraphQL call. Mirrors the stl-scraper technique (github.com/JoeBashe/stl-scraper):
+# authenticate StaysSearch over plain HTTP with this public api-key header
+# instead of relying on a captured browser tab / session headers.
+PUBLIC_AIRBNB_API_KEY = "d306zoyjsyarp7ifhu67rjxn52tv0t20"
 
 
 class AirbnbRateLimited(RuntimeError):
@@ -56,8 +63,13 @@ class PlaywrightScraper:
         self.locale = _configured_locale if _configured_locale.lower().startswith("en") else "en-CA"
         self.currency = "USD"
         self.session = requests.Session()
+        # Direct-HTTP replays must carry the logged-in CDP browser's cookies —
+        # Airbnb returns different prices to logged-out sessions. Warmed lazily
+        # on first direct fetch (see _ensure_session_cookies_from_browser).
+        self._session_cookies_warmed = False
         self.captured_search_req = None
         self.captured_pdp_req = None
+        self.hardcoded_search_req: Optional[Dict[str, Any]] = None
         disable_map_cfg = self.config.get("DISABLE_MAP_SEARCH", None)
         if disable_map_cfg is None:
             self.disable_map_search = bool(
@@ -91,6 +103,14 @@ class PlaywrightScraper:
             )
         else:
             self.use_hardcoded_stayspdp_template = bool(hardcoded_pdp_cfg)
+        hardcoded_search_cfg = self.config.get("USE_HARDCODED_STAYSSEARCH_TEMPLATE", None)
+        if hardcoded_search_cfg is None:
+            self.use_hardcoded_stayssearch_template = bool(
+                str(os.getenv("AIRBNB_USE_HARDCODED_STAYSSEARCH_TEMPLATE", "1")).strip().lower()
+                not in ("0", "false", "no", "off")
+            )
+        else:
+            self.use_hardcoded_stayssearch_template = bool(hardcoded_search_cfg)
         # Cache unresolved PDP booking windows to avoid repeated expensive
         # template recaptures when Airbnb consistently returns NOT_COMPLETE.
         self._pdp_unresolved_windows: Dict[str, float] = {}
@@ -116,6 +136,8 @@ class PlaywrightScraper:
         self._ensure_tab_gate()
         if self.use_hardcoded_stayspdp_template:
             self._load_hardcoded_stayspdp_template()
+        if self.use_hardcoded_stayssearch_template:
+            self._load_hardcoded_stayssearch_template()
 
     @staticmethod
     def _normalize_base_url(raw_base: Any) -> str:
@@ -495,6 +517,54 @@ class PlaywrightScraper:
         logger.info("Loaded hardcoded StaysPdpSections template.")
         return True
 
+    def _load_hardcoded_stayssearch_template(self) -> bool:
+        if not isinstance(HARDCODED_STAYS_SEARCH_TEMPLATE, dict):
+            return False
+        required = ("url", "headers", "post_data")
+        if not all(key in HARDCODED_STAYS_SEARCH_TEMPLATE for key in required):
+            return False
+        template = copy.deepcopy(HARDCODED_STAYS_SEARCH_TEMPLATE)
+        safe_base = self._normalize_base_url(self.base_url)
+        currency = str(self.currency or "USD").upper()
+        locale = str(self.locale or "en-CA")
+
+        def _force_param(query: str, name: str, value: str) -> str:
+            q = str(query or "")
+            if not q:
+                return f"{name}={value}"
+            if re.search(rf"(^|&){re.escape(name)}=", q, flags=re.I):
+                return re.sub(
+                    rf"(^|&){re.escape(name)}=[^&]*",
+                    lambda m: f"{m.group(1)}{name}={value}",
+                    q,
+                    count=1,
+                    flags=re.I,
+                )
+            return f"{q}&{name}={value}"
+
+        def _normalize_query(query: str) -> str:
+            return _force_param(_force_param(query, "currency", currency), "locale", locale)
+
+        try:
+            raw_url = str(template.get("url") or "").strip()
+            if raw_url:
+                parsed = urlparse(raw_url)
+                normalized_query = _normalize_query(parsed.query)
+                query = f"?{normalized_query}" if normalized_query else ""
+                template["url"] = f"{safe_base}{parsed.path}{query}"
+            headers = template.get("headers")
+            if isinstance(headers, dict):
+                raw_referer = str(headers.get("referer") or "").strip()
+                if raw_referer:
+                    parsed_ref = urlparse(raw_referer)
+                    query_ref = f"?{parsed_ref.query}" if parsed_ref.query else ""
+                    headers["referer"] = f"{safe_base}{parsed_ref.path}{query_ref}"
+        except Exception:
+            pass
+        self.hardcoded_search_req = template
+        logger.info("Loaded hardcoded StaysSearch template.")
+        return True
+
     def _cookies_to_records(self):
         records = []
         for c in self.session.cookies:
@@ -571,11 +641,14 @@ class PlaywrightScraper:
         clone.locale = self.locale
         clone.currency = self.currency
         clone.session = requests.Session()
+        clone._session_cookies_warmed = self._session_cookies_warmed
         clone.captured_search_req = copy.deepcopy(self.captured_search_req)
         clone.captured_pdp_req = copy.deepcopy(self.captured_pdp_req)
+        clone.hardcoded_search_req = copy.deepcopy(self.hardcoded_search_req)
         clone.disable_map_search = self.disable_map_search
         clone.enable_ai_search = self.enable_ai_search
         clone.use_hardcoded_stayspdp_template = self.use_hardcoded_stayspdp_template
+        clone.use_hardcoded_stayssearch_template = self.use_hardcoded_stayssearch_template
         clone.cache_path = self.cache_path
         clone.session_max_age_seconds = self.session_max_age_seconds
         clone.refresh_cooldown_seconds = self.refresh_cooldown_seconds
@@ -1395,6 +1468,31 @@ class PlaywrightScraper:
         # Do not mutate context cookies from requests.Session.
         return
 
+    def _ensure_session_cookies_from_browser(self) -> None:
+        """
+        Pull the logged-in CDP browser profile's cookies into self.session so
+        direct-HTTP replays (search + PDP) are authenticated. Airbnb serves
+        different prices to logged-out sessions (e.g. $297 vs the logged-in $299),
+        so an unauthenticated requests.Session yields the wrong price. Runs once
+        per client (idempotent); failures fall through to the unauthenticated
+        session, matching prior behavior.
+        """
+        if self._session_cookies_warmed:
+            return
+        try:
+            async def _warm() -> None:
+                context = await self._get_thread_context()
+                await self._sync_context_cookies_into_session(context)
+
+            self._run_async(_warm(), op_name="warm_session_cookies")
+            self._session_cookies_warmed = True
+            logger.info(
+                "[session] warmed %s cookies from CDP browser for direct-HTTP replay",
+                len(self.session.cookies),
+            )
+        except Exception as exc:
+            logger.debug("[session] cookie warm from CDP browser failed: %s", exc)
+
     async def _sync_context_cookies_into_session(self, context) -> None:
         try:
             context_cookies = await context.cookies()
@@ -2029,7 +2127,9 @@ class PlaywrightScraper:
         self, overrides: Dict[str, Any]
     ) -> Optional[Tuple[int, Dict[str, Any]]]:
         """Attempt StaysSearch via direct HTTP; return None to signal browser fallback."""
-        if not isinstance(self.captured_search_req, dict):
+        if not isinstance(self.captured_search_req, dict) and not isinstance(
+            self.hardcoded_search_req, dict
+        ):
             return None
         try:
             result = self.fetch_search_direct(overrides)
@@ -2129,6 +2229,9 @@ class PlaywrightScraper:
         """
         if not self.captured_pdp_req:
             return None
+        # Authenticate with the logged-in browser's cookies (logged-out PDP
+        # prices differ from logged-in ones).
+        self._ensure_session_cookies_from_browser()
         tmpl = copy.deepcopy(self.captured_pdp_req)
         lid = str(listing_id)
         stay_gid = self._to_global_id("StayListing", lid)
@@ -2244,6 +2347,51 @@ class PlaywrightScraper:
                 if ov.get(key) is not None:
                     _set_all(key, [str(ov[key])])
 
+        amenity_ids = ov.get("amenityIds")
+        if amenity_ids and isinstance(amenity_ids, list):
+            _set_all("amenities", [str(aid) for aid in amenity_ids if aid is not None])
+
+        # ── Generalize a captured/hardcoded template to the requested search ──
+        # A recorded template carries the location/session/pagination state of
+        # wherever it was captured (a specific placeId, a page-N cursor, flexible
+        # /monthly-date params). Airbnb resolves location from placeId over the
+        # query string, so without stripping these every replay would echo the
+        # captured city/page regardless of the overrides above. Drop the pinned
+        # params so the search is driven purely by query + dates + map bounds.
+        for name in (
+            "placeId",
+            "federatedSearchSessionId",
+            "monthlyStartDate",
+            "monthlyLength",
+            "monthlyEndDate",
+            "flexibleTripLengths",
+        ):
+            for rp in raw_targets:
+                self._remove_raw_param(rp, name)
+
+        # Realign the pagination cursor. Modern StaysSearch paginates by an
+        # opaque base64 cursor (not the itemsOffset rawParam), so encode the
+        # requested offset into a fresh cursor: None for the first page, else the
+        # captured cursor's shape with the new items_offset.
+        new_cursor: Optional[str] = None
+        offset_val = ov.get("itemsOffset")
+        if offset_val is not None:
+            try:
+                cursor_payload = {
+                    "section_offset": 0,
+                    "items_offset": int(offset_val),
+                    "version": 1,
+                }
+                new_cursor = base64.b64encode(
+                    json.dumps(cursor_payload, separators=(",", ":")).encode("utf-8")
+                ).decode("utf-8")
+            except (TypeError, ValueError):
+                new_cursor = None
+        for key in ("staysSearchRequest", "staysMapSearchRequestV2"):
+            node = variables.get(key)
+            if isinstance(node, dict) and "cursor" in node:
+                node["cursor"] = new_cursor
+
         # Honor the disable-map-search toggle the same way the browser path would.
         self._apply_disable_map_search({"variables": variables})
 
@@ -2251,16 +2399,23 @@ class PlaywrightScraper:
         self, overrides: Dict[str, Any]
     ) -> Optional[Tuple[int, Dict[str, Any]]]:
         """
-        Direct HTTP POST to StaysSearch using a captured request template and
-        session cookies — no browser tab. Returns (status, data) on success, or
-        None when no template is available or the request failed (caller should
-        then fall back to the browser path).
+        Direct HTTP POST to StaysSearch — no browser tab. Returns (status, data)
+        on success, or None when no template is available or the request failed
+        (caller should then fall back to the browser path).
+
+        Template selection mirrors the StaysPdpSections direct path: prefer a
+        live browser-captured request (freshest persisted-query hash + headers),
+        otherwise use the hardcoded template so comparable search works
+        browser-free from a cold start (stl-scraper technique).
         """
-        tmpl = self.captured_search_req
+        tmpl = self.captured_search_req or self.hardcoded_search_req
         if not isinstance(tmpl, dict) or not tmpl.get("url") or not isinstance(
             tmpl.get("post_data"), dict
         ):
             return None
+        # Authenticate the replay with the logged-in browser's cookies so the
+        # search prices match what a logged-in guest sees.
+        self._ensure_session_cookies_from_browser()
         tmpl = copy.deepcopy(tmpl)
         # Pin currency=USD and an English locale on the replayed StaysSearch URL
         # so results stay priced in USD and returned in English even if the
@@ -2276,6 +2431,10 @@ class PlaywrightScraper:
             return None
 
         headers = self._sanitize_captured_headers(dict(tmpl.get("headers") or {}))
+        # Authenticate with the public web api-key header (stl-scraper technique)
+        # so StaysSearch succeeds over plain HTTP without a browser tab, even when
+        # the captured/hardcoded headers are missing or stale.
+        headers["x-airbnb-api-key"] = PUBLIC_AIRBNB_API_KEY
         rand_str = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
         headers["x-client-request-id"] = rand_str(30)
         headers["x-client-trace-id"] = rand_str(30)
@@ -2367,6 +2526,9 @@ class PlaywrightScraper:
             return None
         # Direct replay relies on authenticated session cookies; without them the
         # request would be challenged, so let the browser path handle it instead.
+        # Warm cookies from the logged-in CDP browser first so the session is
+        # populated (and the price reflects the logged-in guest).
+        self._ensure_session_cookies_from_browser()
         if len(self.session.cookies) == 0:
             return None
         try:

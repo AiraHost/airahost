@@ -569,6 +569,9 @@ def collect_search_comps(
     pdp_structural_enrichment_limit: Optional[int] = None,
     prefer_two_night: bool = False,
     prefer_one_night: bool = False,
+    target_amenity_ids: Optional[List[int]] = None,
+    min_priced_target: Optional[int] = None,
+    span_nights: Optional[int] = None,
 ) -> Tuple[List[ListingSpec], int]:
     collect_start = time.perf_counter()
     base_origin = safe_domain_base(str(base_origin or "https://www.airbnb.com"))
@@ -599,9 +602,12 @@ def collect_search_comps(
 
     # Default: 1-night primary, 2-night fallback.
     # Optional modes:
+    #   - span_nights=N          -> single N-night window (e.g. pool discovery)
     #   - prefer_two_night=True  -> 2-night only
     #   - prefer_one_night=True  -> 1-night only
-    if prefer_two_night:
+    if span_nights is not None and int(span_nights) > 0:
+        query_night_sequence = (int(span_nights),)
+    elif prefer_two_night:
         query_night_sequence = (2,)
     elif prefer_one_night:
         query_night_sequence = (1,)
@@ -649,6 +655,8 @@ def collect_search_comps(
                     overrides["swLng"] = sw_lng
                 # Explicitly disable Guest Favorite filter for raw search requests.
                 overrides["guestFavorite"] = False
+                if target_amenity_ids:
+                    overrides["amenityIds"] = list(target_amenity_ids)
                 if target_accommodates is not None:
                     overrides["guests"] = int(target_accommodates)
                 # Structural filter boundaries based on Medium-tier similarity tolerances
@@ -868,7 +876,14 @@ def collect_search_comps(
                 round((time.perf_counter() - collect_start) * 1000),
             )
 
-            priced_target = page_size
+            # Stop paging once min_priced_target available comps are found (default
+            # keeps the legacy full-page target). Deeper offsets are only scanned
+            # when the first page yields fewer than the target.
+            priced_target = (
+                page_size
+                if min_priced_target is None
+                else max(1, min(int(min_priced_target), page_size))
+            )
             enough_priced = len(priced) >= priced_target
             exhausted_offsets = offset_set_idx >= len(offset_sets) - 1
             explicit_offsets = page_offsets is not None

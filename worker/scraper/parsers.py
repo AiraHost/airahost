@@ -1024,20 +1024,13 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                     if _mentions_original_price(accessibility_label):
                         price_text = accessibility_label
                     else:
+                        # primaryLine.price is the nightly figure Airbnb shows on
+                        # the search card and is the most accurate per-night value.
+                        # Use it directly — do NOT substitute the accessibilityLabel
+                        # amount, which folds small per-night fees into the displayed
+                        # total and shifts the parsed nightly by a few dollars
+                        # (e.g. primaryLine $430 vs accessibilityLabel "$432 for 1 night").
                         price_text = primary.get("price")
-                        # accessibilityLabel is what Airbnb renders on the search card.
-                        # When it contains "for N nights" and its amount differs from
-                        # primaryLine.price, prefer it — primaryLine.price can be an
-                        # accommodation-only subtotal that omits small per-night charges
-                        # folded into the displayed total (e.g. $1,394 vs $1,403).
-                        if (
-                            isinstance(accessibility_label, str)
-                            and re.search(r"\bfor\s+\d+\s+nights?\b", accessibility_label, re.I)
-                        ):
-                            al_val, _ = _parse_dollar_amount_currency(accessibility_label)
-                            pt_val, _ = _parse_dollar_amount_currency(price_text or "")
-                            if isinstance(al_val, float) and al_val > 0 and al_val != pt_val:
-                                price_text = accessibility_label
 
                 # Exact payload rule:
                 # if available=true and primaryLine.price is '$<num> <ccy>',

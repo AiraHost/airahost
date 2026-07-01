@@ -38,8 +38,7 @@ from worker.core.similarity import (
     similarity_score,
 )
 from worker.scraper.comp_collection import collect_search_comps
-from worker.scraper.parsers import parse_pdp_response, parse_search_listing_context
-from worker.scraper.price_normalizer import nightly_price_from_parsed_pdp
+from worker.scraper.parsers import parse_search_listing_context
 from worker.scraper.target_extractor import (
     ListingSpec,
     location_looks_like_placeholder,
@@ -66,12 +65,9 @@ FIXED_COMP_DEEP_MIN_HITS = int(os.getenv("FIXED_COMP_DEEP_MIN_HITS", "4"))
 FIXED_COMP_MIN_PRICED = int(os.getenv("FIXED_COMP_MIN_PRICED", "4"))
 MAP_RADIUS_CAP_KM = 8.0 * 1.609344  # exactly 8 miles
 MIN_DAILY_COMPS_PER_DAY = max(1, int(os.getenv("MIN_DAILY_COMPS_PER_DAY", "10")))
-DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "50"))
-DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "25"))
-DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "25"))
-DAY_QUERY_PDP_REVALIDATE_TOP_N = max(
-    0, int(os.getenv("DAY_QUERY_PDP_REVALIDATE_TOP_N", "0"))
-)
+DAY_MIN_SCAN_TOTAL = int(os.getenv("DAY_QUERY_MIN_SCAN_TOTAL", "80"))
+DAY_ONE_NIGHT_COMP_TARGET = int(os.getenv("DAY_ONE_NIGHT_COMP_TARGET", "40"))
+DAY_TWO_NIGHT_COMP_TARGET = int(os.getenv("DAY_TWO_NIGHT_COMP_TARGET", "40"))
 
 # Relaxed similarity floor — used when the strict floor yields zero comps for a day.
 # Comps in range [SIMILARITY_FLOOR_FALLBACK, SIMILARITY_FLOOR) are accepted only when
@@ -223,94 +219,6 @@ def _get_locked_search_location(client, target: ListingSpec) -> str:
     return canonical
 
 
-def _revalidate_top_comp_prices_with_pdp(
-    client,
-    ranked_comps: List[Tuple[ListingSpec, float]],
-    *,
-    date_i: date,
-    adults: int,
-    top_n: int,
-) -> Dict[str, int]:
-    """
-    Revalidate top comparable prices from PDP for the exact queried date window.
-
-    StaysSearch prices can drift from PDP booking-widget nightly prices by a few
-    dollars. This updates ListingSpec.nightly_price in place for top-ranked comps.
-    """
-    if top_n <= 0 or not ranked_comps:
-        return {"attempted": 0, "updated": 0}
-
-    attempted = 0
-    updated = 0
-    for comp, _score in ranked_comps:
-        if attempted >= top_n:
-            break
-
-        comp_url = str(comp.url or "").strip()
-        comp_id = build_comp_id(comp_url)
-        if not comp_url or not str(comp_id).isdigit():
-            continue
-
-        nights = max(1, int(comp.scrape_nights or 1))
-        checkin = date_i.isoformat()
-        checkout = (date_i + timedelta(days=nights)).isoformat()
-        attempted += 1
-
-        try:
-            pdp_data = client.get_listing_details(
-                str(comp_id),
-                checkin=checkin,
-                checkout=checkout,
-                adults=adults,
-            )
-            parsed = parse_pdp_response(
-                pdp_data,
-                str(comp_id),
-                safe_domain_base(comp_url),
-            )
-            pdp_total = parsed.get("total_price")
-            pdp_nightly = nightly_price_from_parsed_pdp(
-                parsed,
-                stay_nights=nights,
-                source="pdp",
-            )
-            if not isinstance(pdp_nightly, (int, float)) or pdp_nightly <= 0:
-                continue
-
-            old_price = comp.nightly_price
-            new_price = round(float(pdp_nightly), 2)
-            comp.nightly_price = new_price
-            comp.currency = str(parsed.get("currency") or comp.currency or "USD")
-            comp.price_kind = "nightly_from_pdp"
-            if nights > 1:
-                if isinstance(pdp_total, (int, float)) and pdp_total > 0:
-                    comp.query_total_price = round(float(pdp_total), 2)
-
-            if not isinstance(old_price, (int, float)) or round(float(old_price), 2) != new_price:
-                updated += 1
-                logger.info(
-                    "[day_query] %s: pdp price revalidated listing=%s nights=%s search_price=%s pdp_price=%s delta=%s",
-                    checkin,
-                    comp_id,
-                    nights,
-                    old_price,
-                    new_price,
-                    (
-                        round(new_price - float(old_price), 2)
-                        if isinstance(old_price, (int, float))
-                        else None
-                    ),
-                )
-        except Exception as exc:
-            logger.info(
-                "[day_query] %s: pdp revalidation skipped listing=%s reason=%s",
-                checkin,
-                comp_id,
-                str(exc)[:200],
-            )
-
-    return {"attempted": attempted, "updated": updated}
-
 
 def estimate_base_price_for_date(
     client,
@@ -328,7 +236,7 @@ def estimate_base_price_for_date(
     max_radius_km: Optional[float] = None,
     known_comp_pool: Optional[Dict[str, Dict[str, Any]]] = None,
     allow_relaxed_similarity: bool = True,
-    pdp_structural_enrichment_limit: Optional[int] = None,
+    target_amenity_ids: Optional[List[int]] = None,
 ) -> DayResult:
     """
     Execute a 1-night Airbnb search for date_i -> date_i+1.
@@ -342,32 +250,29 @@ def estimate_base_price_for_date(
     checkin_str = date_i.isoformat()
     is_weekend = date_i.weekday() >= 4  # Fri=4, Sat=5
     use_known_pool = bool(known_comp_pool)
+    _pool_cids: set[str] = set(known_comp_pool.keys()) if known_comp_pool else set()
 
     def _apply_known_pool_fields(comps_in: List[ListingSpec]) -> List[ListingSpec]:
+        """Apply stored pool data to pool members; pass all comps through."""
         if not known_comp_pool:
             return comps_in
         out: List[ListingSpec] = []
         for comp in comps_in:
             cid = build_comp_id(comp.url or "")
             payload = (known_comp_pool or {}).get(str(cid or ""))
-            if not cid or not payload:
-                continue
-            comp.accommodates = payload.get("accommodates")
-            comp.bedrooms = payload.get("bedrooms")
-            comp.beds = payload.get("beds")
-            comp.baths = payload.get("baths")
-            comp.rating = payload.get("rating")
-            comp.reviews = payload.get("reviews")
-            comp.property_type = payload.get("property_type") or payload.get("propertyType") or comp.property_type
-            if payload.get("amenities"):
-                comp.amenities = list(payload.get("amenities") or [])
-            pool_title = str(payload.get("title") or "").strip()
-            if pool_title:
-                comp.title = pool_title
-            logger.debug(
-                "[day_query] pool_apply cid=%s pool_title=%r comp_title=%r",
-                cid, pool_title, comp.title,
-            )
+            if cid and payload:
+                comp.accommodates = payload.get("accommodates")
+                comp.bedrooms = payload.get("bedrooms")
+                comp.beds = payload.get("beds")
+                comp.baths = payload.get("baths")
+                comp.rating = payload.get("rating")
+                comp.reviews = payload.get("reviews")
+                comp.property_type = payload.get("property_type") or payload.get("propertyType") or comp.property_type
+                if payload.get("amenities"):
+                    comp.amenities = list(payload.get("amenities") or [])
+                pool_title = str(payload.get("title") or "").strip()
+                if pool_title:
+                    comp.title = pool_title
             out.append(comp)
         return out
 
@@ -400,9 +305,10 @@ def estimate_base_price_for_date(
                 center_lng=query_center_lng,
                 map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
                 target_accommodates=None if use_known_pool else target.accommodates,
-                pdp_structural_enrichment=not use_known_pool,
-                pdp_structural_enrichment_limit=pdp_structural_enrichment_limit,
+                pdp_structural_enrichment=False,
                 prefer_one_night=True,
+                target_amenity_ids=target_amenity_ids,
+                min_priced_target=MIN_DAILY_COMPS_PER_DAY,
             )
 
         def _collect_two_night():
@@ -422,9 +328,10 @@ def estimate_base_price_for_date(
                 center_lng=query_center_lng,
                 map_radius_km=map_radius_limit_km if query_center_lat is not None and query_center_lng is not None else None,
                 target_accommodates=None if use_known_pool else target.accommodates,
-                pdp_structural_enrichment=not use_known_pool,
-                pdp_structural_enrichment_limit=pdp_structural_enrichment_limit,
+                pdp_structural_enrichment=False,
                 prefer_two_night=True,
+                target_amenity_ids=target_amenity_ids,
+                min_priced_target=MIN_DAILY_COMPS_PER_DAY,
             )
 
         # Execute both queries concurrently
@@ -433,10 +340,6 @@ def estimate_base_price_for_date(
             two_night_future = executor.submit(_collect_two_night)
             one_night_comps, _one_qn = one_night_future.result()
             two_night_comps, _two_qn = two_night_future.result()
-
-        # Save raw search results before pool filtering for fallback use.
-        raw_one_night = list(one_night_comps)
-        raw_two_night = list(two_night_comps)
 
         one_night_comps = _apply_known_pool_fields(one_night_comps)
         two_night_comps = _apply_known_pool_fields(two_night_comps)
@@ -452,34 +355,11 @@ def estimate_base_price_for_date(
                 comps_by_id[cid] = c
         comps = list(comps_by_id.values())
 
-        # Fallback: if the fixed pool doesn't yield MIN_DAILY_COMPS_PER_DAY available
-        # listings for this day, supplement with fresh daily-search results.
-        pool_fallback_added = 0
-        if use_known_pool and len(comps) < MIN_DAILY_COMPS_PER_DAY:
-            raw_combined: Dict[str, ListingSpec] = {}
-            for c in raw_one_night + raw_two_night:
-                cid = build_comp_id(c.url or "")
-                if cid and cid not in comps_by_id and cid not in raw_combined:
-                    raw_combined[cid] = c
-            for cid, c in raw_combined.items():
-                comps_by_id[cid] = c
-                pool_fallback_added += 1
-            comps = list(comps_by_id.values())
-            logger.info(
-                "[day_query] %s: fixed-pool shortfall (pool_comps=%s < min=%s); "
-                "supplemented with %s fresh-search comps, total=%s",
-                checkin_str,
-                len(comps) - pool_fallback_added,
-                MIN_DAILY_COMPS_PER_DAY,
-                pool_fallback_added,
-                len(comps),
-            )
-
+        pool_in_search = sum(1 for c in comps if build_comp_id(c.url or "") in _pool_cids)
         query_nights_used = 1 if one_night_comps else (2 if two_night_comps else 1)
         logger.info(
             f"[day_query] {checkin_str}: daily pools one_night={len(one_night_comps)} "
-            f"two_night={len(two_night_comps)} merged={len(comps)} "
-            f"pool_fallback_added={pool_fallback_added}"
+            f"two_night={len(two_night_comps)} merged={len(comps)} pool_in_search={pool_in_search}"
         )
 
         # ── User blacklist filter (per-listing excludedComps) ─────
@@ -530,22 +410,27 @@ def estimate_base_price_for_date(
             round((time.perf_counter() - day_start) * 1000),
         )
 
-        # Score and rank (raw scores stored separately before any boost).
+        # Score and rank. Pool members get similarity = 1.0 (pre-vetted at pool build time).
+        # Non-pool members are scored normally.
         comps_scored = []
         raw_sim_scores: Dict[int, float] = {}
         for c in filtered_comps:
-            score, breakdown = similarity_score(target, c, debug=True)
+            cid = build_comp_id(c.url or "")
+            if cid and cid in _pool_cids:
+                score = 1.0
+            else:
+                score, breakdown = similarity_score(target, c, debug=True)
+                lid = c.url.rsplit("/", 1)[-1] if c.url else ""
+                logger.debug(
+                    "[%s] %s: candidate similarity breakdown listing_id=%s score=%.4f breakdown=%s",
+                    "day_query",
+                    checkin_str,
+                    lid,
+                    score,
+                    breakdown,
+                )
             comps_scored.append((c, score))
             raw_sim_scores[id(c)] = score
-            lid = c.url.rsplit("/", 1)[-1] if c.url else ""
-            logger.debug(
-                "[%s] %s: candidate similarity breakdown listing_id=%s score=%.4f breakdown=%s",
-                "day_query",
-                checkin_str,
-                lid,
-                score,
-                breakdown,
-            )
         comps_scored.sort(key=lambda x: x[1], reverse=True)
 
         # Build list of enabled preferred comp URLs for boost logic.
@@ -664,25 +549,6 @@ def estimate_base_price_for_date(
                 selection_mode = "strict_empty"
         elif not above_floor and comps_scored:
             selection_mode = "strict_empty"
-
-        # Search-feed nightly prices can drift from PDP exact-night prices.
-        # Revalidate top-ranked comps so comparable card prices stay accurate.
-        if above_floor and DAY_QUERY_PDP_REVALIDATE_TOP_N > 0:
-            _rv = _revalidate_top_comp_prices_with_pdp(
-                client,
-                above_floor,
-                date_i=date_i,
-                adults=adults,
-                top_n=DAY_QUERY_PDP_REVALIDATE_TOP_N,
-            )
-            if _rv["updated"] > 0:
-                logger.info(
-                    "[day_query] %s: pdp revalidation updated=%s attempted=%s top_n=%s",
-                    checkin_str,
-                    _rv["updated"],
-                    _rv["attempted"],
-                    DAY_QUERY_PDP_REVALIDATE_TOP_N,
-                )
 
         # ── Layer 1 Price Sanity ──────────────────────────────────
         # Applied after the similarity floor.  Severe price outliers
