@@ -1659,6 +1659,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 summary["livePriceStatus"] = "no_listing_url"
                 summary["livePriceStatusReason"] = "No Airbnb listing URL configured for this property"
             _attach_user_listing_prices_and_log(report_id, calendar, summary)
+            _cache_hit_total_ms = round((time.time() - start_time) * 1000)
             db_helpers.complete_job(
                 client, report_id, worker_token,
                 summary=summary,
@@ -1669,7 +1670,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     "cache_key": cache_key,
                     "worker_host": socket.gethostname(),
                     "worker_version": WORKER_VERSION,
-                    "total_ms": round((time.time() - start_time) * 1000),
+                    "total_ms": _cache_hit_total_ms,
                 },
                 input_attributes=finalized_input_attributes,
                 # For nightly jobs: write all refreshed execution inputs back to the
@@ -1684,6 +1685,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 queue_ml_forecast=is_nightly and bool(job.get("listing_id")) and NIGHTLY_QUEUE_ML_FORECAST,
                 ml_training_scope=NIGHTLY_ML_TRAINING_SCOPE,
                 ml_force_retrain=NIGHTLY_ML_FORCE_RETRAIN,
+                generation_time_ms=_cache_hit_total_ms,
             )
 
             # ── Alert evaluation — nightly only (cache-hit path) ─────────────
@@ -2414,6 +2416,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
             queue_ml_forecast=is_nightly and bool(job.get("listing_id")) and NIGHTLY_QUEUE_ML_FORECAST,
             ml_training_scope=NIGHTLY_ML_TRAINING_SCOPE,
             ml_force_retrain=NIGHTLY_ML_FORCE_RETRAIN,
+            generation_time_ms=total_ms,
         )
 
         # ── Alert evaluation — nightly only (fresh-scrape path) ──────────────

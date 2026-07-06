@@ -174,6 +174,7 @@ def complete_job(
     queue_ml_forecast: bool = False,
     ml_training_scope: str = "global",
     ml_force_retrain: bool = True,
+    generation_time_ms: Optional[int] = None,
 ) -> None:
     """Mark a job as ready with results. Idempotent — overwrites existing results.
 
@@ -190,6 +191,9 @@ def complete_job(
     write_input_listing_url=True: write input_listing_url unconditionally,
     including clearing to NULL when listing_url is None.  This separates
     "parameter not provided" (False, skip update) from "explicitly no URL" (True+None).
+
+    generation_time_ms: total wall-clock time to generate this report, in
+    milliseconds. Surfaced in the admin dashboard.
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
@@ -222,6 +226,8 @@ def complete_job(
         update["discount_policy"] = discount_policy
     if cache_key is not None:
         update["cache_key"] = cache_key
+    if generation_time_ms is not None:
+        update["generation_time_ms"] = generation_time_ms
 
     client.table("pricing_reports").update(update).eq("id", report_id).eq(
         "worker_claim_token", str(worker_token)
