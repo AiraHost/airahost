@@ -1518,6 +1518,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         preferred_comps_raw = attributes.get("preferredComps")
         preferred_comps: Optional[list] = None
         primary_benchmark_url: Optional[str] = None
+        primary_benchmark_name: Optional[str] = None
 
         if isinstance(preferred_comps_raw, list):
             enabled = [
@@ -1532,6 +1533,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
             first_url = str(preferred_comps[0].get("listingUrl") or "").strip()
             if first_url:
                 primary_benchmark_url = first_url
+                primary_benchmark_name = str(preferred_comps[0].get("name") or "").strip() or None
                 logger.info(f"[{job.get('id', '?')}] Primary benchmark URL: {primary_benchmark_url}")
 
         # Secondary benchmark URLs — preferredComps[1:] used for consensus signal only
@@ -1967,6 +1969,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     rate_limit_seconds=RATE_LIMIT_SECONDS,
                     cdp_connect_timeout_ms=CDP_CONNECT_TIMEOUT_MS,
                     target_url=listing_url,
+                    benchmark_name=primary_benchmark_name,
                     secondary_benchmark_urls=secondary_benchmark_urls or None,
                     user_attributes=attributes,
                     fallback_address=address,

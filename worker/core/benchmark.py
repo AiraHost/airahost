@@ -161,6 +161,7 @@ class BenchmarkDayResult:
     price_distribution: Dict[str, Any] = field(default_factory=dict)
     top_comps: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
+    benchmark_title: Optional[str] = None            # real listing name (user-saved or PDP/search-extracted)
 
 
 # ── Benchmark Discount Probing (Strategy B) ───────────────────────────────────
@@ -179,7 +180,7 @@ def _extract_benchmark_price_with_min_stay_fallback(
     benchmark_url: str,
     checkin: str,
     checkout: str,
-) -> Tuple[Optional[float], str]:
+) -> Tuple[Optional[float], str, Optional[str]]:
     """
     Extract benchmark listing-page nightly price with a minimum-stay fallback.
 
@@ -187,12 +188,17 @@ def _extract_benchmark_price_with_min_stay_fallback(
     does not expose a price, retry as a 2-night stay starting on the same date.
     The underlying extractor returns a nightly price, so the fallback remains
     per-night rather than a total trip price.
+
+    Returns (price, confidence, title) — title is the listing's real name from
+    the PDP payload (already parsed for the price; surfaced so the benchmark
+    can be displayed by name instead of a placeholder), or None.
     """
     listing_id = extract_listing_id_from_url(benchmark_url)
     if not listing_id:
-        return None, "failed"
+        return None, "failed", None
     pdp = client.get_listing_details(listing_id, checkin=checkin, checkout=checkout, adults=1)
     parsed = parse_pdp_response(pdp, listing_id, safe_domain_base(benchmark_url))
+    title = str(parsed.get("title") or "").strip() or None
     requested_nights = max(1, (date.fromisoformat(checkout) - date.fromisoformat(checkin)).days)
     price = nightly_price_from_parsed_pdp(
         parsed,
@@ -201,14 +207,15 @@ def _extract_benchmark_price_with_min_stay_fallback(
     )
     confidence = "high" if price is not None else "failed"
     if price is not None:
-        return price, confidence
+        return price, confidence, title
 
     if requested_nights != 1:
-        return None, "failed"
+        return None, "failed", title
 
     fallback_checkout = (date.fromisoformat(checkin) + timedelta(days=2)).isoformat()
     pdp_fb = client.get_listing_details(listing_id, checkin=checkin, checkout=fallback_checkout, adults=1)
     parsed_fb = parse_pdp_response(pdp_fb, listing_id, safe_domain_base(benchmark_url))
+    title = title or (str(parsed_fb.get("title") or "").strip() or None)
     fallback_price = nightly_price_from_parsed_pdp(
         parsed_fb,
         stay_nights=2,
@@ -220,9 +227,9 @@ def _extract_benchmark_price_with_min_stay_fallback(
             f"[benchmark] {checkin}: direct page 1-night unavailable, "
             f"used 2-night minimum-stay fallback (nightly=${fallback_price:.2f})"
         )
-        return fallback_price, fallback_confidence
+        return fallback_price, fallback_confidence, title
 
-    return None, "failed"
+    return None, "failed", title
 
 def probe_benchmark_discounts(
     client,
@@ -249,7 +256,7 @@ def probe_benchmark_discounts(
     checkin_iso = start_date.isoformat()
 
     def _fetch(in_date: str, out_date: str) -> Optional[float]:
-        p, _conf = _extract_benchmark_price_with_min_stay_fallback(
+        p, _conf, _title = _extract_benchmark_price_with_min_stay_fallback(
             client, benchmark_url, in_date, out_date
         )
         return p
@@ -294,6 +301,7 @@ def estimate_benchmark_price_for_date(
     top_k: int = BENCHMARK_TOP_K,
     max_radius_km: float = DEFAULT_MAX_RADIUS_KM,
     excluded_room_ids: Optional[set[str]] = None,
+    benchmark_name: Optional[str] = None,
 ) -> BenchmarkDayResult:
     """
     Execute a 2-night-primary benchmark-first query for *date_i*.
@@ -405,7 +413,7 @@ def estimate_benchmark_price_for_date(
         # The search page and listing page are different domains in Airbnb's eyes;
         # the full rate_limit_seconds (1.0s) is overly conservative here.
         time.sleep(min(rate_limit_seconds * 0.5, 0.5))
-        direct_price, direct_confidence = _extract_benchmark_price_with_min_stay_fallback(
+        direct_price, direct_confidence, direct_page_title = _extract_benchmark_price_with_min_stay_fallback(
             client, benchmark_url, checkin_str, _bm_checkout_str
         )
         if direct_price:
@@ -447,6 +455,14 @@ def estimate_benchmark_price_for_date(
                 f"[benchmark] {checkin_str}: benchmark price unavailable from direct page and search"
             )
 
+        # Real display name for the benchmark: user-saved name → PDP title
+        # (parsed alongside the direct-page price) → search-card title.
+        benchmark_real_title = (
+            (benchmark_name or "").strip()
+            or (direct_page_title or "")
+            or ((benchmark_comp.title or "").strip() if benchmark_comp else "")
+        ) or None
+
         # ── Secondary comps (Phase 2 — observational only) ───────────────
         # Look up preferredComps[1:] in the already-collected search results.
         # No extra page loads — only search_hit prices are recorded here.
@@ -457,7 +473,7 @@ def estimate_benchmark_price_for_date(
             sec_price: Optional[float] = None
             try:
                 time.sleep(min(rate_limit_seconds * 0.35, 0.35))
-                sec_price, _sec_confidence = _extract_benchmark_price_with_min_stay_fallback(
+                sec_price, _sec_confidence, _sec_title = _extract_benchmark_price_with_min_stay_fallback(
                     client, sec_url, checkin_str, _bm_checkout_str
                 )
                 if isinstance(sec_price, (int, float)) and sec_price > 0:
@@ -492,7 +508,7 @@ def estimate_benchmark_price_for_date(
                 all_comp_prices[bm_id] = round(benchmark_price, 2)
                 early_top_comps.append({
                     "id": bm_id,
-                    "title": "Your benchmark listing",
+                    "title": benchmark_real_title or "Your benchmark listing",
                     "propertyType": target.property_type or "entire_home",
                     "accommodates": None,
                     "bedrooms": None,
@@ -518,6 +534,7 @@ def estimate_benchmark_price_for_date(
                 is_sampled=True,
                 is_weekend=is_weekend,
                 error="No comps found",
+                benchmark_title=benchmark_real_title,
             )
 
         # Filter and score market comps
@@ -740,7 +757,7 @@ def estimate_benchmark_price_for_date(
             bm_spec = benchmark_comp  # may be None if not in search results
             bm_payload: Dict[str, Any] = {
                 "id": bm_id,
-                "title": (bm_spec.title if bm_spec else "") or "Your benchmark listing",
+                "title": benchmark_real_title or "Your benchmark listing",
                 "propertyType": (bm_spec.property_type if bm_spec else "") or target.property_type or "entire_home",
                 "accommodates": int(bm_spec.accommodates) if bm_spec and isinstance(bm_spec.accommodates, (int, float)) else None,
                 "bedrooms": int(bm_spec.bedrooms) if bm_spec and isinstance(bm_spec.bedrooms, (int, float)) else None,
@@ -823,6 +840,7 @@ def estimate_benchmark_price_for_date(
             is_weekend=is_weekend,
             price_distribution=dist,
             top_comps=top_comps,
+            benchmark_title=benchmark_real_title,
         )
 
     except Exception as exc:
@@ -956,9 +974,16 @@ def aggregate_benchmark_transparency(
         or consensus_signal == "divergent"
     )
 
+    # Real listing name — first day that resolved one (user-saved name, PDP
+    # title, or search-card title). None keeps the frontend placeholder.
+    benchmark_title = next(
+        (r.benchmark_title for r in day_results if r.benchmark_title), None
+    )
+
     return {
         "benchmarkUsed": benchmark_used,
         "benchmarkUrl": benchmark_url,
+        "benchmarkTitle": benchmark_title,
         "benchmarkFetchStatus": primary_method,
         "benchmarkFetchMethod": primary_method,
         "avgBenchmarkPrice": avg_benchmark,
@@ -1015,4 +1040,5 @@ def benchmark_day_result_to_dict(r: BenchmarkDayResult) -> Dict[str, Any]:
         "price_distribution": r.price_distribution,
         "top_comps": r.top_comps,
         "error": r.error,
+        "benchmark_title": r.benchmark_title,
     }

@@ -19,7 +19,7 @@ def test_benchmark_search_caps_map_radius_to_five_miles(monkeypatch):
     monkeypatch.setattr(
         benchmark_core,
         "_extract_benchmark_price_with_min_stay_fallback",
-        lambda *args, **kwargs: (None, "failed"),
+        lambda *args, **kwargs: (None, "failed", None),
     )
     monkeypatch.setattr(benchmark_core.time, "sleep", lambda *_: None)
 

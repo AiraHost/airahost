@@ -2146,6 +2146,20 @@ class PlaywrightScraper:
             return None
         count = self._count_search_results(data)
         if count <= 0:
+            # A well-formed empty page at a deeper pagination offset is almost
+            # always genuine end-of-results (the base page already succeeded via
+            # this session), so trust it. A browser fallback here would cost a
+            # multi-second navigation only to have Airbnb re-serve page 1.
+            try:
+                items_offset = int(overrides.get("itemsOffset") or 0)
+            except (TypeError, ValueError):
+                items_offset = 0
+            if items_offset > 0 and not data.get("errors"):
+                logger.info(
+                    "[direct_search] empty results at itemsOffset=%s; treating as end of results",
+                    items_offset,
+                )
+                return status_code, data
             logger.info("[direct_search] empty results; falling back to browser")
             return None
         logger.info(

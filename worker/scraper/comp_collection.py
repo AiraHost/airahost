@@ -717,12 +717,14 @@ def collect_search_comps(
                     priced_page_rows,
                     round((time.perf_counter() - collect_start) * 1000),
                 )
+                new_ids_this_page = 0
                 for lid in page_ids:
                     sid = str(lid)
                     row = page_ctx.get(sid, {})
                     if sid not in seen_ids:
                         listing_ids.append(sid)
                         seen_ids.add(sid)
+                        new_ids_this_page += 1
                         logger.info(
                             "[%s] %s: new comp listing id=%s rating=%s reviews=%s",
                             log_prefix,
@@ -745,6 +747,20 @@ def collect_search_comps(
                         )
                         if row_has_price and not existing_has_price:
                             context[sid] = row
+
+                # When the result set is exhausted, Airbnb serves the same page
+                # (or an empty one) for every deeper offset — each costing a
+                # full search request. Stop the deep sweep at the first page
+                # that adds no new listings.
+                if offset_set_idx > 0 and new_ids_this_page == 0:
+                    logger.info(
+                        "[%s] %s: offset=%s added no new listings; result set "
+                        "exhausted — stopping deeper paging",
+                        log_prefix,
+                        checkin_str,
+                        offset,
+                    )
+                    break
 
             if not page_ok:
                 continue

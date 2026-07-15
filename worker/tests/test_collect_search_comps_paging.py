@@ -92,6 +92,17 @@ class _FakeClientSparseFirstPage:
         return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
 
 
+class _FakeClientRepeatsSamePage:
+    """Sparse market: Airbnb re-serves the identical page for every offset."""
+
+    def __init__(self):
+        self.calls = []
+
+    def search_listings_with_overrides(self, overrides):
+        self.calls.append(dict(overrides))
+        return 200, _payload_many(["111", "222"])
+
+
 class _FakeClientCapacity:
     def __init__(self):
         self.calls = []
@@ -321,6 +332,34 @@ def test_collect_search_comps_min_priced_target_stops_early_when_met():
     assert qn == 1
     assert offsets == [0]  # one priced comp on page 0 meets the target; no deeper paging
     assert len(comps) == 1
+
+
+def test_collect_search_comps_stops_deep_sweep_when_page_adds_no_new_listings():
+    """
+    When the market is exhausted, Airbnb re-serves the same page for every
+    deeper offset. Each extra offset costs a full search request (a multi-second
+    browser navigation when direct HTTP is unavailable), so crawling all
+    max_scroll_rounds offsets multiplies report generation time for zero new
+    comps. The sweep must stop at the first page that adds no new listings.
+    """
+    client = _FakeClientRepeatsSamePage()
+    comps, qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.ca",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=12,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+    )
+
+    offsets = [call.get("itemsOffset", 0) for call in client.calls]
+    assert qn == 1
+    # Base page (offset 0), then exactly one deeper page (offset 20) that
+    # repeats the same listings — the remaining 11 offsets must be skipped.
+    assert offsets == [0, 20]
+    assert len(comps) == 2
 
 
 def test_collect_search_comps_two_night_keeps_paging_until_priced_target():

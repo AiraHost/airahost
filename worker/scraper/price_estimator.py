@@ -1182,6 +1182,8 @@ def _preferred_comp_id(listing_url: str) -> str:
 def _build_url_mode_benchmark_info(
     all_day_results: List[Dict[str, Any]],
     preferred_comps: Optional[List[Dict[str, Any]]],
+    client: Optional[Any] = None,
+    rate_limit_seconds: float = 1.0,
 ) -> Optional[Dict[str, Any]]:
     if not preferred_comps:
         return None
@@ -1195,7 +1197,13 @@ def _build_url_mode_benchmark_info(
     if total_days == 0:
         return None
 
-    from worker.core.benchmark import BENCHMARK_MARKET_WEIGHT, BENCHMARK_MAX_ADJ
+    from worker.core.benchmark import (
+        BENCHMARK_MARKET_WEIGHT,
+        BENCHMARK_MAX_ADJ,
+        FETCH_STATUS_DIRECT_PAGE,
+        FETCH_STATUS_SEARCH_HIT,
+        _extract_benchmark_price_with_min_stay_fallback,
+    )
 
     primary_id = _preferred_comp_id(primary_url)
     benchmark_prices: List[float] = []
@@ -1203,6 +1211,7 @@ def _build_url_mode_benchmark_info(
     market_adjustments: List[float] = []
     outlier_days = 0
     search_hits = 0
+    direct_fetches = 0
     failed = 0
 
     secondary_urls = [
@@ -1212,9 +1221,15 @@ def _build_url_mode_benchmark_info(
     ]
     secondary_found: Dict[str, List[float]] = {url: [] for url in secondary_urls}
 
+    # Real display name for the benchmark: user-saved name first, else the
+    # first title resolved from a search hit or direct PDP fetch below.
+    _pc_name = str((preferred_comps[0] or {}).get("name") or "").strip()
+    benchmark_title: Optional[str] = _pc_name or None
+
     for day in sampled_days:
         comp_prices = day.get("comp_prices") or {}
         primary_price = comp_prices.get(primary_id)
+        fetch_method = FETCH_STATUS_SEARCH_HIT
         if primary_price is None:
             for tc in day.get("top_comps", []) or []:
                 tc_url = str(tc.get("url") or "").strip()
@@ -1222,11 +1237,57 @@ def _build_url_mode_benchmark_info(
                     price = tc.get("nightlyPrice")
                     if isinstance(price, (int, float)) and price > 0:
                         primary_price = float(price)
+                        if benchmark_title is None:
+                            benchmark_title = str(tc.get("title") or "").strip() or None
                         break
+
+        # The benchmark didn't surface in this day's search results (e.g. it's
+        # outside the search's ranking window). Fall back to a direct PDP fetch
+        # of the benchmark listing page itself, same as the Mode C pipeline.
+        if primary_price is None and client is not None:
+            try:
+                day_date = dt.strptime(str(day.get("date")), "%Y-%m-%d").date()
+                checkin_str = day_date.isoformat()
+                checkout_str = (day_date + timedelta(days=1)).isoformat()
+                time.sleep(min(rate_limit_seconds * 0.5, 0.5))
+                pdp_price, _pdp_confidence, _pdp_title = _extract_benchmark_price_with_min_stay_fallback(
+                    client, primary_url, checkin_str, checkout_str
+                )
+                if _pdp_title and benchmark_title is None:
+                    benchmark_title = _pdp_title
+                if pdp_price:
+                    primary_price = float(pdp_price)
+                    fetch_method = FETCH_STATUS_DIRECT_PAGE
+                    # A PDP-only price never went through the day's normal
+                    # top_comps/comp_prices assembly, so without this it would
+                    # count toward benchmarkInfo but never appear in
+                    # comparableListings. Inject it the same way Mode C does.
+                    _rounded_price = round(primary_price, 2)
+                    if not isinstance(day.get("comp_prices"), dict):
+                        day["comp_prices"] = dict(comp_prices)
+                    day["comp_prices"][primary_id] = _rounded_price
+                    if not isinstance(day.get("top_comps"), list):
+                        day["top_comps"] = []
+                    if not any(str(tc.get("id") or "") == primary_id for tc in day["top_comps"]):
+                        day["top_comps"].append({
+                            "id": primary_id,
+                            "title": benchmark_title or "Your benchmark listing",
+                            "nightlyPrice": _rounded_price,
+                            "similarity": 0.98,
+                            "url": primary_url,
+                            "isPinnedBenchmark": True,
+                        })
+            except Exception as _pdp_exc:
+                logger.warning(
+                    f"[url-mode-benchmark] {day.get('date')}: direct PDP fetch failed: {_pdp_exc}"
+                )
 
         if primary_price is not None:
             benchmark_prices.append(round(float(primary_price), 2))
-            search_hits += 1
+            if fetch_method == FETCH_STATUS_DIRECT_PAGE:
+                direct_fetches += 1
+            else:
+                search_hits += 1
             market_price = day.get("median_price")
             if isinstance(market_price, (int, float)) and market_price > 0:
                 market_prices.append(round(float(market_price), 2))
@@ -1287,11 +1348,19 @@ def _build_url_mode_benchmark_info(
         or consensus_signal == "divergent"
     )
 
+    if search_hits >= direct_fetches and search_hits > 0:
+        primary_method = FETCH_STATUS_SEARCH_HIT
+    elif direct_fetches > 0:
+        primary_method = FETCH_STATUS_DIRECT_PAGE
+    else:
+        primary_method = "failed"
+
     return {
         "benchmarkUsed": benchmark_used,
         "benchmarkUrl": primary_url,
-        "benchmarkFetchStatus": "search_hit" if benchmark_used else "failed",
-        "benchmarkFetchMethod": "search_hit" if benchmark_used else "failed",
+        "benchmarkTitle": benchmark_title,
+        "benchmarkFetchStatus": primary_method,
+        "benchmarkFetchMethod": primary_method,
         "avgBenchmarkPrice": avg_benchmark,
         "avgMarketPrice": avg_market,
         "marketAdjustmentPct": avg_adj,
@@ -1303,10 +1372,10 @@ def _build_url_mode_benchmark_info(
         "fallbackReason": None if benchmark_used else "benchmark_not_found_in_url_mode",
         "fetchStats": {
             "searchHits": search_hits,
-            "directFetches": 0,
+            "directFetches": direct_fetches,
             "failed": failed,
             "totalDays": total_days,
-            "highConfidenceDays": search_hits,
+            "highConfidenceDays": search_hits + direct_fetches,
             "mediumConfidenceDays": 0,
             "lowConfidenceDays": 0,
         },
@@ -2170,6 +2239,8 @@ def run_scrape(
                 benchmark_info=_build_url_mode_benchmark_info(
                     all_day_results,
                     preferred_comps,
+                    client=client,
+                    rate_limit_seconds=rate_limit_seconds,
                 ),
                 target_price_confidence=_target_price_confidence,
                 spec_backfill=_spec_backfill_meta,
@@ -2247,6 +2318,7 @@ def run_benchmark_scrape(
     nightly_plan: Optional[Any] = None,
     fallback_address: Optional[str] = None,
     target_url: Optional[str] = None,
+    benchmark_name: Optional[str] = None,
 ) -> tuple:
     """
     Benchmark-first pipeline.
@@ -2587,6 +2659,7 @@ def run_benchmark_scrape(
                         top_k=BENCHMARK_TOP_K,
                         max_radius_km=_effective_radius,
                         excluded_room_ids=excluded_room_ids,
+                        benchmark_name=benchmark_name,
                     )
 
             try:
@@ -2764,6 +2837,8 @@ def run_benchmark_scrape(
 
             # Aggregate benchmark transparency
             benchmark_info = aggregate_benchmark_transparency(benchmark_url, sampled_results)
+            if not benchmark_info.get("benchmarkTitle") and (benchmark_name or "").strip():
+                benchmark_info["benchmarkTitle"] = benchmark_name.strip()
             # Attach benchmark-to-target similarity (computed once above)
             if discount_info:
                 benchmark_info["detectedDiscounts"] = discount_info
