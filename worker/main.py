@@ -1434,8 +1434,18 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
     )
     hb_thread.start()
 
+    # Highest pct reported so far — fallback passes (benchmark → market scrape
+    # → Playwright retry) restart their internal 10–75% ranges, and letting the
+    # bar jump backwards reads as the job starting over.
+    _max_pct_seen = [0]
+
     def _progress(pct: int, stage: str, message: str, est: Optional[int] = None) -> None:
-        """Update progress metadata in DB.  Non-fatal on error."""
+        """Update progress metadata in DB.  Non-fatal on error.
+
+        pct is clamped to be monotonically non-decreasing within this job run.
+        """
+        pct = max(int(pct), _max_pct_seen[0])
+        _max_pct_seen[0] = pct
         try:
             db_helpers.update_progress(
                 client, report_id, worker_token,
@@ -2014,7 +2024,15 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         if not _obs_reuse_succeeded and not _mode_c_succeeded and listing_url:
             # Mode A: URL scrape — user provided a listing URL
             logger.info(f"[{report_id}] Mode A (URL scrape): {listing_url}")
-            _progress(10, "extracting_target", "Extracting listing details...")
+            # When Mode C ran and failed, this is a retry pass — say so instead
+            # of "Extracting listing details", which reads as starting over.
+            _progress(
+                10,
+                "extracting_target",
+                "Benchmark analysis incomplete — retrying with market comps..."
+                if primary_benchmark_url
+                else "Extracting listing details...",
+            )
             try:
                 from worker.scraper.price_estimator import run_scrape
 
@@ -2083,7 +2101,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                             target_lat=_job_target_lat,
                             target_lng=_job_target_lng,
                             max_radius_km=_job_radius_km,
-                            progress_callback=_make_day_callback(15, 75, "searching_comps", "Searching comparable listings"),
+                            progress_callback=_make_day_callback(15, 75, "searching_comps", "Retrying comparable search"),
                             nightly_plan=_nightly_plan,
                             fallback_attributes=attributes,
                             fallback_address=address,

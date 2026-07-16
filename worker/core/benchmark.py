@@ -50,8 +50,15 @@ from worker.core.similarity import (
     filter_similar_candidates,
     similarity_score,
 )
-from worker.scraper.comp_collection import collect_search_comps
-from worker.scraper.parsers import parse_pdp_response
+from worker.scraper.comp_collection import (
+    _compute_bbox_from_radius_km,
+    _map_search_row_to_spec,
+    collect_search_comps,
+)
+from worker.scraper.parsers import (
+    parse_pdp_response,
+    parse_search_listing_context,
+)
 from worker.scraper.price_normalizer import nightly_price_from_parsed_pdp
 from worker.scraper.target_extractor import ListingSpec, extract_listing_id_from_url, safe_domain_base
 
@@ -65,6 +72,17 @@ BENCHMARK_MAX_CARDS: int = 15        # standard: DAY_MAX_CARDS = 30
 BENCHMARK_TOP_K: int = 5             # standard: top_k = 10
 BENCHMARK_MAX_SAMPLE_QUERIES: int = 10  # standard: MAX_SAMPLE_QUERIES = 20
 MAP_RADIUS_CAP_KM: float = 5.0 * 1.609344  # exactly 5 miles
+
+# Micro map-search radius around the benchmark's own coordinates.
+# Airbnb publishes fuzzed listing coords (up to ~150m off), so the box must be
+# wide enough to still contain the pin while staying small enough that the
+# benchmark card is guaranteed onto the first results page.
+MICRO_SEARCH_RADIUS_KM: float = 0.25
+
+# Benchmark mode needs ~5 priced market comps for a reliable median
+# (_MIN_COMPS_FOR_FULL_WEIGHT below); stop paging once we have a few spare
+# instead of sweeping deep offsets toward a full 15-card page.
+BENCHMARK_MIN_PRICED_TARGET: int = 8
 
 # Pricing formula weights
 BENCHMARK_MARKET_WEIGHT: float = 0.30   # 30 % weight to market adjustment (high-confidence baseline)
@@ -175,6 +193,215 @@ def _calculate_discount_pct(base_val: float, discounted_val: float) -> float:
     return round(((base_val - discounted_val) / base_val) * 100, 1)
 
 
+_PDP_UNAVAILABLE_MARKERS = (
+    "those dates are not available",
+    "dates are not available",
+    "date_not_available",
+    "not available for these dates",
+)
+
+
+def _pdp_payload_dates_unavailable(data: Any) -> bool:
+    """True when a PDP payload explicitly reports the dates as not bookable.
+
+    Mirrors PlaywrightScraper._pdp_dates_unavailable — lets the benchmark
+    pipeline distinguish "listing exists but isn't bookable" from a fetch
+    failure, so the report can state the real fallback reason.
+    """
+    if not data:
+        return False
+    try:
+        import json as _json
+        payload_text = _json.dumps(data, ensure_ascii=False).lower()
+    except Exception:
+        payload_text = str(data or "").lower()
+    return any(m in payload_text for m in _PDP_UNAVAILABLE_MARKERS)
+
+
+def _fetch_pdp_payload(client, listing_id: str, checkin: str, checkout: str) -> Dict[str, Any]:
+    """
+    Fetch a PDP payload for benchmark pricing via direct HTTP only.
+
+    Browser PDP navigation costs 10-15s per attempt (and is frequently
+    misclassified as challenged); in the benchmark hot path a failed direct
+    fetch is treated as price-unavailable so the day can be interpolated
+    instead of paying for a browser round trip.
+    """
+    direct = getattr(client, "fetch_pdp_price_direct", None)
+    if callable(direct):
+        try:
+            data = direct(str(listing_id), checkin=checkin, checkout=checkout, adults=1)
+        except Exception as exc:
+            logger.info(f"[benchmark] direct PDP fetch failed for {listing_id}: {exc}")
+            return {}
+        return data if isinstance(data, dict) else {}
+    # Clients without a direct fetcher (tests/fakes) keep the legacy path.
+    return client.get_listing_details(listing_id, checkin=checkin, checkout=checkout, adults=1)
+
+
+def fetch_benchmark_price_via_micro_search(
+    client,
+    benchmark_url: str,
+    bm_lat: Optional[float],
+    bm_lng: Optional[float],
+    date_i: date,
+    *,
+    query_nights_sequence: Tuple[int, ...] = (1, 2),
+    adults: int = 1,
+    search_location: str = "",
+) -> Tuple[Optional[float], Optional[str], int]:
+    """
+    Fetch the benchmark listing's own nightly price from a stays-search zoomed
+    to a tiny map box around the benchmark's coordinates.
+
+    StaysSearch replays over direct HTTP are rarely challenged (unlike PDP
+    fetches), so this is the fastest reliable per-day benchmark price source:
+    one search request returns the benchmark's card with its discounted price.
+    A 1-night query misses listings with a minimum stay, so a 2-night query is
+    tried next (card totals are normalised back to per-night).
+
+    Returns (nightly_price, card_title, query_nights_used); (None, None, 0)
+    when the benchmark did not surface with a usable price.
+    """
+    bm_id = extract_listing_id_from_url(benchmark_url)
+    if not bm_id or bm_lat is None or bm_lng is None:
+        return None, None, 0
+    ne_lat, ne_lng, sw_lat, sw_lng = _compute_bbox_from_radius_km(
+        float(bm_lat), float(bm_lng), MICRO_SEARCH_RADIUS_KM
+    )
+    checkin_str = date_i.isoformat()
+    for nights in query_nights_sequence:
+        overrides: Dict[str, Any] = {
+            "checkin": checkin_str,
+            "checkout": (date_i + timedelta(days=int(nights))).isoformat(),
+            "adults": int(adults),
+            "dailySearch": True,
+            "itemsPerGrid": 10,
+            "guestFavorite": False,
+            "searchByMap": True,
+            "neLat": ne_lat,
+            "neLng": ne_lng,
+            "swLat": sw_lat,
+            "swLng": sw_lng,
+            "centerLat": float(bm_lat),
+            "centerLng": float(bm_lng),
+        }
+        if str(search_location or "").strip():
+            overrides["query"] = search_location
+        # Direct HTTP only: an empty page here just means the benchmark is not
+        # bookable for this window — a browser fallback would burn 10-30s to
+        # learn the same thing.
+        try:
+            direct_only = getattr(client, "search_listings_direct_only", None)
+            if callable(direct_only):
+                result = direct_only(overrides)
+                if result is None:
+                    logger.info(
+                        f"[benchmark] {checkin_str}: micro-search ({nights}n) "
+                        f"direct replay unavailable"
+                    )
+                    continue
+                status, data = result
+            else:
+                status, data = client.search_listings_with_overrides(overrides)
+        except Exception as exc:
+            logger.info(
+                f"[benchmark] {checkin_str}: micro-search ({nights}n) failed: {exc}"
+            )
+            continue
+        if status < 200 or status >= 300:
+            continue
+        row = parse_search_listing_context(data).get(str(bm_id))
+        if not isinstance(row, dict):
+            logger.info(
+                f"[benchmark] {checkin_str}: micro-search ({nights}n) did not "
+                f"surface benchmark {bm_id}"
+            )
+            continue
+        min_nights = row.get("min_nights")
+        if isinstance(min_nights, int) and min_nights > int(nights):
+            continue
+        # Multi-night cards sometimes omit the "for N nights" qualifier, so the
+        # search parser records the trip total as a 1-night nightly price
+        # (nightly == total, price_nights == 1). Restore per-night before mapping.
+        _row_nightly = row.get("nightly_price")
+        _row_total = row.get("total_price")
+        _row_price_nights = int(row.get("price_nights") or 1)
+        if (
+            int(nights) > 1
+            and isinstance(_row_total, (int, float))
+            and _row_total > 0
+            and _row_price_nights <= 1
+            and (
+                not isinstance(_row_nightly, (int, float))
+                or float(_row_nightly) == float(_row_total)
+            )
+        ):
+            row = dict(row)
+            row["nightly_price"] = round(float(_row_total) / int(nights), 2)
+            row["price_nights"] = int(nights)
+        spec = _map_search_row_to_spec(
+            str(bm_id), row, safe_domain_base(benchmark_url), int(nights)
+        )
+        if spec.nightly_price and spec.nightly_price > 0:
+            title = (spec.title or "").strip() or None
+            logger.info(
+                f"[benchmark] {checkin_str}: micro-search hit "
+                f"(nights={nights}, nightly=${spec.nightly_price:.2f})"
+            )
+            return round(float(spec.nightly_price), 2), title, int(nights)
+    return None, None, 0
+
+
+# Stay windows tried when discovering how the benchmark can be booked.
+# Long-stay-only listings (e.g. 30-night-minimum furnished rentals) never
+# surface in 1-2 night searches, PDP price replays, or browser DOM reads —
+# a long window is the only way to obtain their real nightly revenue rate.
+BENCHMARK_STAY_DISCOVERY_NIGHTS: Tuple[int, ...] = (1, 2, 3, 7, 30)
+
+
+def discover_benchmark_stay_nights(
+    client,
+    benchmark_url: str,
+    bm_lat: Optional[float],
+    bm_lng: Optional[float],
+    date_i: date,
+    *,
+    search_location: str = "",
+) -> Optional[int]:
+    """
+    Find the shortest stay window for which the benchmark appears (with a
+    price) in a micro map-search — once per job, ~1s per attempted window.
+
+    Returns the night count to use for per-day benchmark queries, or None
+    when the benchmark could not be surfaced (caller falls back to the
+    default (1, 2) per-day sequence).
+    """
+    if bm_lat is None or bm_lng is None:
+        return None
+    for nights in BENCHMARK_STAY_DISCOVERY_NIGHTS:
+        price, _title, used = fetch_benchmark_price_via_micro_search(
+            client,
+            benchmark_url,
+            bm_lat,
+            bm_lng,
+            date_i,
+            query_nights_sequence=(nights,),
+            search_location=search_location,
+        )
+        if price is not None and used:
+            logger.info(
+                f"[benchmark] stay-window discovery: benchmark bookable at "
+                f"{used} night(s) (nightly=${price:.2f})"
+            )
+            return used
+    logger.info(
+        "[benchmark] stay-window discovery: benchmark not found in any "
+        f"window {BENCHMARK_STAY_DISCOVERY_NIGHTS}"
+    )
+    return None
+
+
 def _extract_benchmark_price_with_min_stay_fallback(
     client,
     benchmark_url: str,
@@ -192,59 +419,66 @@ def _extract_benchmark_price_with_min_stay_fallback(
     Returns (price, confidence, title) — title is the listing's real name from
     the PDP payload (already parsed for the price; surfaced so the benchmark
     can be displayed by name instead of a placeholder), or None.
+    On failure, confidence is "unavailable" when the PDP payload explicitly
+    reported the dates as not bookable, otherwise "failed".
     """
     listing_id = extract_listing_id_from_url(benchmark_url)
     if not listing_id:
         return None, "failed", None
-    pdp = client.get_listing_details(listing_id, checkin=checkin, checkout=checkout, adults=1)
+    pdp = _fetch_pdp_payload(client, listing_id, checkin, checkout)
     parsed = parse_pdp_response(pdp, listing_id, safe_domain_base(benchmark_url))
     title = str(parsed.get("title") or "").strip() or None
+    dates_unavailable = _pdp_payload_dates_unavailable(pdp)
     requested_nights = max(1, (date.fromisoformat(checkout) - date.fromisoformat(checkin)).days)
     price = nightly_price_from_parsed_pdp(
         parsed,
         stay_nights=requested_nights,
         source="pdp",
     )
-    confidence = "high" if price is not None else "failed"
     if price is not None:
-        return price, confidence, title
+        return price, "high", title
 
     if requested_nights != 1:
-        return None, "failed", title
+        return None, ("unavailable" if dates_unavailable else "failed"), title
 
     fallback_checkout = (date.fromisoformat(checkin) + timedelta(days=2)).isoformat()
-    pdp_fb = client.get_listing_details(listing_id, checkin=checkin, checkout=fallback_checkout, adults=1)
+    pdp_fb = _fetch_pdp_payload(client, listing_id, checkin, fallback_checkout)
     parsed_fb = parse_pdp_response(pdp_fb, listing_id, safe_domain_base(benchmark_url))
     title = title or (str(parsed_fb.get("title") or "").strip() or None)
+    dates_unavailable = dates_unavailable or _pdp_payload_dates_unavailable(pdp_fb)
     fallback_price = nightly_price_from_parsed_pdp(
         parsed_fb,
         stay_nights=2,
         source="pdp",
     )
-    fallback_confidence = "high" if fallback_price is not None else "failed"
     if fallback_price is not None:
         logger.info(
             f"[benchmark] {checkin}: direct page 1-night unavailable, "
             f"used 2-night minimum-stay fallback (nightly=${fallback_price:.2f})"
         )
-        return fallback_price, fallback_confidence, title
+        return fallback_price, "high", title
 
-    return None, "failed", title
+    return None, ("unavailable" if dates_unavailable else "failed"), title
 
 def probe_benchmark_discounts(
     client,
     benchmark_url: str,
     base_origin: str,
     start_date: date,
+    *,
+    bm_lat: Optional[float] = None,
+    bm_lng: Optional[float] = None,
+    search_location: str = "",
+    bm_stay_nights: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Probes the benchmark listing for the weekly discount by executing two
-    targeted listing-page fetches (1-night base + 7-night weekly).
+    Probes the benchmark listing for the weekly discount (1-night base price
+    vs 7-night effective nightly price).
 
-    Previously also probed monthly (28-night) and last-minute (tomorrow), but
-    those added 2 extra page loads (~4s) per job for rarely-configured discounts.
-    Monthly and last-minute probes were dropped in the first performance pass;
-    they can be re-enabled individually if the signal proves valuable.
+    Both probes go through the micro map-search first (direct-HTTP stays-search
+    around the benchmark's coordinates — rarely challenged, ~1s each) with a
+    direct-HTTP PDP replay as fallback. No browser navigation: the old
+    listing-page probe cost ~30s per job when the PDP fetch was challenged.
     """
     results = {
         "weeklyDiscountPct": 0.0,
@@ -253,9 +487,31 @@ def probe_benchmark_discounts(
         "details": {}
     }
 
+    # A min-stay beyond a week means there is no 1-night base price and the
+    # 7-night window is unbookable — the weekly-discount probe cannot apply.
+    if bm_stay_nights and int(bm_stay_nights) > 7:
+        logger.info(
+            f"[benchmark-probe] skipped: benchmark min stay is "
+            f"{bm_stay_nights} nights (no weekly-discount signal)"
+        )
+        return results
+
     checkin_iso = start_date.isoformat()
 
     def _fetch(in_date: str, out_date: str) -> Optional[float]:
+        nights = max(1, (date.fromisoformat(out_date) - date.fromisoformat(in_date)).days)
+        if bm_lat is not None and bm_lng is not None:
+            p, _title, _n = fetch_benchmark_price_via_micro_search(
+                client,
+                benchmark_url,
+                bm_lat,
+                bm_lng,
+                date.fromisoformat(in_date),
+                query_nights_sequence=(nights,) if nights > 1 else (1, 2),
+                search_location=search_location,
+            )
+            if p is not None:
+                return p
         p, _conf, _title = _extract_benchmark_price_with_min_stay_fallback(
             client, benchmark_url, in_date, out_date
         )
@@ -302,21 +558,25 @@ def estimate_benchmark_price_for_date(
     max_radius_km: float = DEFAULT_MAX_RADIUS_KM,
     excluded_room_ids: Optional[set[str]] = None,
     benchmark_name: Optional[str] = None,
+    benchmark_lat: Optional[float] = None,
+    benchmark_lng: Optional[float] = None,
+    benchmark_stay_nights: Optional[int] = None,
 ) -> BenchmarkDayResult:
     """
-    Execute a 2-night-primary benchmark-first query for *date_i*.
+    Execute a search-first benchmark query for *date_i*.
 
-    1. Run a 2-night Airbnb search first (fast-path: fewer rounds/cards) to
+    1. Run a 1-night-primary Airbnb search (fast-path: fewer rounds/cards) to
        collect market comps and locate the benchmark card if present.
-       Falls back to a 1-night search only when the 2-night search returns
+       Falls back to a 2-night search only when the 1-night search returns
        zero priced comps.
-    2. Always attempt benchmark direct-page extraction so the anchor price
-       comes from the listing page booking widget's discounted/current nightly rate.
-    3. If direct-page extraction fails and the benchmark appeared in results,
-       fall back to its search-result card price (per-night, already normalised
-       by parse_card_to_spec when price_kind is trip_total_*).
-    4. Remaining market comps → compute market adjustment.
-    5. Return blended final price.
+    2. Benchmark anchor price, cheapest source first — all direct HTTP, never
+       a browser navigation:
+         a. the benchmark's own card in the market search results;
+         b. a micro map-search zoomed to the benchmark's coordinates
+            (guarantees capture regardless of market-search ranking/filters);
+         c. a direct-HTTP PDP replay (1-night with 2-night min-stay fallback).
+    3. Remaining market comps → compute market adjustment.
+    4. Return blended final price.
     """
 
     checkin_str = date_i.isoformat()
@@ -352,6 +612,8 @@ def estimate_benchmark_price_for_date(
                 if query_center_lat is not None and query_center_lng is not None
                 else None
             ),
+            min_priced_target=BENCHMARK_MIN_PRICED_TARGET,
+            enforce_exact_capacity=False,
         )
 
         # ── Geographic distance filter ────────────────────────────────────
@@ -399,32 +661,15 @@ def estimate_benchmark_price_for_date(
         benchmark_price: Optional[float] = None
         benchmark_fetch_status = FETCH_STATUS_FAILED
         fetch_confidence = "failed"
-
-        # Benchmark is the primary anchor, so always prefer the listing page's
-        # live booking-widget price (including discounts) over the search card.
-        # Always attempt with a 1-night checkout regardless of how many nights the
-        # market search used — the extractor has its own 1→2-night fallback for
-        # listings with a minimum-stay > 1 night.
+        direct_page_title: Optional[str] = None
+        micro_search_title: Optional[str] = None
         _bm_checkout_str = (date_i + timedelta(days=1)).isoformat()
-        logger.info(
-            f"[benchmark] {checkin_str}: trying benchmark listing page first"
-        )
-        # Use half the configured rate limit before direct benchmark page fetches.
-        # The search page and listing page are different domains in Airbnb's eyes;
-        # the full rate_limit_seconds (1.0s) is overly conservative here.
-        time.sleep(min(rate_limit_seconds * 0.5, 0.5))
-        direct_price, direct_confidence, direct_page_title = _extract_benchmark_price_with_min_stay_fallback(
-            client, benchmark_url, checkin_str, _bm_checkout_str
-        )
-        if direct_price:
-            benchmark_price = direct_price
-            fetch_confidence = direct_confidence
-            benchmark_fetch_status = FETCH_STATUS_DIRECT_PAGE
-            logger.info(
-                f"[benchmark] {checkin_str}: direct page price=${benchmark_price:.2f} "
-                f"(confidence={fetch_confidence})"
-            )
-        elif benchmark_comp and benchmark_comp.nightly_price:
+
+        # Cheapest source first — search-card prices carry the same discounted
+        # rate the card shows a guest, and stays-search over direct HTTP is
+        # rarely challenged, unlike PDP fetches (whose browser fallback costs
+        # 10-15s per attempt and dominated benchmark report time).
+        if benchmark_comp and benchmark_comp.nightly_price:
             benchmark_price = benchmark_comp.nightly_price
             # Per-night normalization: parse_card_to_spec divides by scrape_nights only
             # when price_kind is "trip_total_*" AND price_nights > 1.
@@ -447,20 +692,62 @@ def estimate_benchmark_price_for_date(
             benchmark_fetch_status = FETCH_STATUS_SEARCH_HIT
             fetch_confidence = "high"
             logger.info(
-                f"[benchmark] {checkin_str}: direct page failed, falling back to search "
+                f"[benchmark] {checkin_str}: benchmark found in market search "
                 f"(price=${benchmark_price:.2f}, query_nights={query_nights_used})"
             )
-        else:
-            logger.info(
-                f"[benchmark] {checkin_str}: benchmark price unavailable from direct page and search"
-            )
 
-        # Real display name for the benchmark: user-saved name → PDP title
-        # (parsed alongside the direct-page price) → search-card title.
+        _bm_long_stay_rate = False
+        if benchmark_price is None:
+            micro_price, micro_search_title, _micro_nights = fetch_benchmark_price_via_micro_search(
+                client,
+                benchmark_url,
+                benchmark_lat,
+                benchmark_lng,
+                date_i,
+                query_nights_sequence=(
+                    (int(benchmark_stay_nights),)
+                    if benchmark_stay_nights and int(benchmark_stay_nights) > 0
+                    else (1, 2)
+                ),
+                search_location=str(target.location or ""),
+            )
+            if micro_price:
+                benchmark_price = micro_price
+                benchmark_fetch_status = FETCH_STATUS_SEARCH_HIT
+                # A nightly rate derived from a long stay window (min-stay
+                # listings) embeds weekly/monthly discounts — trust it less so
+                # the market correction gets more pull.
+                _bm_long_stay_rate = _micro_nights > 3
+                fetch_confidence = "medium" if _bm_long_stay_rate else "high"
+
+        _bm_dates_unavailable = False
+        if benchmark_price is None:
+            direct_price, direct_confidence, direct_page_title = _extract_benchmark_price_with_min_stay_fallback(
+                client, benchmark_url, checkin_str, _bm_checkout_str
+            )
+            if direct_price:
+                benchmark_price = direct_price
+                fetch_confidence = direct_confidence
+                benchmark_fetch_status = FETCH_STATUS_DIRECT_PAGE
+                logger.info(
+                    f"[benchmark] {checkin_str}: direct page price=${benchmark_price:.2f} "
+                    f"(confidence={fetch_confidence})"
+                )
+            else:
+                _bm_dates_unavailable = direct_confidence == "unavailable"
+                logger.info(
+                    f"[benchmark] {checkin_str}: benchmark price unavailable from "
+                    f"search, micro-search, and direct page"
+                    + (" (dates not bookable)" if _bm_dates_unavailable else "")
+                )
+
+        # Real display name for the benchmark: user-saved name → PDP title →
+        # search-card / micro-search-card title.
         benchmark_real_title = (
             (benchmark_name or "").strip()
             or (direct_page_title or "")
             or ((benchmark_comp.title or "").strip() if benchmark_comp else "")
+            or (micro_search_title or "")
         ) or None
 
         # ── Secondary comps (Phase 2 — observational only) ───────────────
@@ -471,24 +758,12 @@ def estimate_benchmark_price_for_date(
         secondary_prices: Dict[str, Optional[float]] = {}
         for sec_url in (secondary_benchmark_urls or []):
             sec_price: Optional[float] = None
-            try:
-                time.sleep(min(rate_limit_seconds * 0.35, 0.35))
-                sec_price, _sec_confidence, _sec_title = _extract_benchmark_price_with_min_stay_fallback(
-                    client, sec_url, checkin_str, _bm_checkout_str
-                )
-                if isinstance(sec_price, (int, float)) and sec_price > 0:
-                    sec_price = round(float(sec_price), 2)
-            except Exception as _sec_exc:
-                sec_price = None
-
-            if sec_price is None:
-                sec_match = next(
-                    (c for c in comps if c.url and comp_urls_match(c.url, sec_url)),
-                    None,
-                )
-                if sec_match and sec_match.nightly_price and sec_match.nightly_price > 0:
-                    sec_price = round(float(sec_match.nightly_price), 2)
-
+            sec_match = next(
+                (c for c in comps if c.url and comp_urls_match(c.url, sec_url)),
+                None,
+            )
+            if sec_match and sec_match.nightly_price and sec_match.nightly_price > 0:
+                sec_price = round(float(sec_match.nightly_price), 2)
             secondary_prices[sec_url] = sec_price
 
         # ── Stage 2: market comps (exclude primary benchmark only) ────────
@@ -522,8 +797,14 @@ def estimate_benchmark_price_for_date(
                     "url": benchmark_url,
                     "isPinnedBenchmark": True,
                 })
+            # No market comps at all — price the day at the pure benchmark
+            # price, exactly like the market_median-is-None branch below.
+            # Leaving median_price unset here discarded a successfully fetched
+            # benchmark anchor, made the whole pipeline return empty for sparse
+            # markets, and forced a redundant full re-scrape via run_scrape.
             return BenchmarkDayResult(
                 date=checkin_str,
+                median_price=benchmark_price,
                 benchmark_price=benchmark_price,
                 benchmark_fetch_status=benchmark_fetch_status,
                 fetch_confidence=fetch_confidence,
@@ -648,6 +929,10 @@ def estimate_benchmark_price_for_date(
         flags: List[str] = []
         if benchmark_fetch_status == FETCH_STATUS_FAILED:
             flags.append("benchmark_fetch_failed")
+        if _bm_dates_unavailable:
+            flags.append("benchmark_dates_unavailable")
+        if _bm_long_stay_rate:
+            flags.append("benchmark_long_stay_rate")
 
         # ── Blend: benchmark anchor + confidence-weighted market adjustment ──
         final_price: Optional[float] = None
@@ -890,7 +1175,12 @@ def aggregate_benchmark_transparency(
     benchmark_used = len(benchmark_prices) > 0
     fallback_reason: Optional[str] = None
     if not benchmark_used:
-        fallback_reason = "benchmark_fetch_failed"
+        # Distinguish "listing exists but isn't bookable for these dates"
+        # (host calendar blocked/closed) from a genuine fetch failure.
+        if any("benchmark_dates_unavailable" in r.flags for r in day_results):
+            fallback_reason = "benchmark_unavailable_for_dates"
+        else:
+            fallback_reason = "benchmark_fetch_failed"
 
     # Determine primary fetch method used
     if search_hits >= direct_fetches and search_hits > 0:

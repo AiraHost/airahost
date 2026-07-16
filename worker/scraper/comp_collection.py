@@ -572,6 +572,7 @@ def collect_search_comps(
     target_amenity_ids: Optional[List[int]] = None,
     min_priced_target: Optional[int] = None,
     span_nights: Optional[int] = None,
+    enforce_exact_capacity: bool = True,
 ) -> Tuple[List[ListingSpec], int]:
     collect_start = time.perf_counter()
     base_origin = safe_domain_base(str(base_origin or "https://www.airbnb.com"))
@@ -830,7 +831,11 @@ def collect_search_comps(
                     adults=adults,
                 )
             structural_excluded = 0
-            if target_accommodates is not None:
+            # enforce_exact_capacity=False (benchmark fast path): search cards
+            # frequently omit per-listing capacity, and the exact-match filter
+            # would drop every candidate — the server-side guests filter in the
+            # request already guarantees capacity >= target.
+            if target_accommodates is not None and enforce_exact_capacity:
                 before = len(comps)
                 new_comps = []
                 for c in comps:

@@ -97,6 +97,17 @@ class AirbnbClient:
     ) -> Tuple[int, Dict[str, Any]]:
         return self._get_playwright_scraper().search_listings_with_overrides(overrides)
 
+    def search_listings_direct_only(
+        self, overrides: Dict[str, Any]
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """StaysSearch via direct HTTP replay only — never the browser.
+
+        Unlike search_listings_with_overrides, a legitimately empty result page
+        is returned as-is instead of triggering a multi-second browser
+        navigation. Returns None when the direct replay itself failed.
+        """
+        return self._get_playwright_scraper().fetch_search_direct(overrides)
+
     def get_listing_details(
         self,
         listing_id: str,
@@ -125,6 +136,10 @@ class AirbnbClient:
             checkout=checkout or self.config.get("CHECKOUT", ""),
             adults=int(adults if adults is not None else self.config.get("ADULTS", 1)),
         )
+
+    def fetch_listing_page_html(self, listing_id: str) -> Optional[str]:
+        """Direct HTTP GET of the listing page's server-rendered HTML (~1s, no browser tab)."""
+        return self._get_playwright_scraper()._fetch_listing_page_html_direct(str(listing_id))
 
     def fetch_pdp_price_direct(
         self,

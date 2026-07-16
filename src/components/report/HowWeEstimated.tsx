@@ -332,7 +332,9 @@ function BenchmarkBlock({ info, name }: { info: BenchmarkInfo; name?: string | n
 
       {!statusUsed && info.fallbackReason && (
         <p className="mt-2 text-xs text-amber-700">
-          Fallback reason: {info.fallbackReason.replace(/_/g, " ")}. Market comps were used instead.
+          {info.fallbackReason === "benchmark_unavailable_for_dates"
+            ? "Your benchmark listing isn't bookable for these dates (its calendar appears blocked or closed), so no benchmark price exists. Market comps were used instead."
+            : `Fallback reason: ${info.fallbackReason.replace(/_/g, " ")}. Market comps were used instead.`}
         </p>
       )}
 

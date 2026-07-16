@@ -72,6 +72,7 @@ from worker.scraper.day_query import (
 )
 from worker.scraper.target_extractor import (
     ListingSpec,
+    extract_listing_coords_from_html,
     extract_listing_id_from_url,
     extract_nightly_price_from_listing_page,
     extract_target_spec,
@@ -1213,6 +1214,7 @@ def _build_url_mode_benchmark_info(
     search_hits = 0
     direct_fetches = 0
     failed = 0
+    dates_unavailable_days = 0
 
     secondary_urls = [
         str(pc.get("listingUrl") or "").strip()
@@ -1255,6 +1257,8 @@ def _build_url_mode_benchmark_info(
                 )
                 if _pdp_title and benchmark_title is None:
                     benchmark_title = _pdp_title
+                if pdp_price is None and _pdp_confidence == "unavailable":
+                    dates_unavailable_days += 1
                 if pdp_price:
                     primary_price = float(pdp_price)
                     fetch_method = FETCH_STATUS_DIRECT_PAGE
@@ -1369,7 +1373,17 @@ def _build_url_mode_benchmark_info(
         "maxAdjCap": BENCHMARK_MAX_ADJ,
         "outlierDays": outlier_days,
         "conflictDetected": conflict_detected,
-        "fallbackReason": None if benchmark_used else "benchmark_not_found_in_url_mode",
+        "fallbackReason": (
+            None
+            if benchmark_used
+            else (
+                # The benchmark's own page said the dates are not bookable —
+                # the listing exists but its calendar is blocked/closed.
+                "benchmark_unavailable_for_dates"
+                if dates_unavailable_days > 0
+                else "benchmark_not_found_in_url_mode"
+            )
+        ),
         "fetchStats": {
             "searchHits": search_hits,
             "directFetches": direct_fetches,
@@ -2397,15 +2411,10 @@ def run_benchmark_scrape(
         }
     )
     if True:
-        # Step 0: Probe Discounts
-        # 在開始逐日抓取前，先對 Benchmark 進行「定價策略探測」
-        # 這會額外花費約 3-5 秒，但能大幅提升準確度
-        discount_info = {}
-        try:
-            discount_info = probe_benchmark_discounts(client, benchmark_url, base_origin, d_start)
-        except Exception as e:
-            logger.warning(f"[benchmark] Discount probe failed: {e}")
-        # ────────────────────────────────────────────────────────────────
+        # Discount probing moved off the critical path: it now runs on a
+        # background thread concurrently with the day queries (see below),
+        # after the benchmark coordinates are known.
+        discount_info: Dict[str, Any] = {}
 
         try:
             # Step 1: Extract benchmark listing spec (location, capacity, etc.)
@@ -2595,6 +2604,69 @@ def run_benchmark_scrape(
                         f"({bm_mismatch_level})"
                     )
 
+            # ── Benchmark's own coordinates (per-day micro map-search) ────────
+            # When the target spec was extracted from the benchmark listing
+            # itself, its coords may already be on `target`; otherwise one
+            # direct-HTTP page GET + regex resolves them (~1s, no browser).
+            # Without coords the micro-search is skipped and per-day pricing
+            # falls back to direct-HTTP PDP.
+            _bm_lat: Optional[float] = None
+            _bm_lng: Optional[float] = None
+            _bm_coords_start = time.time()
+            if target_spec_override is None and not target_url:
+                _bm_lat, _bm_lng = target.lat, target.lng
+            if _bm_lat is None or _bm_lng is None:
+                try:
+                    _bm_room_id = extract_listing_id_from_url(benchmark_url)
+                    if _bm_room_id:
+                        _bm_html = client.fetch_listing_page_html(_bm_room_id)
+                        _bm_lat, _bm_lng = extract_listing_coords_from_html(_bm_html)
+                except Exception as _bm_coords_exc:
+                    logger.warning(
+                        f"[benchmark] Benchmark coords fetch failed "
+                        f"(micro-search disabled): {_bm_coords_exc}"
+                    )
+            timings["benchmark_coords_ms"] = round(
+                (time.time() - _bm_coords_start) * 1000
+            )
+            logger.info(
+                f"[benchmark] Benchmark coords: lat={_bm_lat} lng={_bm_lng}"
+            )
+
+            # ── Stay-window discovery (once per job) ──────────────────────────
+            # Long-min-stay benchmarks (e.g. 30-night furnished rentals) have no
+            # 1-2 night price anywhere; discover the shortest bookable window so
+            # each day query issues exactly one micro-search with it.
+            from worker.core.benchmark import discover_benchmark_stay_nights
+            _bm_stay_start = time.time()
+            _bm_stay_nights = discover_benchmark_stay_nights(
+                client,
+                benchmark_url,
+                _bm_lat,
+                _bm_lng,
+                all_nights[sample_indices[0]] if sample_indices else d_start,
+                search_location=str(target.location or ""),
+            )
+            timings["benchmark_stay_discovery_ms"] = round(
+                (time.time() - _bm_stay_start) * 1000
+            )
+
+            # ── Discount probe (background, concurrent with day queries) ──────
+            _probe_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="bm_discount_probe"
+            )
+            _probe_future = _probe_pool.submit(
+                probe_benchmark_discounts,
+                client,
+                benchmark_url,
+                base_origin,
+                d_start,
+                bm_lat=_bm_lat,
+                bm_lng=_bm_lng,
+                search_location=str(target.location or ""),
+                bm_stay_nights=_bm_stay_nights,
+            )
+
             effective_adults = adults
             if target.accommodates and target.accommodates > 0:
                 effective_adults = min(int(target.accommodates), 16)
@@ -2660,6 +2732,9 @@ def run_benchmark_scrape(
                         max_radius_km=_effective_radius,
                         excluded_room_ids=excluded_room_ids,
                         benchmark_name=benchmark_name,
+                        benchmark_lat=_bm_lat,
+                        benchmark_lng=_bm_lng,
+                        benchmark_stay_nights=_bm_stay_nights,
                     )
 
             try:
@@ -2834,6 +2909,15 @@ def run_benchmark_scrape(
                         f"[benchmark] Secondary {sec_url}: injected as synthetic comp "
                         f"(avg_price=${avg_sec_price}, n={len(sec_prices_found)} days)"
                     )
+
+            # Collect the background discount probe (started before day queries).
+            try:
+                discount_info = _probe_future.result(timeout=45)
+            except Exception as _probe_exc:
+                logger.warning(f"[benchmark] Discount probe failed: {_probe_exc}")
+                discount_info = {}
+            finally:
+                _probe_pool.shutdown(wait=False)
 
             # Aggregate benchmark transparency
             benchmark_info = aggregate_benchmark_transparency(benchmark_url, sampled_results)

@@ -306,6 +306,35 @@ def extract_listing_id_from_url(listing_url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+_HTML_COORDS_PATTERNS = (
+    re.compile(r'"latitude"\s*:\s*(-?\d+\.\d+)\s*,\s*"longitude"\s*:\s*(-?\d+\.\d+)'),
+    re.compile(r'"lat"\s*:\s*(-?\d+\.\d+)\s*,\s*"lng"\s*:\s*(-?\d+\.\d+)'),
+)
+
+
+def extract_listing_coords_from_html(html: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Pull the listing's public (privacy-fuzzed) coordinates out of server-rendered
+    listing-page HTML (JSON-LD geo block / embedded map state).
+
+    Much cheaper than a full spec extraction when only coordinates are needed
+    (single ~1s HTTP GET vs PDP GraphQL + amenity enrichment).
+    """
+    if not html:
+        return None, None
+    for pattern in _HTML_COORDS_PATTERNS:
+        m = pattern.search(html)
+        if not m:
+            continue
+        try:
+            lat, lng = float(m.group(1)), float(m.group(2))
+        except (TypeError, ValueError):
+            continue
+        if -90 <= lat <= 90 and -180 <= lng <= 180 and (lat != 0 or lng != 0):
+            return lat, lng
+    return None, None
+
+
 def _normalize_property_type_for_spec(value: Any) -> str:
     v = clean(str(value or ""))
     if not v:
