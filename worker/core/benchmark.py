@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -132,6 +133,32 @@ _SECONDARY_CONSENSUS_THRESHOLD: float = 0.20  # 20 %
 FETCH_STATUS_SEARCH_HIT = "search_hit"       # benchmark appeared in search results
 FETCH_STATUS_DIRECT_PAGE = "direct_page"     # obtained via listing-page scrape
 FETCH_STATUS_FAILED = "failed"               # price unavailable for this day
+
+
+class RadiusEscalation:
+    """
+    Shared across one job's concurrent day queries: as soon as any day's
+    market search finds zero comps, the map radius is doubled — that day
+    retries once at the doubled radius, and every later day query starts
+    with it. Escalation is one-shot (never beyond `factor`×) so a sparse
+    market widens the net once instead of compounding.
+    """
+
+    def __init__(self, factor: float = 2.0) -> None:
+        self._lock = threading.Lock()
+        self._factor = max(1.0, float(factor))
+        self._multiplier = 1.0
+
+    @property
+    def multiplier(self) -> float:
+        with self._lock:
+            return self._multiplier
+
+    def escalate(self) -> float:
+        """Raise the multiplier to `factor` (idempotent); returns the new value."""
+        with self._lock:
+            self._multiplier = self._factor
+            return self._multiplier
 
 
 def _resolve_query_center(target: ListingSpec) -> Tuple[Optional[float], Optional[float]]:
@@ -561,6 +588,7 @@ def estimate_benchmark_price_for_date(
     benchmark_lat: Optional[float] = None,
     benchmark_lng: Optional[float] = None,
     benchmark_stay_nights: Optional[int] = None,
+    radius_escalation: Optional[RadiusEscalation] = None,
 ) -> BenchmarkDayResult:
     """
     Execute a search-first benchmark query for *date_i*.
@@ -588,33 +616,58 @@ def estimate_benchmark_price_for_date(
         if isinstance(max_radius_km, (int, float)) and float(max_radius_km) > 0:
             map_radius_limit_km = min(float(max_radius_km), MAP_RADIUS_CAP_KM)
 
-        # 2-night-primary / 1-night-fallback search with coord extraction.
-        # exclude_url is intentionally None: the benchmark listing must remain
-        # in the results so Stage 1 can capture its search-card price as a
-        # fallback when direct-page extraction fails.
-        comps, query_nights_used = collect_search_comps(
-            client,
-            target.location,
-            base_origin,
-            date_i,
-            adults,
-            max_scroll_rounds=max_scroll_rounds,
-            max_cards=max_cards,
-            rate_limit_seconds=rate_limit_seconds,
-            log_prefix="benchmark",
-            target_accommodates=target.accommodates,
-            target_beds=target.beds,
-            target_baths=target.baths,
-            center_lat=query_center_lat,
-            center_lng=query_center_lng,
-            map_radius_km=(
-                map_radius_limit_km
-                if query_center_lat is not None and query_center_lng is not None
-                else None
-            ),
-            min_priced_target=BENCHMARK_MIN_PRICED_TARGET,
-            enforce_exact_capacity=False,
-        )
+        # Sparse-market radius escalation: once any day in this job found zero
+        # comps, all searches use a doubled radius (shared via radius_escalation).
+        _radius_mult = radius_escalation.multiplier if radius_escalation else 1.0
+
+        def _run_market_search(radius_mult: float):
+            # exclude_url is intentionally None: the benchmark listing must
+            # remain in the results so Stage 1 can capture its search-card
+            # price as a fallback when direct-page extraction fails.
+            return collect_search_comps(
+                client,
+                target.location,
+                base_origin,
+                date_i,
+                adults,
+                max_scroll_rounds=max_scroll_rounds,
+                max_cards=max_cards,
+                rate_limit_seconds=rate_limit_seconds,
+                log_prefix="benchmark",
+                target_accommodates=target.accommodates,
+                target_beds=target.beds,
+                target_baths=target.baths,
+                center_lat=query_center_lat,
+                center_lng=query_center_lng,
+                map_radius_km=(
+                    map_radius_limit_km * radius_mult
+                    if query_center_lat is not None and query_center_lng is not None
+                    else None
+                ),
+                min_priced_target=BENCHMARK_MIN_PRICED_TARGET,
+                enforce_exact_capacity=False,
+            )
+
+        comps, query_nights_used = _run_market_search(_radius_mult)
+
+        # Zero comps at the current radius: double it for the whole job and
+        # retry this day once at the doubled radius (later days start doubled).
+        if (
+            not comps
+            and radius_escalation is not None
+            and query_center_lat is not None
+            and query_center_lng is not None
+        ):
+            escalated_mult = radius_escalation.escalate()
+            if escalated_mult > _radius_mult:
+                logger.info(
+                    f"[benchmark] {checkin_str}: no comps within "
+                    f"{map_radius_limit_km * _radius_mult:.2f}km — retrying at "
+                    f"doubled radius {map_radius_limit_km * escalated_mult:.2f}km "
+                    f"(applies to remaining days)"
+                )
+                _radius_mult = escalated_mult
+                comps, query_nights_used = _run_market_search(_radius_mult)
 
         # ── Geographic distance filter ────────────────────────────────────
         # Applied before Stage 1.  The benchmark card is excluded from
@@ -622,8 +675,13 @@ def estimate_benchmark_price_for_date(
         # Comps without coords always pass through (never blocked on missing data).
         if target.lat is not None and target.lng is not None:
             try:
+                _geo_radius_km = (
+                    float(max_radius_km) * _radius_mult
+                    if isinstance(max_radius_km, (int, float)) and float(max_radius_km) > 0
+                    else max_radius_km
+                )
                 comps, _ = apply_geo_filter(
-                    comps, target.lat, target.lng, max_radius_km
+                    comps, target.lat, target.lng, _geo_radius_km
                 )
             except Exception as _bm_geo_exc:
                 logger.warning(
@@ -933,6 +991,8 @@ def estimate_benchmark_price_for_date(
             flags.append("benchmark_dates_unavailable")
         if _bm_long_stay_rate:
             flags.append("benchmark_long_stay_rate")
+        if _radius_mult > 1.0:
+            flags.append("map_radius_expanded")
 
         # ── Blend: benchmark anchor + confidence-weighted market adjustment ──
         final_price: Optional[float] = None
@@ -1141,6 +1201,30 @@ def estimate_benchmark_price_for_date(
             is_weekend=is_weekend,
             error=str(exc)[:200],
         )
+
+
+def apply_market_only_rescue(sampled_results: List[BenchmarkDayResult]) -> int:
+    """
+    Price sampled days from their market medians when the benchmark had no
+    bookable price on ANY sampled day (calendar blocked/closed listing).
+
+    The market comps were already collected by the same day queries, so
+    discarding them and re-running the full standard pipeline would roughly
+    double report time only to rebuild the same market signal. Returns the
+    number of days repriced; 0 when at least one benchmark anchor exists
+    (interpolation from anchors stays the better strategy in that case).
+    """
+    if not sampled_results:
+        return 0
+    if any(r.benchmark_price is not None for r in sampled_results):
+        return 0
+    rescued = 0
+    for r in sampled_results:
+        if r.median_price is None and isinstance(r.market_price, (int, float)) and r.market_price > 0:
+            r.median_price = float(r.market_price)
+            r.flags.append("market_only_pricing")
+            rescued += 1
+    return rescued
 
 
 # ── Aggregate transparency stats ─────────────────────────────────────────────

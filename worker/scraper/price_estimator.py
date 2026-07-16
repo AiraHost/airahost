@@ -2652,20 +2652,30 @@ def run_benchmark_scrape(
             )
 
             # ── Discount probe (background, concurrent with day queries) ──────
-            _probe_pool = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="bm_discount_probe"
-            )
-            _probe_future = _probe_pool.submit(
-                probe_benchmark_discounts,
-                client,
-                benchmark_url,
-                base_origin,
-                d_start,
-                bm_lat=_bm_lat,
-                bm_lng=_bm_lng,
-                search_location=str(target.location or ""),
-                bm_stay_nights=_bm_stay_nights,
-            )
+            # Skipped when discovery already proved there is no bookable window
+            # at the report start date — the probe's base fetch targets the same
+            # date and would fail the same way (4 wasted requests).
+            _probe_pool: Optional[ThreadPoolExecutor] = None
+            _probe_future = None
+            if _bm_lat is not None and _bm_lng is not None and _bm_stay_nights is None:
+                logger.info(
+                    "[benchmark] Discount probe skipped: no bookable stay window found"
+                )
+            else:
+                _probe_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="bm_discount_probe"
+                )
+                _probe_future = _probe_pool.submit(
+                    probe_benchmark_discounts,
+                    client,
+                    benchmark_url,
+                    base_origin,
+                    d_start,
+                    bm_lat=_bm_lat,
+                    bm_lng=_bm_lng,
+                    search_location=str(target.location or ""),
+                    bm_stay_nights=_bm_stay_nights,
+                )
 
             effective_adults = adults
             if target.accommodates and target.accommodates > 0:
@@ -2686,7 +2696,11 @@ def run_benchmark_scrape(
             }
 
             # Step 2: Benchmark day-by-day queries
-            from worker.core.benchmark import BENCHMARK_TOP_K
+            from worker.core.benchmark import BENCHMARK_TOP_K, RadiusEscalation
+
+            # Shared across all concurrent day queries: the first day that
+            # finds zero comps doubles the map radius for the rest of the job.
+            _bm_radius_escalation = RadiusEscalation(factor=2.0)
             sampled_results: List[BenchmarkDayResult] = []
             day_loop_start = time.time()
             _bm_day_query_workers = _bounded_workers("BENCHMARK_DAY_QUERY_MAX_WORKERS", 12)
@@ -2735,6 +2749,7 @@ def run_benchmark_scrape(
                         benchmark_lat=_bm_lat,
                         benchmark_lng=_bm_lng,
                         benchmark_stay_nights=_bm_stay_nights,
+                        radius_escalation=_bm_radius_escalation,
                     )
 
             try:
@@ -2784,6 +2799,21 @@ def run_benchmark_scrape(
                     "max_cards": nightly_plan.max_cards,
                     "query_workers": _bm_day_query_workers,
                 }
+
+            # ── Market-only rescue ────────────────────────────────────────────
+            # Benchmark unbookable on every sampled day (calendar blocked or
+            # closed): price the days from the market medians these same
+            # queries already collected instead of returning empty — which
+            # would discard all of this work and re-run the full standard
+            # pipeline, roughly doubling report time.
+            from worker.core.benchmark import apply_market_only_rescue
+            _market_rescued = apply_market_only_rescue(sampled_results)
+            if _market_rescued:
+                logger.warning(
+                    f"[benchmark] No benchmark anchors on any sampled day — "
+                    f"priced {_market_rescued} day(s) from market medians "
+                    f"(market-only mode, standard-pipeline fallback avoided)"
+                )
 
             # Step 3: Interpolate
             # Reuse standard interpolation — BenchmarkDayResult.median_price is the blended price
@@ -2911,13 +2941,15 @@ def run_benchmark_scrape(
                     )
 
             # Collect the background discount probe (started before day queries).
-            try:
-                discount_info = _probe_future.result(timeout=45)
-            except Exception as _probe_exc:
-                logger.warning(f"[benchmark] Discount probe failed: {_probe_exc}")
-                discount_info = {}
-            finally:
-                _probe_pool.shutdown(wait=False)
+            if _probe_future is not None:
+                try:
+                    discount_info = _probe_future.result(timeout=45)
+                except Exception as _probe_exc:
+                    logger.warning(f"[benchmark] Discount probe failed: {_probe_exc}")
+                    discount_info = {}
+                finally:
+                    if _probe_pool is not None:
+                        _probe_pool.shutdown(wait=False)
 
             # Aggregate benchmark transparency
             benchmark_info = aggregate_benchmark_transparency(benchmark_url, sampled_results)
