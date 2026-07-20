@@ -21,10 +21,12 @@ Stage 2 — Market validation / adjustment
 
   final_price = benchmark_price × (1 + capped_adj × MARKET_WEIGHT)
 
-Fast-path settings
+Per-query settings
 ------------------
-Benchmark mode requests fewer scroll rounds, fewer cards, and fewer
-sample days than the standard pipeline, making it faster overall.
+Benchmark mode's scroll-round/card/comp-count limits default to the same
+values as the standard pipeline (env-configurable independently). It
+queries every night (same as the standard pipeline) so every day has its
+own comparable listings.
 """
 
 from __future__ import annotations
@@ -68,16 +70,16 @@ logger = logging.getLogger("worker.core.benchmark")
 
 # ── Tuning constants ─────────────────────────────────────────────────────────
 
-# Fast-path scraping limits (less than standard day-query defaults)
-BENCHMARK_SCROLL_ROUNDS: int = 1     # standard: DAY_SCROLL_ROUNDS = 2
-BENCHMARK_MAX_CARDS: int = 15        # standard: DAY_MAX_CARDS = 30
-BENCHMARK_TOP_K: int = 5             # standard: top_k = 10
-# Long windows (>SAMPLE_THRESHOLD nights) sample this many nights live and
-# interpolate the rest. Raised to match the standard pipeline's MAX_SAMPLE_QUERIES
-# (20) — the old value of 10 left too few live anchors for a 28-30 night window
-# when several sampled days fail to fetch a benchmark price, producing long
-# interpolated stretches with no per-day comparable listings.
-BENCHMARK_MAX_SAMPLE_QUERIES: int = int(os.getenv("BENCHMARK_MAX_SAMPLE_QUERIES", "20"))
+# Per-query scraping limits. Raised to match the standard pipeline's
+# DAY_SCROLL_ROUNDS/DAY_MAX_CARDS — near-term dates in particular often have
+# sparse raw inventory, and scanning fewer cards left too few candidates for
+# BENCHMARK_TOP_K to pick from on those days.
+BENCHMARK_SCROLL_ROUNDS: int = int(os.getenv("BENCHMARK_SCROLL_ROUNDS", "2"))
+BENCHMARK_MAX_CARDS: int = int(os.getenv("BENCHMARK_MAX_CARDS", "30"))
+# Comps kept per day. Raised from 5 so each day's comparableListings entry
+# lands in the 7-20 range the report UI targets (5 market comps + the pinned
+# benchmark itself was landing most days at 5-6).
+BENCHMARK_TOP_K: int = int(os.getenv("BENCHMARK_TOP_K", "12"))
 MAP_RADIUS_CAP_KM: float = 5.0 * 1.609344  # exactly 5 miles
 
 # Micro map-search radius around the benchmark's own coordinates.

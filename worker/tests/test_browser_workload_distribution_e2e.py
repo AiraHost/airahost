@@ -326,6 +326,7 @@ def test_run_benchmark_day_query_accepts_runner_keyword_args(monkeypatch):
         progress_callback=None,
     ):
         assert isinstance(args_list, list) and args_list
+        assert len(args_list) == 23
         first = dict(args_list[0])
         assert set(first.keys()) == {"night_idx", "browser_slot"}
         _ = query_func(**first)
@@ -341,7 +342,7 @@ def test_run_benchmark_day_query_accepts_runner_keyword_args(monkeypatch):
         price_estimator.run_benchmark_scrape(
             benchmark_url="https://www.airbnb.com/rooms/987654321",
             checkin="2026-06-01",
-            checkout="2026-06-04",
+            checkout="2026-06-24",
             rate_limit_seconds=0.0,
         )
 

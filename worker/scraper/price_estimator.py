@@ -61,11 +61,8 @@ from worker.scraper.day_query import (
     DayResult,
     MAP_RADIUS_CAP_KM,
     MAX_NIGHTS,
-    MAX_SAMPLE_QUERIES,
     PER_DAY_MAX_RETRIES,
-    SAMPLE_THRESHOLD,
     SIMILARITY_FLOOR_FALLBACK,
-    compute_sample_dates,
     daterange_nights,
     estimate_base_price_for_date,
     interpolate_missing_days,
@@ -2356,7 +2353,6 @@ def run_benchmark_scrape(
     so the caller can fall back to the standard run_scrape pipeline.
     """
     from worker.core.benchmark import (
-        BENCHMARK_MAX_SAMPLE_QUERIES,
         BenchmarkDayResult,
         aggregate_benchmark_transparency,
         benchmark_day_result_to_dict,
@@ -2385,10 +2381,11 @@ def run_benchmark_scrape(
 
     all_nights = daterange_nights(d_start, d_end)
 
-    if total_nights <= SAMPLE_THRESHOLD:
-        sample_indices = list(range(total_nights))
-    else:
-        sample_indices = compute_sample_dates(total_nights, BENCHMARK_MAX_SAMPLE_QUERIES)
+    # The report UI only shows a comparable on a selected day when that
+    # listing has an exact price for the day. Interpolated benchmark prices do
+    # not provide that evidence, so benchmark reports must query every day just
+    # like the standard URL-scrape pipeline.
+    sample_indices = list(range(total_nights))
     from worker.core.benchmark import BENCHMARK_SCROLL_ROUNDS as _bm_eff_scroll_rounds, BENCHMARK_MAX_CARDS as _bm_eff_max_cards  # noqa: E501
     _bm_early_stop_threshold = None
     logger.info(

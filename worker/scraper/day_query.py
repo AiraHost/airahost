@@ -840,13 +840,24 @@ def interpolate_missing_days(
             flags.append("missing_data")
 
         if interp_price is not None:
+            # A day can need price interpolation (its own anchor price wasn't
+            # found — e.g. a benchmark listing unbookable for that date) while
+            # still having collected real market comps in the same query.
+            # Carry those forward instead of discarding them, so the report
+            # can still show comparable listings for this date.
+            _orig = all_sampled.get(ds)
+            _carry_comps = bool(_orig and (_orig.comps_collected or _orig.top_comps))
             result.append(DayResult(
                 date=ds,
                 median_price=round(interp_price, 2),
+                comps_collected=_orig.comps_collected if _carry_comps else 0,
+                comps_used=_orig.comps_used if _carry_comps else 0,
                 filter_stage="interpolated",
                 flags=flags,
                 is_sampled=False,
                 is_weekend=is_weekend,
+                top_comps=list(_orig.top_comps) if _carry_comps else [],
+                comp_prices=dict(_orig.comp_prices) if _carry_comps else {},
             ))
         else:
             result.append(DayResult(
