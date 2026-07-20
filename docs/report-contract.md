@@ -261,112 +261,23 @@ unchanged; `execution_policy` is available for future filtering if needed.
 
 ---
 
-## Nightly Crawl Strategy (Phase 3)
+## Nightly Scraping: aligned with interactive
 
-Nightly jobs are **budgeted collectors**, not full 30-day live analyses.  They
-use a tiered date-selection plan built in `worker/core/nightly_strategy.py` to
-minimise Airbnb request volume while preserving the two outcomes that matter:
+Nightly jobs run the exact same scrape pipeline as interactive jobs — same
+per-day sampling (every night queried, no tiered observe/infer split), same
+scroll-round and card limits (`DAY_QUERY_SCROLL_ROUNDS` / `DAY_QUERY_MAX_CARDS`
+for Modes A/B, `BENCHMARK_SCROLL_ROUNDS` / `BENCHMARK_MAX_CARDS` for Mode C),
+and no circuit breaker. There is no `nightly_plan` parameter anymore and no
+`result_core_debug.nightly_crawl` block.
 
-1. **Fresh near-term data** for alert evaluation (D0–D3)
-2. **Recurring market observations** at lower cadence for future ML training (D4+)
+The only place nightly and interactive still diverge is scheduling (`job_lane`,
+`WORKER_LANE`) and post-scrape side effects (writing `market_price_observations`,
+queueing an ML forecast) — not comp-finding.
 
-### Date Tiers (defaults, all tunable via env vars)
-
-| Tier | Date range | Cadence | Env var (boundary) |
-|---|---|---|---|
-| `near_term` | D0 – D3 | Every night | `NIGHTLY_TIER1_END=4` |
-| `medium` | D4 – D10 | Every 2 nights | `NIGHTLY_TIER2_END=11`, `NIGHTLY_TIER2_STEP=2` |
-| `far` | D11 – D21 | Every 3 nights | `NIGHTLY_TIER3_END=22`, `NIGHTLY_TIER3_STEP=3` |
-| `sparse` | D22 – D29 | First + last only | `NIGHTLY_TIER4_COUNT=2` |
-
-**Hard cap**: `NIGHTLY_MAX_OBSERVE_DATES=15` — never observe more than this many
-nights regardless of tier math.
-
-For a standard 30-night window this produces **~14 observed nights** and **~16
-interpolated nights**.  By comparison, the interactive path samples ~16 of 30
-nights via `compute_sample_dates()` (`step = ceil(30 / MAX_SAMPLE_QUERIES) = 2`),
-so nightly and interactive coverage are roughly equivalent for a 30-night window.
-Unsampled nights are filled by the existing `interpolate_missing_days()` linear
-interpolation — output shape is unchanged.
-
-### Per-query limits
-
-Nightly queries use reduced scroll depth and card limits to further cut request
-volume per observed night.  Mode C (benchmark) uses a separate, tighter cap
-that keeps its volume at parity with the pre-Phase-3 `BENCHMARK_MAX_SAMPLE_QUERIES=10`
-interactive baseline:
-
-| Setting | Interactive default | Nightly (A/B) | Nightly (C benchmark) | Env var |
-|---|---|---|---|---|
-| Scroll rounds | `DAY_QUERY_SCROLL_ROUNDS` (2) | 1 | 1 | `NIGHTLY_SCROLL_ROUNDS` / `BENCHMARK_NIGHTLY_SCROLL_ROUNDS` |
-| Max cards | `DAY_QUERY_MAX_CARDS` (30) | 20 | 15 | `NIGHTLY_MAX_CARDS` / `BENCHMARK_NIGHTLY_MAX_CARDS` |
-| Max observe dates | — | 15 | 10 | `NIGHTLY_MAX_OBSERVE_DATES` / `BENCHMARK_NIGHTLY_MAX_OBSERVE` |
-
-`build_nightly_crawl_plan(total_nights, mode="benchmark")` is called for Mode C;
-`mode="standard"` (default) is used for Modes A and B.  Criteria Mode B Pass 1
-(`scroll_and_collect` anchor search) also uses `nightly_plan.scroll_rounds` /
-`nightly_plan.max_cards` when a nightly plan is active, reducing its anchor-search
-volume on nightly runs.
-
-### Circuit-breaker (early-stop)
-
-If the scrape loop sees `NIGHTLY_EARLY_STOP_THRESHOLD` (default: 3) consecutive
-date queries with no price results — a signal of Airbnb challenge pages or
-empty search results — the loop halts without querying the remaining planned
-dates.  Already-collected observations are preserved and the rest are
-interpolated.
-
-The job still completes (does not fail) if there are enough valid prices to
-build a calendar.  `result_core_debug.nightly_crawl.early_stop_triggered` is
-set to `true` when this fires.
-
-### Debug metadata
-
-Every nightly fresh-scrape report (not cache-hit) includes a
-`result_core_debug.nightly_crawl` block:
-
-```json
-{
-  "total_nights": 30,
-  "observed_count": 12,
-  "queried_count": 13,
-  "infer_count": 18,
-  "early_stop_triggered": false,
-  "consecutive_empty_peak": 1,
-  "scroll_rounds": 1,
-  "max_cards": 20,
-  "tiers": {
-    "near_term": { "range": "D0-D3",   "indices": [0,1,2,3],        "step": 1, "observed": 4 },
-    "medium":    { "range": "D4-D10",  "indices": [4,6,8,10],       "step": 2, "observed": 4 },
-    "far":       { "range": "D11-D21", "indices": [11,14,17,20],    "step": 3, "observed": 4 },
-    "sparse":    { "range": "D22-D29", "indices": [22,29],                     "observed": 2 }
-  },
-  "planned_observe_indices":  [0,1,2,3,4,6,8,10,11,14,17,20,22,29],
-  "actual_queried_indices":   [0,1,2,3,4,6,8,10,11,14,17,20,22],
-  "actual_observed_indices":  [0,1,2,3,4,6,8,10,11,14,17,22],
-  "actual_inferred_indices":  [5,7,9,12,13,15,16,18,19,21,23,24,25,26,27,28,29]
-}
-```
-
-Field semantics:
-- `planned_observe_indices` — nights the plan intended to query (before execution)
-- `actual_queried_indices` — nights actually sent to Airbnb (may be shorter if early-stop or timeout fired)
-- `actual_observed_indices` — queried nights that returned a non-null `median_price`
-- `actual_inferred_indices` — all remaining nights filled by interpolation
-- `observed_count` / `queried_count` / `infer_count` — lengths of the above lists
-
-`tiers` indices are updated after the hard-cap is applied, reflecting the indices
-actually included in `planned_observe_indices` rather than the pre-cap planned set.
-
-Interactive reports do not include `nightly_crawl` — its absence indicates a
-standard interactive run.
-
-### Interactive jobs: unchanged
-
-`run_interactive_job()` passes `nightly_plan=None` to all scrape functions.
-When `nightly_plan` is `None`, every scrape function falls through to its
-existing sampling logic (`compute_sample_dates()` / `BENCHMARK_MAX_SAMPLE_QUERIES`),
-card limits, and scroll rounds.  No behavior change for interactive paths.
+`OBS_FRESH_TIER1_END` / `OBS_FRESH_TIER2_END` exist as env vars only for
+`worker/core/observation_reuse.py`'s freshness-tier policy (how fresh a stored
+observation must be before an interactive report reuses it instead of
+live-scraping) — unrelated to how nightly scrapes.
 
 ---
 

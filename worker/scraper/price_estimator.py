@@ -1572,7 +1572,6 @@ def run_scrape(
     target_lng: Optional[float] = None,
     max_radius_km: Optional[float] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
     fallback_attributes: Optional[Dict[str, Any]] = None,
     fallback_address: Optional[str] = None,
     target_spec_override: Optional[ListingSpec] = None,
@@ -1624,31 +1623,19 @@ def run_scrape(
 
     all_nights = daterange_nights(d_start, d_end)
 
-    # Query every night in the requested range.
-    if nightly_plan is not None:
-        sample_indices = list(range(total_nights))
-        _eff_scroll_rounds = nightly_plan.scroll_rounds
-        _eff_max_cards = nightly_plan.max_cards
-        _early_stop_threshold = None
-        logger.info(
-            f"Day-by-day pipeline (nightly): {total_nights} nights, "
-            f"querying all {len(sample_indices)} nights "
-            f"(scroll_rounds={_eff_scroll_rounds}, max_cards={_eff_max_cards})"
-        )
-    else:
-        # Interactive reports PRICE every night with accurate 1/2-night day
-        # queries so each day's comp prices are real (not reused across days).
-        # Comparable-listing POOL discovery is the part chunked into 5-day spans
-        # (see _fixed_pool_nights below).
-        sample_indices = list(range(total_nights))
-        _eff_scroll_rounds = max_scroll_rounds
-        _eff_max_cards = max_cards
-        _early_stop_threshold = None
-        logger.info(
-            f"Day-by-day pipeline: {total_nights} nights, "
-            f"pricing all {len(sample_indices)} days "
-            f"(pool discovery chunked every {INTERACTIVE_CHUNK_DAYS} days)"
-        )
+    # Every job (nightly and interactive) prices every night with accurate
+    # 1/2-night day queries so each day's comp prices are real (not reused
+    # across days). Comparable-listing POOL discovery is the part chunked
+    # into 5-day spans (see _fixed_pool_nights below).
+    sample_indices = list(range(total_nights))
+    _eff_scroll_rounds = max_scroll_rounds
+    _eff_max_cards = max_cards
+    _early_stop_threshold = None
+    logger.info(
+        f"Day-by-day pipeline: {total_nights} nights, "
+        f"pricing all {len(sample_indices)} days "
+        f"(pool discovery chunked every {INTERACTIVE_CHUNK_DAYS} days)"
+    )
 
     client = AirbnbClient(
         {
@@ -1975,19 +1962,14 @@ def run_scrape(
 
             fixed_comp_pool: Dict[str, Dict[str, Any]] = {}
             fixed_pool_start = time.time()
-            # Interactive reports anchor the fixed pool on the same chunk anchors
-            # as the day queries above (one per INTERACTIVE_CHUNK_DAYS-day span).
-            # Nightly keeps striding across the span for ML observation coverage.
-            if nightly_plan is not None:
-                _fixed_pool_nights = all_nights
-                _fixed_pool_stride = FIXED_COMP_POOL_STRIDE_DAYS
-            else:
-                # Pool discovery is chunked into 5-day spans: one 5-night anchor
-                # per span (pricing above still runs per day).
-                _fixed_pool_nights = [
-                    all_nights[i] for i in range(0, total_nights, INTERACTIVE_CHUNK_DAYS)
-                ]
-                _fixed_pool_stride = 1
+            # Fixed pool anchors the same chunk anchors as the day queries
+            # above (one per INTERACTIVE_CHUNK_DAYS-day span). Pool discovery
+            # is chunked into 5-day spans: one 5-night anchor per span
+            # (pricing above still runs per day).
+            _fixed_pool_nights = [
+                all_nights[i] for i in range(0, total_nights, INTERACTIVE_CHUNK_DAYS)
+            ]
+            _fixed_pool_stride = 1
             try:
                 (
                     fixed_comp_pool,
@@ -2093,6 +2075,65 @@ def run_scrape(
                         logger.info(
                             f"[day_query] {date_str}: retry {attempt+1}/{PER_DAY_MAX_RETRIES}"
                         )
+
+                # Still no price after the normal retries: refresh the comp
+                # pool with a fresh anchor search for this specific date and
+                # try once more before giving up. Handles the case where the
+                # job-wide fixed_comp_pool's cached comps are no longer
+                # priceable for this date (e.g. booked/blocked) even though
+                # the market itself isn't empty. Exactly one refresh attempt;
+                # if it still finds no price, the day is left for interpolation.
+                if result is not None and result.median_price is None:
+                    logger.info(
+                        f"[day_query] {date_str}: no price after {PER_DAY_MAX_RETRIES} "
+                        f"attempt(s); refreshing comp pool and retrying once"
+                    )
+                    try:
+                        with day_lock:
+                            refreshed_pool = _build_fixed_comp_pool(
+                                day_client,
+                                target,
+                                base_origin,
+                                date_i,
+                                effective_adults,
+                                max_scroll_rounds=_eff_scroll_rounds,
+                                max_cards=_eff_max_cards,
+                                rate_limit_seconds=rate_limit_seconds,
+                                max_radius_km=_effective_radius,
+                                pool_size=FIXED_COMP_POOL_GLOBAL_LIMIT,
+                            )
+                    except Exception as refresh_exc:
+                        logger.warning(
+                            f"[day_query] {date_str}: comp pool refresh failed "
+                            f"(non-fatal): {refresh_exc}"
+                        )
+                        refreshed_pool = {}
+                    merged_pool = {**(fixed_comp_pool or {}), **refreshed_pool}
+                    time.sleep(rate_limit_seconds)
+                    with day_lock:
+                        refreshed_result = estimate_base_price_for_date(
+                            day_client,
+                            target,
+                            base_origin,
+                            date_i,
+                            effective_adults,
+                            max_scroll_rounds=_eff_scroll_rounds,
+                            max_cards=_eff_max_cards,
+                            rate_limit_seconds=rate_limit_seconds,
+                            top_k=top_k,
+                            preferred_comps=preferred_comps,
+                            excluded_room_ids=excluded_room_ids,
+                            max_radius_km=_effective_radius,
+                            known_comp_pool=merged_pool or None,
+                            allow_relaxed_similarity=False,
+                            target_amenity_ids=_day_query_target_amenity_ids,
+                        )
+                    if refreshed_result.median_price is not None:
+                        logger.info(
+                            f"[day_query] {date_str}: recovered price after comp pool refresh"
+                        )
+                    result = refreshed_result
+
                 if result is None:
                     return DayResult(
                         date=date_i.isoformat(),
@@ -2128,35 +2169,6 @@ def run_scrape(
                 )
 
             timings["day_queries_ms"] = round((time.time() - day_loop_start) * 1000)
-            # Record nightly crawl metadata for debug visibility.
-            if nightly_plan is not None:
-                # Compute actual observed/inferred from execution tracking, not from the
-                # original plan.  If early-stop fired, unqueried planned dates must not
-                # be counted as observed or as the plan's original infer set.
-                _actual_observed = [
-                    _queried_night_indices[i]
-                    for i, r in enumerate(sampled_results)
-                    if r.median_price is not None
-                ]
-                _actual_inferred = sorted(
-                    set(range(nightly_plan.total_nights)) - set(_actual_observed)
-                )
-                timings["nightly_crawl_debug"] = {
-                    "total_nights": nightly_plan.total_nights,
-                    "observed_count": len(_actual_observed),
-                    "queried_count": len(_queried_night_indices),
-                    "infer_count": len(_actual_inferred),
-                    "early_stop_triggered": _early_stop_triggered,
-                    "consecutive_empty_peak": _consecutive_empty_peak,
-                    "tiers": nightly_plan.tier_debug,
-                    "planned_observe_indices": nightly_plan.observe_indices,
-                    "actual_queried_indices": _queried_night_indices,
-                    "actual_observed_indices": _actual_observed,
-                    "actual_inferred_indices": _actual_inferred,
-                    "scroll_rounds": nightly_plan.scroll_rounds,
-                    "max_cards": nightly_plan.max_cards,
-                    "query_workers": _day_query_workers,
-                }
 
             # Step 3: Interpolate unsampled/failed days. Every night is priced
             # per day, so interpolation only fills days whose query failed.
@@ -2329,7 +2341,6 @@ def run_benchmark_scrape(
     max_radius_km: Optional[float] = None,
     excluded_room_ids: Optional[set[str]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
     fallback_address: Optional[str] = None,
     target_url: Optional[str] = None,
     benchmark_name: Optional[str] = None,
@@ -2343,10 +2354,6 @@ def run_benchmark_scrape(
     Returns (daily_results, transparent_result).
     Fallback: if benchmark price fetch fails entirely, raises ValueError
     so the caller can fall back to the standard run_scrape pipeline.
-
-    nightly_plan: when provided (nightly jobs only), overrides sample indices
-    with the tiered nightly plan and applies reduced per-query limits and
-    circuit-breaker early-stop.
     """
     from worker.core.benchmark import (
         BENCHMARK_MAX_SAMPLE_QUERIES,
@@ -2378,27 +2385,16 @@ def run_benchmark_scrape(
 
     all_nights = daterange_nights(d_start, d_end)
 
-    # Nightly jobs use the tiered plan; benchmark interactive uses standard sampling.
-    if nightly_plan is not None:
-        sample_indices = nightly_plan.observe_indices
-        _bm_eff_scroll_rounds = nightly_plan.scroll_rounds
-        _bm_eff_max_cards = nightly_plan.max_cards
-        _bm_early_stop_threshold: Optional[int] = nightly_plan.early_stop_threshold
-        logger.info(
-            f"Benchmark pipeline (nightly): {benchmark_url} | {total_nights} nights, "
-            f"observing {len(sample_indices)} / inferring {len(nightly_plan.infer_indices)}"
-        )
+    if total_nights <= SAMPLE_THRESHOLD:
+        sample_indices = list(range(total_nights))
     else:
-        if total_nights <= SAMPLE_THRESHOLD:
-            sample_indices = list(range(total_nights))
-        else:
-            sample_indices = compute_sample_dates(total_nights, BENCHMARK_MAX_SAMPLE_QUERIES)
-        from worker.core.benchmark import BENCHMARK_SCROLL_ROUNDS as _bm_eff_scroll_rounds, BENCHMARK_MAX_CARDS as _bm_eff_max_cards  # noqa: E501
-        _bm_early_stop_threshold = None
-        logger.info(
-            f"Benchmark pipeline: {benchmark_url} | {total_nights} nights, "
-            f"querying {len(sample_indices)} days"
-        )
+        sample_indices = compute_sample_dates(total_nights, BENCHMARK_MAX_SAMPLE_QUERIES)
+    from worker.core.benchmark import BENCHMARK_SCROLL_ROUNDS as _bm_eff_scroll_rounds, BENCHMARK_MAX_CARDS as _bm_eff_max_cards  # noqa: E501
+    _bm_early_stop_threshold = None
+    logger.info(
+        f"Benchmark pipeline: {benchmark_url} | {total_nights} nights, "
+        f"querying {len(sample_indices)} days"
+    )
 
     client = AirbnbClient(
         {
@@ -2728,29 +2724,51 @@ def run_benchmark_scrape(
                 day_client = _bm_day_query_pool[browser_slot]
                 day_lock = _bm_day_query_locks[browser_slot]
                 date_i = all_nights[night_idx]
-                time.sleep(rate_limit_seconds)
-                with day_lock:
-                    return estimate_benchmark_price_for_date(
-                        day_client,
-                        target,
-                        benchmark_url,
-                        base_origin,
-                        date_i,
-                        effective_adults,
-                        secondary_benchmark_urls=secondary_benchmark_urls or [],
-                        benchmark_target_similarity=bm_target_similarity,
-                        max_scroll_rounds=_bm_eff_scroll_rounds,
-                        max_cards=_bm_eff_max_cards,
-                        rate_limit_seconds=rate_limit_seconds,
-                        top_k=BENCHMARK_TOP_K,
-                        max_radius_km=_effective_radius,
-                        excluded_room_ids=excluded_room_ids,
-                        benchmark_name=benchmark_name,
-                        benchmark_lat=_bm_lat,
-                        benchmark_lng=_bm_lng,
-                        benchmark_stay_nights=_bm_stay_nights,
-                        radius_escalation=_bm_radius_escalation,
+                date_str = date_i.isoformat()
+
+                def _query_once() -> BenchmarkDayResult:
+                    time.sleep(rate_limit_seconds)
+                    with day_lock:
+                        return estimate_benchmark_price_for_date(
+                            day_client,
+                            target,
+                            benchmark_url,
+                            base_origin,
+                            date_i,
+                            effective_adults,
+                            secondary_benchmark_urls=secondary_benchmark_urls or [],
+                            benchmark_target_similarity=bm_target_similarity,
+                            max_scroll_rounds=_bm_eff_scroll_rounds,
+                            max_cards=_bm_eff_max_cards,
+                            rate_limit_seconds=rate_limit_seconds,
+                            top_k=BENCHMARK_TOP_K,
+                            max_radius_km=_effective_radius,
+                            excluded_room_ids=excluded_room_ids,
+                            benchmark_name=benchmark_name,
+                            benchmark_lat=_bm_lat,
+                            benchmark_lng=_bm_lng,
+                            benchmark_stay_nights=_bm_stay_nights,
+                            radius_escalation=_bm_radius_escalation,
+                        )
+
+                result = _query_once()
+                # No comparable listings found and no price: refresh with one
+                # fresh re-query of the market search before giving up on this
+                # date. Exactly one retry; if it still finds nothing, the day
+                # is left for interpolation like any other unpriced day.
+                if result.median_price is None and result.comps_collected == 0:
+                    logger.info(
+                        f"[benchmark/day_query] {date_str}: no comparable listings found; "
+                        f"refreshing and re-querying once"
                     )
+                    refreshed = _query_once()
+                    if refreshed.median_price is not None or refreshed.comps_collected > 0:
+                        logger.info(
+                            f"[benchmark/day_query] {date_str}: recovered on refresh "
+                            f"(comps={refreshed.comps_collected})"
+                        )
+                    result = refreshed
+                return result
 
             try:
                 sampled_results, _bm_runner_state = execute_day_queries_concurrently(
@@ -2774,31 +2792,6 @@ def run_benchmark_scrape(
                 )
 
             timings["day_queries_ms"] = round((time.time() - day_loop_start) * 1000)
-            if nightly_plan is not None:
-                _bm_actual_observed = [
-                    _bm_queried_night_indices[i]
-                    for i, r in enumerate(sampled_results)
-                    if r.median_price is not None
-                ]
-                _bm_actual_inferred = sorted(
-                    set(range(nightly_plan.total_nights)) - set(_bm_actual_observed)
-                )
-                timings["nightly_crawl_debug"] = {
-                    "total_nights": nightly_plan.total_nights,
-                    "observed_count": len(_bm_actual_observed),
-                    "queried_count": len(_bm_queried_night_indices),
-                    "infer_count": len(_bm_actual_inferred),
-                    "early_stop_triggered": _bm_early_stop_triggered,
-                    "consecutive_empty_peak": _bm_consecutive_empty_peak,
-                    "tiers": nightly_plan.tier_debug,
-                    "planned_observe_indices": nightly_plan.observe_indices,
-                    "actual_queried_indices": _bm_queried_night_indices,
-                    "actual_observed_indices": _bm_actual_observed,
-                    "actual_inferred_indices": _bm_actual_inferred,
-                    "scroll_rounds": nightly_plan.scroll_rounds,
-                    "max_cards": nightly_plan.max_cards,
-                    "query_workers": _bm_day_query_workers,
-                }
 
             # ── Market-only rescue ────────────────────────────────────────────
             # Benchmark unbookable on every sampled day (calendar blocked or
@@ -3587,7 +3580,6 @@ def run_criteria_search(
     target_lng: Optional[float] = None,
     max_radius_km: Optional[float] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Criteria-based search: search Airbnb for listings matching the user's
@@ -3832,7 +3824,7 @@ def run_criteria_search(
     n_coords_assigned = 0
     anchor_debug: Dict[str, Any] = {}
 
-    _p1_max_cards = nightly_plan.max_cards if nightly_plan is not None else max_cards
+    _p1_max_cards = max_cards
     search_start = time.time()
     _clean_location = re.sub(r"\*+", "", str(search_location or "")).strip()
     _clean_location = re.sub(r"\s+", " ", _clean_location)
@@ -4028,7 +4020,6 @@ def run_criteria_search(
         target_lng=target_lng,
         max_radius_km=max_radius_km,
         progress_callback=progress_callback,
-        nightly_plan=nightly_plan,
         fallback_attributes=attributes,
         fallback_address=address,
         target_spec_override=user_spec,

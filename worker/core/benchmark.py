@@ -30,6 +30,7 @@ sample days than the standard pipeline, making it faster overall.
 from __future__ import annotations
 
 import logging
+import os
 import statistics
 import threading
 import time
@@ -71,7 +72,12 @@ logger = logging.getLogger("worker.core.benchmark")
 BENCHMARK_SCROLL_ROUNDS: int = 1     # standard: DAY_SCROLL_ROUNDS = 2
 BENCHMARK_MAX_CARDS: int = 15        # standard: DAY_MAX_CARDS = 30
 BENCHMARK_TOP_K: int = 5             # standard: top_k = 10
-BENCHMARK_MAX_SAMPLE_QUERIES: int = 10  # standard: MAX_SAMPLE_QUERIES = 20
+# Long windows (>SAMPLE_THRESHOLD nights) sample this many nights live and
+# interpolate the rest. Raised to match the standard pipeline's MAX_SAMPLE_QUERIES
+# (20) — the old value of 10 left too few live anchors for a 28-30 night window
+# when several sampled days fail to fetch a benchmark price, producing long
+# interpolated stretches with no per-day comparable listings.
+BENCHMARK_MAX_SAMPLE_QUERIES: int = int(os.getenv("BENCHMARK_MAX_SAMPLE_QUERIES", "20"))
 MAP_RADIUS_CAP_KM: float = 5.0 * 1.609344  # exactly 5 miles
 
 # Micro map-search radius around the benchmark's own coordinates.

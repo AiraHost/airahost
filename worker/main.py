@@ -1853,51 +1853,10 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         # Without this, a failed-but-attempted benchmark run would lose all transparency.
         _saved_benchmark_info: Optional[Dict[str, Any]] = None
 
-        # ── Nightly crawl plans ───────────────────────────────────────────────
-        # Build tiered date-selection plans for nightly jobs before entering the
-        # Mode C/A/B selection.  Interactive jobs leave both plans as None so all
-        # three scrape functions keep their existing interactive behavior unchanged.
-        #
-        # Two plans are built:
-        #   _nightly_plan           — standard plan for Mode A/B (criteria/URL)
-        #   _nightly_plan_benchmark — tighter plan for Mode C (benchmark), keeping
-        #                             benchmark volume at parity with the pre-Phase-3
-        #                             BENCHMARK_MAX_SAMPLE_QUERIES=10 path.
-        _nightly_plan = None
-        _nightly_plan_benchmark = None
-        if is_nightly:
-            try:
-                from datetime import date as _date
-                from worker.core.nightly_strategy import build_nightly_crawl_plan
-                _d_start = _date.fromisoformat(start_date)
-                _d_end = _date.fromisoformat(end_date)
-                _total_nights = max(1, (_d_end - _d_start).days)
-                _nightly_plan = build_nightly_crawl_plan(_total_nights, mode="standard")
-                _nightly_plan_benchmark = build_nightly_crawl_plan(_total_nights, mode="benchmark")
-                logger.info(
-                    f"[{report_id}] Nightly crawl plan (standard): "
-                    f"observe={len(_nightly_plan.observe_indices)} "
-                    f"infer={len(_nightly_plan.infer_indices)} "
-                    f"of {_total_nights} nights | "
-                    f"scroll_rounds={_nightly_plan.scroll_rounds} "
-                    f"max_cards={_nightly_plan.max_cards} "
-                    f"early_stop={_nightly_plan.early_stop_threshold}"
-                )
-                logger.info(
-                    f"[{report_id}] Nightly crawl plan (benchmark): "
-                    f"observe={len(_nightly_plan_benchmark.observe_indices)} "
-                    f"of {_total_nights} nights | "
-                    f"scroll_rounds={_nightly_plan_benchmark.scroll_rounds} "
-                    f"max_cards={_nightly_plan_benchmark.max_cards}"
-                )
-            
-            except Exception as _plan_exc:
-                logger.warning(
-                    f"[{report_id}] Failed to build nightly crawl plan (non-fatal, "
-                    f"falling back to interactive sampling): {_plan_exc}"
-                )
-                _nightly_plan = None
-                _nightly_plan_benchmark = None
+        # Nightly jobs use the exact same scrape pipeline as interactive jobs —
+        # no separate tiered sampling, scroll/card limits, or circuit breaker.
+        # (Previously a nightly_plan was built here; removed so nightly always
+        # takes the same code path as interactive.)
 
         # ── Phase 6A: Observation-first reuse (interactive, criteria modes) ─────
         # Before live-scraping, attempt to assemble the report from stored
@@ -1988,7 +1947,6 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     max_radius_km=_job_radius_km,
                     excluded_room_ids=excluded_room_ids or None,
                     progress_callback=_make_day_callback(15, 75, "searching_comps", "Searching comparable listings"),
-                    nightly_plan=_nightly_plan_benchmark,
                 )
 
                 # Save benchmark transparency now — before any fallback overwrites transparent_result.
@@ -2053,7 +2011,6 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     target_lng=_job_target_lng,
                     max_radius_km=_job_radius_km,
                     progress_callback=_make_day_callback(15, 75, "searching_comps", "Searching comparable listings"),
-                    nightly_plan=_nightly_plan,
                     # Backfill any target spec fields Airbnb failed to return
                     # (bedrooms, baths, accommodates, propertyType) from the
                     # saved listing inputs so comparable matching stays effective.
@@ -2102,7 +2059,6 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                             target_lng=_job_target_lng,
                             max_radius_km=_job_radius_km,
                             progress_callback=_make_day_callback(15, 75, "searching_comps", "Retrying comparable search"),
-                            nightly_plan=_nightly_plan,
                             fallback_attributes=attributes,
                             fallback_address=address,
                             force_playwright_daily_search=True,
@@ -2204,7 +2160,6 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     target_lng=_job_target_lng,
                     max_radius_km=_job_radius_km,
                     progress_callback=_make_day_callback(15, 75, "searching_comps", "Searching comparable listings"),
-                    nightly_plan=_nightly_plan,
                 )
 
                 valid_prices = [r["median_price"] for r in daily_results if r.get("median_price")]
@@ -2262,13 +2217,6 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
             "worker_version": WORKER_VERSION,
             "total_ms": total_ms,
         })
-
-        # Promote nightly crawl debug from timings into the top-level debug dict
-        # so it is visible in result_core_debug without digging into timingsMs.
-        if _nightly_plan is not None:
-            _ncd = (debug.get("timingsMs") or {}).get("nightly_crawl_debug")
-            if _ncd:
-                debug["nightly_crawl"] = _ncd
 
         # Phase 6A: merge observation reuse metadata into debug so the reuse
         # decision is fully inspectable without reading the observation tables.

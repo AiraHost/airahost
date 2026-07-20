@@ -151,7 +151,7 @@ The scrape worker uses `WORKER_LANE` to distinguish `interactive` (user-triggere
 - `dynamic_pricing.py` — time-based and demand-based price multipliers
 - `discounts.py` — weekly/monthly/non-refundable discount application
 - `similarity.py` — comp scoring algorithm
-- `nightly_strategy.py` / `report_policy.py` — nightly scheduling logic
+- `report_policy.py` — nightly scheduling logic
 - `concurrent_runner.py` — threaded day-query concurrency
 
 ### Frontend API Routes (`src/app/api/`)

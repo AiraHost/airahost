@@ -11,7 +11,7 @@ instead of scraping Airbnb — avoiding unnecessary Airbnb requests.
 
 Freshness Policy
 ----------------
-Stay dates are bucketed into three tiers matching the nightly crawl strategy:
+Stay dates are bucketed into three tiers, each with its own max observation age:
 
   Tier          Date offset       Max observation age
   ─────────────────────────────────────────────────────────────────────────
@@ -19,11 +19,8 @@ Stay dates are bucketed into three tiers matching the nightly crawl strategy:
   medium        D(T1) – D(T2-1)   OBS_FRESH_MEDIUM_HOURS     (default: 36h)
   far           D(T2)+            OBS_FRESH_FAR_HOURS         (default: 72h)
 
-  T1 = NIGHTLY_TIER1_END  (default: 4,  sourced from env)
-  T2 = NIGHTLY_TIER2_END  (default: 11, sourced from env)
-
-Tier boundaries share env vars with nightly_strategy.py so the freshness
-policy stays naturally aligned with the nightly collection cadence.
+  T1 = OBS_FRESH_TIER1_END  (default: 4,  sourced from env)
+  T2 = OBS_FRESH_TIER2_END  (default: 11, sourced from env)
 
 Eligibility Gate (Phase 6A: all-or-nothing)
 --------------------------------------------
@@ -75,12 +72,11 @@ OBS_FRESH_MEDIUM_HOURS: int = int(os.getenv("OBS_FRESH_MEDIUM_HOURS", "36"))
 OBS_FRESH_FAR_HOURS: int = int(os.getenv("OBS_FRESH_FAR_HOURS", "72"))
 
 # ---------------------------------------------------------------------------
-# Tier boundaries — must match nightly_strategy.py defaults.
-# Read from the same env vars so the policy stays aligned with nightly cadence.
+# Tier boundaries for the freshness policy above.
 # ---------------------------------------------------------------------------
 
-_TIER1_END: int = int(os.getenv("NIGHTLY_TIER1_END", "4"))   # D0 – D(T1-1)
-_TIER2_END: int = int(os.getenv("NIGHTLY_TIER2_END", "11"))  # D(T1) – D(T2-1)
+_TIER1_END: int = int(os.getenv("OBS_FRESH_TIER1_END", "4"))   # D0 – D(T1-1)
+_TIER2_END: int = int(os.getenv("OBS_FRESH_TIER2_END", "11"))  # D(T1) – D(T2-1)
 
 # Input modes eligible for observation reuse.
 # URL mode is excluded: it must scrape at least once to extract real listing
