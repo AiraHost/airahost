@@ -261,8 +261,14 @@ def _fetch_pdp_payload(client, listing_id: str, checkin: str, checkout: str) -> 
     misclassified as challenged); in the benchmark hot path a failed direct
     fetch is treated as price-unavailable so the day can be interpolated
     instead of paying for a browser round trip.
+
+    Prefers the prioritized fetch (airbnb pdp api first, then the captured-
+    template direct replay); falls back to the plain direct replay for
+    clients that don't implement it (older fakes/tests).
     """
-    direct = getattr(client, "fetch_pdp_price_direct", None)
+    direct = getattr(client, "fetch_pdp_payload_prioritized", None) or getattr(
+        client, "fetch_pdp_price_direct", None
+    )
     if callable(direct):
         try:
             data = direct(str(listing_id), checkin=checkin, checkout=checkout, adults=1)

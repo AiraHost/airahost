@@ -17,8 +17,19 @@ import requests
 from playwright.async_api import async_playwright
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.rate_limiter import get_airbnb_rate_limiter
+from worker.scraper.airbnb_pdp_api.airbnb_crawler import (
+    AirbnbPdpClient,
+    AntiBotError as PdpApiAntiBotError,
+    StaleHashError as PdpApiStaleHashError,
+)
 from worker.scraper.stayspdp_template import HARDCODED_STAYS_PDP_TEMPLATE
 from worker.scraper.stayssearch_template import HARDCODED_STAYS_SEARCH_TEMPLATE
+
+# .../api/v3/StaysPdpSections/<64-hex-hash>?... — used to opportunistically
+# refresh the airbnb_pdp_api persisted-query hash (in-memory only) whenever a
+# real browser PDP navigation happens to run anyway, so the standalone client
+# self-heals without ever spawning its own browser.
+_PDP_API_HASH_IN_URL_RE = re.compile(r"/api/v3/StaysPdpSections/([0-9a-f]{64})")
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +80,13 @@ class PlaywrightScraper:
         self._session_cookies_warmed = False
         self.captured_search_req = None
         self.captured_pdp_req = None
+        # Standalone airbnb_pdp_api client (public API key, no CDP browser
+        # required) tried before the captured-template replay / browser
+        # fallback below. Lazily constructed; hash override is refreshed
+        # in-memory whenever a real browser PDP navigation reveals a newer
+        # persisted-query hash (see _get_listing_details_via_browser).
+        self._pdp_api_client: Optional[AirbnbPdpClient] = None
+        self._pdp_api_hash_override: Optional[str] = None
         self.hardcoded_search_req: Optional[Dict[str, Any]] = None
         disable_map_cfg = self.config.get("DISABLE_MAP_SEARCH", None)
         if disable_map_cfg is None:
@@ -642,6 +660,11 @@ class PlaywrightScraper:
         clone.currency = self.currency
         clone.session = requests.Session()
         clone._session_cookies_warmed = self._session_cookies_warmed
+        # Not shared across clones: requests.Session isn't safe for concurrent
+        # use, and each fork gets its own lazily-built client. The learned hash
+        # override *is* copied so forks don't all pay to rediscover it.
+        clone._pdp_api_client = None
+        clone._pdp_api_hash_override = self._pdp_api_hash_override
         clone.captured_search_req = copy.deepcopy(self.captured_search_req)
         clone.captured_pdp_req = copy.deepcopy(self.captured_pdp_req)
         clone.hardcoded_search_req = copy.deepcopy(self.hardcoded_search_req)
@@ -1826,6 +1849,12 @@ class PlaywrightScraper:
                         return
                     if first_pdp_seen_at is None:
                         first_pdp_seen_at = time.monotonic()
+                    hash_m = _PDP_API_HASH_IN_URL_RE.search(resp.url)
+                    if hash_m and hash_m.group(1) != self._pdp_api_hash_override:
+                        self._pdp_api_hash_override = hash_m.group(1)
+                        logger.info(
+                            "[pdp_api] learned fresh persisted-query hash from live browser traffic"
+                        )
                     captured_status = int(resp.status)
                     payload = await resp.json()
                     if isinstance(payload, dict):
@@ -2513,6 +2542,143 @@ class PlaywrightScraper:
             eff_adults = 1
         return eff_checkin, eff_checkout, eff_adults
 
+    def _pdp_payload_is_usable(
+        self,
+        data: Any,
+        listing_id: str,
+        *,
+        require_price: bool,
+        log_tag: str,
+    ) -> bool:
+        """
+        Shared acceptance check for a raw StaysPdpSections payload obtained
+        outside the browser (airbnb_pdp_api or the captured-template replay).
+
+        require_price=True  -> only accept payloads that carry a bookable price
+                               or are explicitly dates-unavailable; otherwise
+                               defer to the browser so its DOM price fallback can
+                               recover prices the API omits (price paths).
+        require_price=False -> accept any structurally-complete PDP payload
+                               regardless of price (metadata/enrichment paths).
+        """
+        if not isinstance(data, dict):
+            return False
+        if data.get("errors") and self._response_looks_auth_or_challenge_error(200, data):
+            logger.info(
+                "[%s] listing=%s challenge-like response; falling back",
+                log_tag,
+                listing_id,
+            )
+            return False
+        if not self._extract_pdp_sections(data) and not self._pdp_payload_has_amenity_groups(data):
+            # Empty/degraded payload — not a real PDP response.
+            return False
+        if require_price:
+            return bool(self._pdp_dates_unavailable(data) or self._pdp_booking_has_price(data))
+        return True
+
+    def _get_pdp_api_client(self) -> AirbnbPdpClient:
+        """
+        Lazily build the standalone airbnb_pdp_api client (own requests.Session,
+        Airbnb's public web api-key, no CDP browser dependency). Reused for the
+        life of this PlaywrightScraper instance; picks up a fresher persisted-query
+        hash if one has been learned from real browser traffic in the meantime.
+        """
+        if self._pdp_api_client is None:
+            # Match fetch_pdp_price_direct's budget (timeout=8) rather than the
+            # library default (30s) — this client is tried FIRST in every PDP
+            # cascade, including the benchmark hot path that's designed to fail
+            # fast and interpolate rather than wait out a slow response.
+            self._pdp_api_client = AirbnbPdpClient(
+                locale=self.locale, currency=self.currency, timeout=8
+            )
+        if (
+            self._pdp_api_hash_override
+            and self._pdp_api_client.persisted_query_hash != self._pdp_api_hash_override
+        ):
+            self._pdp_api_client.persisted_query_hash = self._pdp_api_hash_override
+        return self._pdp_api_client
+
+    def _try_pdp_api_listing_details(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int,
+        *,
+        require_price: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Satisfy a PDP detail fetch via the standalone airbnb_pdp_api crawler —
+        the prioritized StaysPdpSections method. Works browser-free from a cold
+        start (public web api-key, no captured template/cookies required), so it
+        is tried before the captured-template replay and full browser capture
+        below. Returns the raw GraphQL payload, or None to signal the caller
+        should fall through to the next method in the chain.
+        """
+        client = self._get_pdp_api_client()
+        # Best-effort cookie parity with the rest of the pipeline (Airbnb prices
+        # logged-in and logged-out sessions differently). Only warms once per
+        # scraper instance and reuses the already-running CDP browser, so this
+        # is cheap when available and simply no-ops otherwise.
+        self._ensure_session_cookies_from_browser()
+        if len(self.session.cookies) > 0:
+            for c in self.session.cookies:
+                client.session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+        try:
+            data = client.fetch(
+                str(listing_id),
+                check_in=checkin or None,
+                check_out=checkout or None,
+                adults=max(1, int(adults or 1)),
+            )
+        except (PdpApiAntiBotError, PdpApiStaleHashError) as exc:
+            logger.debug(
+                "[pdp_api] listing=%s fetch failed (%s); falling back",
+                listing_id,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            logger.debug(
+                "[pdp_api] listing=%s fetch raised; falling back: %s",
+                listing_id,
+                str(exc)[:160],
+            )
+            return None
+        if not self._pdp_payload_is_usable(data, listing_id, require_price=require_price, log_tag="pdp_api"):
+            return None
+        logger.info(
+            "[pdp_api] listing=%s served via airbnb pdp api (%s path)",
+            listing_id,
+            "price" if require_price else "detail",
+        )
+        return data
+
+    def fetch_pdp_payload_prioritized(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        PDP payload for hot paths that must stay browser-free (e.g. benchmark
+        nightly pricing, where a failed fetch is simply treated as
+        price-unavailable rather than paying for a 10-15s browser navigation).
+
+        airbnb_pdp_api first, captured-template direct replay second; never
+        falls back to the browser. Returns None if both fail.
+        """
+        pdp_api = self._try_pdp_api_listing_details(
+            str(listing_id), checkin, checkout, adults, require_price=True
+        )
+        if pdp_api is not None:
+            return pdp_api
+        return self.fetch_pdp_price_direct(
+            listing_id=str(listing_id), checkin=checkin, checkout=checkout, adults=adults
+        )
+
     def _try_direct_listing_details(
         self,
         listing_id: str,
@@ -2528,13 +2694,6 @@ class PlaywrightScraper:
         browser navigation). Returns the raw GraphQL payload when it is a usable
         PDP response, or None to signal the caller should fall back to the
         browser path.
-
-        require_price=True  -> only accept payloads that carry a bookable price
-                               or are explicitly dates-unavailable; otherwise
-                               defer to the browser so its DOM price fallback can
-                               recover prices the API omits (price paths).
-        require_price=False -> accept any structurally-complete PDP payload
-                               regardless of price (metadata/enrichment paths).
         """
         if not self.captured_pdp_req:
             return None
@@ -2559,28 +2718,12 @@ class PlaywrightScraper:
                 str(exc)[:120],
             )
             return None
-        if not isinstance(data, dict):
-            return None
-        if data.get("errors") and self._response_looks_auth_or_challenge_error(200, data):
-            logger.info(
-                "[direct_pdp] listing=%s challenge-like response; browser fallback",
-                listing_id,
-            )
-            return None
-        if not self._extract_pdp_sections(data) and not self._pdp_payload_has_amenity_groups(data):
-            # Empty/degraded payload — not a real PDP response.
-            return None
-        if require_price:
-            if self._pdp_dates_unavailable(data) or self._pdp_booking_has_price(data):
-                logger.info(
-                    "[direct_pdp] listing=%s served via direct HTTP (price path)",
-                    listing_id,
-                )
-                return data
+        if not self._pdp_payload_is_usable(data, listing_id, require_price=require_price, log_tag="direct_pdp"):
             return None
         logger.info(
-            "[direct_pdp] listing=%s served via direct HTTP (detail path)",
+            "[direct_pdp] listing=%s served via direct HTTP (%s path)",
             listing_id,
+            "price" if require_price else "detail",
         )
         return data
 
@@ -2592,14 +2735,21 @@ class PlaywrightScraper:
         adults: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        PDP detail fetch — direct HTTP replay first, browser capture fallback.
+        PDP detail fetch — airbnb_pdp_api first, captured-template direct
+        replay second, browser capture fallback last.
 
-        The price-aware gate defers no-price/bookable responses to the browser so
-        its DOM price fallback can recover prices the StaysPdpSections API omits.
+        The price-aware gate defers no-price/bookable responses further down
+        the chain so the browser's DOM price fallback can recover prices the
+        StaysPdpSections API omits.
         """
         eff_checkin, eff_checkout, eff_adults = self._resolve_pdp_window(
             checkin, checkout, adults
         )
+        pdp_api = self._try_pdp_api_listing_details(
+            str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=True
+        )
+        if pdp_api is not None:
+            return pdp_api
         direct = self._try_direct_listing_details(
             str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=True
         )
@@ -2645,6 +2795,33 @@ class PlaywrightScraper:
             )
         return None
 
+    def _enrich_fast_detail_amenities(self, data: Dict[str, Any], listing_id: str, *, log_tag: str) -> None:
+        """
+        When a non-browser PDP payload lacks amenity groups (the normal case for
+        the booking-section-only captured template, and possible for the public
+        airbnb_pdp_api template too), fall back to a direct HTTP GET of the
+        listing page HTML to extract the SSR-embedded amenity data. Mutates
+        ``data`` in place.
+        """
+        if self._pdp_payload_has_amenity_groups(data):
+            return
+        html = self._fetch_listing_page_html_direct(str(listing_id))
+        if not html:
+            return
+        html_amenities = self._extract_pdp_amenities_from_rendered_html(html)
+        if isinstance(html_amenities, dict):
+            self._inject_pdp_presentation_amenities(data, html_amenities)
+            preview = html_amenities.get("previewAmenitiesGroups")
+            see_all = html_amenities.get("seeAllAmenitiesGroups")
+            logger.info(
+                "[%s] listing=%s amenities enriched from page HTML "
+                "preview_groups=%s see_all_groups=%s",
+                log_tag,
+                listing_id,
+                len(preview) if isinstance(preview, list) else 0,
+                len(see_all) if isinstance(see_all, list) else 0,
+            )
+
     def get_listing_details_fast(
         self,
         listing_id: str,
@@ -2653,37 +2830,26 @@ class PlaywrightScraper:
         adults: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Metadata-oriented PDP fetch — direct HTTP replay first (accepts no-price
-        payloads), browser capture fallback. Used for comp/target structural
-        detail where amenities/capacity/baths/type matter but the booking price
-        does not, so we never pay for a browser navigation just to recover a price.
-
-        When the GraphQL response lacks amenity groups (the normal case for the
-        booking-section-only template), we fall back to a direct HTTP GET of the
-        listing page HTML to extract the SSR-embedded amenity data.
+        Metadata-oriented PDP fetch — airbnb_pdp_api first, captured-template
+        direct replay second (both accept no-price payloads), browser capture
+        fallback last. Used for comp/target structural detail where
+        amenities/capacity/baths/type matter but the booking price does not, so
+        we never pay for a browser navigation just to recover a price.
         """
         eff_checkin, eff_checkout, eff_adults = self._resolve_pdp_window(
             checkin, checkout, adults
         )
+        pdp_api = self._try_pdp_api_listing_details(
+            str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=False
+        )
+        if pdp_api is not None:
+            self._enrich_fast_detail_amenities(pdp_api, str(listing_id), log_tag="pdp_api")
+            return pdp_api
         direct = self._try_direct_listing_details(
             str(listing_id), eff_checkin, eff_checkout, eff_adults, require_price=False
         )
         if direct is not None:
-            if not self._pdp_payload_has_amenity_groups(direct):
-                html = self._fetch_listing_page_html_direct(str(listing_id))
-                if html:
-                    html_amenities = self._extract_pdp_amenities_from_rendered_html(html)
-                    if isinstance(html_amenities, dict):
-                        self._inject_pdp_presentation_amenities(direct, html_amenities)
-                        preview = html_amenities.get("previewAmenitiesGroups")
-                        see_all = html_amenities.get("seeAllAmenitiesGroups")
-                        logger.info(
-                            "[direct_pdp] listing=%s amenities enriched from page HTML "
-                            "preview_groups=%s see_all_groups=%s",
-                            listing_id,
-                            len(preview) if isinstance(preview, list) else 0,
-                            len(see_all) if isinstance(see_all, list) else 0,
-                        )
+            self._enrich_fast_detail_amenities(direct, str(listing_id), log_tag="direct_pdp")
             return direct
         return self._get_listing_details_browser(listing_id, checkin, checkout, adults)
 

@@ -118,8 +118,28 @@ _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 _root_logger.addHandler(_console)
 
+class _WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """
+    RotatingFileHandler that tolerates Windows file-lock races.
+
+    doRollover() renames worker.log -> worker.log.1 via os.rename(), which
+    Windows refuses (WinError 32) if any other process/handle (antivirus,
+    search indexer, a log viewer, ...) has the file open at that instant.
+    On POSIX this is a non-issue (rename just repoints the inode), so the
+    failure is Windows-only. Skip this rollover on that race rather than
+    dropping the log record; the next rollover attempt (on the next write
+    past maxBytes) will usually succeed once the other handle releases it.
+    """
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            pass
+
+
 # Rotating file handler: 5 MB per file, keep 5 backups
-_file_handler = logging.handlers.RotatingFileHandler(
+_file_handler = _WindowsSafeRotatingFileHandler(
     filename=str(_log_dir / "worker.log"),
     maxBytes=5 * 1024 * 1024,
     backupCount=5,

@@ -154,3 +154,17 @@ class AirbnbClient:
         if fetcher is None:
             return None
         return fetcher(listing_id=str(listing_id), checkin=checkin, checkout=checkout, adults=adults)
+
+    def fetch_pdp_payload_prioritized(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """PDP payload for browser-free hot paths: airbnb pdp api first, direct-template replay second."""
+        scraper = self._get_playwright_scraper()
+        fetcher = getattr(scraper, "fetch_pdp_payload_prioritized", None)
+        if fetcher is None:
+            return None
+        return fetcher(listing_id=str(listing_id), checkin=checkin, checkout=checkout, adults=adults)
