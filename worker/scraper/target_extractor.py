@@ -671,10 +671,6 @@ def extract_target_spec(
             warnings.extend(dom_warnings)
             if isinstance(dom_spec, ListingSpec):
                 return dom_spec, warnings
-            if fail_on_unusable:
-                raise ValueError(
-                    f"PDP individual listing extraction failed (payload + rendered DOM): {listing_url}"
-                )
             return (
                 ListingSpec(url=normalize_airbnb_url(listing_url)),
                 warnings,
