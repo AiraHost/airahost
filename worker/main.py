@@ -41,6 +41,7 @@ from worker.core.discounts import (
     build_stay_length_averages,
 )
 from worker.core.dynamic_pricing import compute_dynamic_pricing_adjustment
+from worker.core.errors import ReportInputError
 from worker.core.report_policy import (
     resolve_execution_policy,
     NIGHTLY_POLICIES,
@@ -2144,12 +2145,15 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     )
                     core_version = WORKER_VERSION + "+self_only"
 
-            except ValueError as exc:
-                logger.exception(f"[{report_id}] ValueError in URL mode")
+            except ReportInputError as exc:
+                logger.warning(f"[{report_id}] Invalid report input in URL mode: {exc}")
                 _fail(str(exc), str(exc))
                 return
 
             except Exception as exc:
+                # Internal failures never surface their own text — the raw
+                # exception is kept in result_core_debug instead.
+                logger.exception(f"[{report_id}] URL mode failed")
                 _fail(
                     "Service is busy. An error occurred during analysis — please try again later.",
                     str(exc),
@@ -2204,12 +2208,13 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     )
                     return
 
-            except ValueError as exc:
-                logger.exception(f"[{report_id}] ValueError in criteria mode")
+            except ReportInputError as exc:
+                logger.warning(f"[{report_id}] Invalid report input in criteria mode: {exc}")
                 _fail(str(exc), str(exc))
                 return
 
             except Exception as exc:
+                logger.exception(f"[{report_id}] Criteria mode failed")
                 _fail(
                     "Service is busy. An error occurred during analysis — please try again later.",
                     str(exc),

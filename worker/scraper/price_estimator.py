@@ -35,6 +35,7 @@ from urllib.parse import quote, urlencode
 from worker.core.concurrent_runner import execute_day_queries_concurrently
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.comp_utils import build_comp_id
+from worker.core.errors import ReportInputError
 from worker.core.geo_filter import apply_geo_filter, haversine_km
 from worker.core.similarity import (
     SIMILARITY_FLOOR,
@@ -1613,7 +1614,7 @@ def run_scrape(
     if total_nights < 1:
         return [], _empty_transparent("scrape", "Invalid date range: checkout must be after checkin")
     if total_nights > MAX_NIGHTS:
-        raise ValueError(
+        raise ReportInputError(
             f"Date range of {total_nights} nights exceeds maximum of {MAX_NIGHTS}. "
             f"Please select a shorter range."
         )
@@ -2375,7 +2376,7 @@ def run_benchmark_scrape(
     if total_nights < 1:
         return [], _empty_transparent("benchmark", "Invalid date range")
     if total_nights > MAX_NIGHTS:
-        raise ValueError(
+        raise ReportInputError(
             f"Date range of {total_nights} nights exceeds maximum of {MAX_NIGHTS}."
         )
 
