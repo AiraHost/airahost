@@ -68,3 +68,69 @@ html {
 .input:focus {
   border-color: var(--accent);
 }
+
+/* ---------------------------------------------------------------------------
+   Admin dashboard (/admin) — dark theme tokens and utilities.
+   Scoped by name (base-*, brand-*, admin-*) so site styles are untouched.
+--------------------------------------------------------------------------- */
+
+@theme {
+  --font-display: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+
+  --color-base-950: hsl(240 28% 6%);
+  --color-base-900: hsl(240 24% 9%);
+  --color-base-850: hsl(243 22% 12%);
+  --color-base-800: hsl(244 20% 16%);
+  --color-base-700: hsl(244 16% 22%);
+  --color-base-600: hsl(244 12% 32%);
+  --color-base-400: hsl(244 10% 58%);
+  --color-base-200: hsl(240 20% 88%);
+  --color-base-100: hsl(240 30% 96%);
+
+  --color-brand-400: hsl(262 83% 70%);
+  --color-brand-500: hsl(262 83% 62%);
+  --color-brand-600: hsl(262 76% 52%);
+
+  --color-accent-400: hsl(189 94% 55%);
+  --color-accent-500: hsl(189 94% 46%);
+
+  --color-success-400: hsl(152 69% 52%);
+  --color-success-500: hsl(152 69% 42%);
+  --color-warning-400: hsl(38 92% 58%);
+  --color-warning-500: hsl(38 92% 50%);
+  --color-danger-400: hsl(0 84% 65%);
+  --color-danger-500: hsl(0 72% 55%);
+}
+
+.admin-root {
+  color-scheme: dark;
+}
+
+@layer utilities {
+  .admin-panel {
+    background: linear-gradient(
+      160deg,
+      color-mix(in oklab, var(--color-base-850) 88%, transparent),
+      color-mix(in oklab, var(--color-base-900) 92%, transparent)
+    );
+    border: 1px solid color-mix(in oklab, var(--color-base-600) 45%, transparent);
+    backdrop-filter: blur(16px);
+  }
+
+  .admin-glow-brand {
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-brand-500) 30%, transparent),
+      0 12px 40px -12px color-mix(in oklab, var(--color-brand-600) 55%, transparent);
+  }
+
+  .admin-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .admin-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--color-base-700);
+    border-radius: 9999px;
+  }
+  .admin-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

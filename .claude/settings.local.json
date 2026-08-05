@@ -131,7 +131,8 @@
       "Bash(mv admin-dashboard/src/App.tsx.bak admin-dashboard/src/App.tsx)",
       "Bash(rm -f check_login_tmp.js check_dashboard_tmp.js admin-dashboard/.env)",
       "Bash(supabase --version)",
-      "Bash(psql --version)"
+      "Bash(psql --version)",
+      "PowerShell(npm run *)"
     ]
   }
 }

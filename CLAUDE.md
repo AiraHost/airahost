@@ -121,6 +121,8 @@ Two separate `.env` files are required:
 - `worker/.env` (copy from `worker/.env.example`) — Python worker; set `WORKER_ENV=local` for local dev
 - `.env.local` (copy from `.env.example`) — Next.js; set `WORKER_TARGET_ENV=local` for local dev
 
+`ADMIN_PASSWORD` gates the `/admin` dashboard; without it `/admin` shows a "not configured" notice.
+
 Chrome must be running with remote debugging for real scraping:
 ```powershell
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\chrome-cdp-profile"
@@ -161,6 +163,7 @@ The scrape worker uses `WORKER_LANE` to distinguish `interactive` (user-triggere
 - `GET/POST/PATCH/DELETE /api/listings/[id]` — saved listing CRUD
 - `POST /api/listings/[id]/rerun` — re-queues a job
 - `GET /api/internal/nightly/schedule` — internal nightly scheduler endpoint
+- `POST /api/admin/login` + `GET /api/admin/reports` — password-gated admin dashboard at `/admin` (see `docs/admin dashboard/usage.md`)
 
 ### Frontend Lib (`src/lib/`)
 - `schemas.ts` — Zod schemas for `ListingInput`, `DiscountPolicy`, `ReportSummary`, `CalendarDay` — the canonical type definitions shared between frontend and API
