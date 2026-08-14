@@ -33,6 +33,8 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=False)
 load_dotenv(override=False)
 
 from worker.core import db as db_helpers
+from worker.core import scrape_artifacts, scrape_events, scrape_trace
+from worker.core.admission import get_admission_controller
 from worker.core.cache import compute_cache_key, get_cached, set_cached
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.discounts import (
@@ -41,7 +43,16 @@ from worker.core.discounts import (
     build_stay_length_averages,
 )
 from worker.core.dynamic_pricing import compute_dynamic_pricing_adjustment
-from worker.core.errors import ReportInputError
+from worker.core.errors import (
+    InputListingNotFound,
+    ReportInputError,
+    StaleReportJobError,
+)
+from worker.core.report_dates import validate_report_dates
+from worker.scraper.scraper_errors import (
+    AirbnbSearchBlocked,
+    BrowserRuntimeUnavailable,
+)
 from worker.core.report_policy import (
     resolve_execution_policy,
     NIGHTLY_POLICIES,
@@ -110,14 +121,33 @@ LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 _log_dir = Path(__file__).resolve().parent / "logs"
 _log_dir.mkdir(exist_ok=True)
 
-# Root logger setup — captures all worker.* loggers
+# Root logger setup — captures all worker.* loggers.
+# Handlers are tagged and installed at most once: a second import of this
+# module (or a stray logging.basicConfig() from an imported library) would
+# otherwise attach a second handler and emit every event twice.
+_HANDLER_TAG = "_airahost_worker_handler"
 _root_logger = logging.getLogger()
 _root_logger.setLevel(logging.INFO)
 
-# Console handler
-_console = logging.StreamHandler(sys.stdout)
-_console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-_root_logger.addHandler(_console)
+
+def _already_installed(kind: str) -> bool:
+    return any(getattr(h, _HANDLER_TAG, None) == kind for h in _root_logger.handlers)
+
+
+def _install_handler(handler: logging.Handler, kind: str) -> None:
+    if _already_installed(kind):
+        return
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    setattr(handler, _HANDLER_TAG, kind)
+    _root_logger.addHandler(handler)
+
+
+# Drop any handler a library installed via logging.basicConfig() at import
+# time; the entrypoint owns root-logger configuration.
+for _stray in [h for h in list(_root_logger.handlers) if not hasattr(h, _HANDLER_TAG)]:
+    _root_logger.removeHandler(_stray)
+
+_install_handler(logging.StreamHandler(sys.stdout), "console")
 
 class _WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """
@@ -140,16 +170,25 @@ class _WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
 
 # Rotating file handler: 5 MB per file, keep 5 backups
-_file_handler = _WindowsSafeRotatingFileHandler(
-    filename=str(_log_dir / "worker.log"),
-    maxBytes=5 * 1024 * 1024,
-    backupCount=5,
-    encoding="utf-8",
-)
-_file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-_root_logger.addHandler(_file_handler)
+if not _already_installed("file"):
+    _install_handler(
+        _WindowsSafeRotatingFileHandler(
+            filename=str(_log_dir / "worker.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+        "file",
+    )
 
 logger = logging.getLogger("worker")
+
+# Centralized structured event sink (newline-delimited JSON). Separate from the
+# handlers above on purpose: the console stays human-readable while every
+# scraper event is also written machine-readably to worker/logs/worker.jsonl
+# (or stdout, for an external log agent). Installing it here — the entrypoint
+# that already owns logging configuration — keeps handler ownership in one place.
+scrape_events.install_event_sink()
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown
@@ -1160,6 +1199,48 @@ def _capture_user_listing_prices_for_range(
     }
 
 
+def _capture_user_listing_prices_or_degrade(
+    *, report_id: str, start_date: str, end_date: str, **kwargs
+) -> Dict[str, Any]:
+    """Live-price capture that degrades instead of failing a finished report.
+
+    The capture is documented as non-fatal: it enriches a calendar that already
+    exists. A host that cannot spawn a browser runtime must therefore leave the
+    report intact with empty live-price fields, not throw the whole analysis
+    away. Paths that genuinely *need* the browser to produce a report at all
+    (the target-listing-only fallback) still let the typed error propagate.
+    """
+    from datetime import datetime as _dt
+
+    try:
+        return _capture_user_listing_prices_for_range(
+            report_id=report_id, start_date=start_date, end_date=end_date, **kwargs
+        )
+    except BrowserRuntimeUnavailable as exc:
+        logger.warning(
+            f"[{report_id}] Live price capture skipped: {exc.public_message} "
+            f"(reason={exc.reason_code})"
+        )
+        total_days = max(
+            1,
+            (
+                _dt.strptime(end_date, "%Y-%m-%d") - _dt.strptime(start_date, "%Y-%m-%d")
+            ).days,
+        )
+        return {
+            "priceByDate": {},
+            "capturedDays": 0,
+            "totalDays": total_days,
+            "observedListingPrice": None,
+            "observedListingPriceDate": start_date,
+            "observedListingPriceCapturedAt": None,
+            "observedListingPriceSource": None,
+            "observedListingPriceConfidence": None,
+            "livePriceStatus": "browser_runtime_unavailable",
+            "livePriceStatusReason": exc.public_message,
+        }
+
+
 def _attach_user_listing_prices_and_log(
     report_id: str,
     calendar: List[Dict[str, Any]],
@@ -1224,10 +1305,34 @@ def process_job(job: Dict[str, Any], worker_token: uuid.UUID) -> None:
     """
     Dispatcher: resolves execution policy and routes to the correct pipeline.
 
+    Opens the report's trace scope: one trace_id, one shared retry budget, and
+    one artifact quota for everything this job does, propagated into the day
+    query threads by ``worker.core.concurrent_runner``.
+
     forecast_snapshot jobs are rejected immediately (deprecated).
     All live_analysis jobs are routed to run_nightly_job() or
     run_interactive_job() based on the resolved execution_policy.
     """
+    report_id = job["id"]
+    with scrape_trace.trace_scope(
+        report_id=str(report_id),
+        target_listing_id=_extract_airbnb_listing_id_from_url(_get_listing_url(job)),
+        retry_budget=get_admission_controller().make_retry_budget(),
+    ):
+        try:
+            _dispatch_job(job, worker_token)
+        finally:
+            # Free this report's artifact allowance and prune anything past the
+            # retention/size bounds. Best-effort: neither may affect the job's
+            # outcome, which has already been decided by this point.
+            try:
+                scrape_artifacts.reset_report_quota(str(report_id))
+                scrape_artifacts.enforce_retention()
+            except Exception as exc:
+                logger.debug("[%s] artifact housekeeping skipped: %s", report_id, exc)
+
+
+def _dispatch_job(job: Dict[str, Any], worker_token: uuid.UUID) -> None:
     report_id = job["id"]
     job_lane = job.get("job_lane", "interactive")
 
@@ -1598,6 +1703,31 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 f"{', '.join(sorted(excluded_room_ids))}"
             )
 
+        # ── Stale-job / past-date gate ────────────────────────────────────────
+        # Runs before the cache lookup and before any Airbnb request. Airbnb
+        # silently normalizes past-date filters and still renders a search page,
+        # so a stale queued job would otherwise scrape a window nobody asked for
+        # and cache the result under an obsolete key.
+        try:
+            validate_report_dates(start_date, end_date)
+        except StaleReportJobError as _date_exc:
+            logger.warning(
+                f"[{report_id}] Rejecting job on date policy "
+                f"(reason={_date_exc.reason_code}): {_date_exc.debug}"
+            )
+            db_helpers.fail_job(
+                client, report_id, worker_token,
+                error_message=str(_date_exc),
+                debug={
+                    "error": _date_exc.reason_code,
+                    "reportDates": _date_exc.debug,
+                    "worker_host": socket.gethostname(),
+                    "worker_version": WORKER_VERSION,
+                    "total_ms": round((time.time() - start_time) * 1000),
+                },
+            )
+            return
+
         finalized_input_attributes = dict(attributes)
         finalized_input_attributes["inputMode"] = input_mode
         finalized_input_attributes["listingUrl"] = listing_url or None
@@ -1634,7 +1764,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
             # explicitly to ensure backward compat with any pre-bump cached row.
             summary["excludedRoomIdsAtRun"] = sorted(excluded_room_ids)
             if listing_url:
-                _cache_live_info = _capture_user_listing_prices_for_range(
+                _cache_live_info = _capture_user_listing_prices_or_degrade(
                     report_id=report_id,
                     listing_url=listing_url,
                     start_date=start_date,
@@ -1789,6 +1919,79 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                 error_message=effective_msg,
                 debug={
                     "error": debug_error,
+                    "worker_host": socket.gethostname(),
+                    "worker_version": WORKER_VERSION,
+                    "total_ms": round((time.time() - start_time) * 1000),
+                },
+            )
+
+        def _fail_search_blocked(exc: "AirbnbSearchBlocked") -> None:
+            """Exhausted recovery against a blocked Airbnb search session.
+
+            Surfaces as an actionable failure rather than a zero-comp
+            "successful" report; the machine-readable reason stays in debug.
+            """
+            logger.warning(
+                f"[{report_id}] Airbnb search session blocked "
+                f"(reason={exc.reason_code}); failing report"
+            )
+            db_helpers.fail_job(
+                client, report_id, worker_token,
+                error_message=(
+                    "Airbnb search session is blocked; authentication refresh required."
+                ),
+                debug={
+                    "error": "airbnb_search_blocked",
+                    "reasonCode": exc.reason_code,
+                    "reportId": str(report_id),
+                    "worker_host": socket.gethostname(),
+                    "worker_version": WORKER_VERSION,
+                    "total_ms": round((time.time() - start_time) * 1000),
+                },
+            )
+
+        def _fail_browser_runtime_unavailable(exc: BrowserRuntimeUnavailable) -> None:
+            """The worker could not get a browser runtime at all.
+
+            Nothing about Airbnb is wrong here, so this must not read as a
+            challenge or as an empty search. The user-facing message is the
+            error type's fixed public text; endpoint/runtime counts stay in
+            structured debug. Called once per job — every caller returns
+            immediately after it.
+            """
+            logger.warning(
+                f"[{report_id}] Browser runtime unavailable "
+                f"(reason={exc.reason_code} endpoint={exc.endpoint or '-'}); failing report"
+            )
+            debug = {
+                **exc.structured_fields(),
+                "reportId": str(report_id),
+                "worker_host": socket.gethostname(),
+                "worker_version": WORKER_VERSION,
+                "total_ms": round((time.time() - start_time) * 1000),
+            }
+            db_helpers.fail_job(
+                client, report_id, worker_token,
+                error_message=exc.public_message,
+                debug=debug,
+            )
+
+        def _fail_input_listing_not_found(exc: InputListingNotFound) -> None:
+            """Terminal failure for a confirmed 404 on the user's own listing.
+
+            The public message is fixed (`input listing not found`); the room id
+            and detection detail stay in structured debug. Every caller returns
+            immediately after this, so no retry, fallback, live-price capture,
+            pool seeding, or cache write can follow.
+            """
+            db_helpers.fail_job(
+                client, report_id, worker_token,
+                error_message=InputListingNotFound.PUBLIC_MESSAGE,
+                debug={
+                    "error": InputListingNotFound.ERROR_CODE,
+                    "roomId": exc.room_id or None,
+                    "detectionDetail": exc.detail or None,
+                    "reportId": str(report_id),
                     "worker_host": socket.gethostname(),
                     "worker_version": WORKER_VERSION,
                     "total_ms": round((time.time() - start_time) * 1000),
@@ -1993,6 +2196,14 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                         "falling back to criteria search"
                     )
 
+            except InputListingNotFound as exc:
+                # Terminal: the user's own listing does not exist. Falling back
+                # to criteria/URL scraping would re-probe a listing already
+                # proven absent, so this must escape the broad handler below.
+                logger.warning(f"[{report_id}] {exc} (room_id={exc.room_id})")
+                _fail_input_listing_not_found(exc)
+                return
+
             except Exception as exc:
                 logger.warning(
                     f"[{report_id}] Benchmark pipeline failed ({exc}), "
@@ -2145,6 +2356,19 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                     )
                     core_version = WORKER_VERSION + "+self_only"
 
+            except InputListingNotFound as exc:
+                logger.warning(f"[{report_id}] {exc} (room_id={exc.room_id})")
+                _fail_input_listing_not_found(exc)
+                return
+
+            except BrowserRuntimeUnavailable as exc:
+                _fail_browser_runtime_unavailable(exc)
+                return
+
+            except AirbnbSearchBlocked as exc:
+                _fail_search_blocked(exc)
+                return
+
             except ReportInputError as exc:
                 logger.warning(f"[{report_id}] Invalid report input in URL mode: {exc}")
                 _fail(str(exc), str(exc))
@@ -2207,6 +2431,19 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
                         f"Criteria search produced no daily results: {criteria_err}",
                     )
                     return
+
+            except InputListingNotFound as exc:
+                logger.warning(f"[{report_id}] {exc} (room_id={exc.room_id})")
+                _fail_input_listing_not_found(exc)
+                return
+
+            except BrowserRuntimeUnavailable as exc:
+                _fail_browser_runtime_unavailable(exc)
+                return
+
+            except AirbnbSearchBlocked as exc:
+                _fail_search_blocked(exc)
+                return
 
             except ReportInputError as exc:
                 logger.warning(f"[{report_id}] Invalid report input in criteria mode: {exc}")
@@ -2312,7 +2549,7 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
         if listing_url:
             _progress(85, "capturing_live_price", "Capturing your current listing prices from Airbnb...")
             final_live_capture_adults = _resolve_live_capture_adults(finalized_input_attributes)
-            live_price_info = _capture_user_listing_prices_for_range(
+            live_price_info = _capture_user_listing_prices_or_degrade(
                 report_id=report_id,
                 listing_url=listing_url,
                 start_date=start_date,
@@ -2751,6 +2988,11 @@ def main():
             _shutdown_event.wait(backoff)
             backoff = min(backoff * 2, max_backoff)
 
+    # Release every runtime lease before exit: no leftover Playwright driver
+    # subprocess and no leftover playwright-async-runtime thread.
+    from worker.scraper.playwright_runtime import shutdown_all as _shutdown_playwright_runtimes
+
+    _shutdown_playwright_runtimes()
     logger.info("Worker shut down.")
 
 

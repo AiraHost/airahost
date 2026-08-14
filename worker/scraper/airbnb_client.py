@@ -45,12 +45,18 @@ class AirbnbClient:
         self._get_playwright_scraper().ensure_browser_ready()
 
     def close_browser(self) -> None:
+        """Release this client's runtime lease.
+
+        Failures are logged rather than swallowed: a silently incomplete
+        release leaves a lease — and therefore a Playwright driver — alive for
+        the rest of the worker process.
+        """
         if self._playwright_scraper is None:
             return
         try:
             self._playwright_scraper.close_browser()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("browser lease release failed cdp=%s err=%s", self.cdp_url, exc)
 
     def close_extra_tabs(self) -> None:
         """Close all browser tabs except one after a scraping task completes."""

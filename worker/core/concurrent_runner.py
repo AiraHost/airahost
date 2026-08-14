@@ -8,6 +8,8 @@ import os
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from worker.core.scrape_trace import propagate
+
 
 try:
     _configured_max_workers = int(os.getenv("MAX_SCRAPER_WORKERS", "12"))
@@ -67,10 +69,15 @@ def execute_day_queries_concurrently(
     cancelled_pending_count = 0
     early_stop_triggered = False
 
+    # Bind the submitting thread's trace/search context onto each task.
+    # ThreadPoolExecutor does not carry contextvars across the boundary, so
+    # without this every day-query would emit events with no report attached.
+    invoke = propagate(_invoke_query_func)
+
     executor = ThreadPoolExecutor(max_workers=max_workers)
     try:
         for idx, args in enumerate(args_list):
-            future = executor.submit(_invoke_query_func, query_func, args)
+            future = executor.submit(invoke, query_func, args)
             index_by_future[future] = idx
 
         pending = set(index_by_future.keys())

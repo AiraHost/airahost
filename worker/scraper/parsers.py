@@ -659,8 +659,13 @@ def _extract_structural_context_from_search_result(r: Dict[str, Any]) -> Dict[st
 
 
 def _extract_availability_context_from_search_result(r: Dict[str, Any]) -> Dict[str, Any]:
+    # is_available starts as None = "the card did not say". Absence of an
+    # `available` field is not evidence of availability: an ID-only row carries
+    # no availability claim at all, and defaulting it to True is what made such
+    # rows look structurally valid to the collector. True/False are only set
+    # from explicit payload fields or strong visible text.
     out: Dict[str, Any] = {
-        "is_available": True,
+        "is_available": None,
         "availability_reason": None,
         "min_nights": None,
     }
@@ -965,7 +970,8 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                 "rating": None,
                 "reviews": None,
                 "amenities": [],
-                "is_available": True,
+                # None = unknown; see _extract_availability_context_from_search_result.
+                "is_available": None,
                 "availability_reason": None,
                 "min_nights": None,
             },
@@ -1035,7 +1041,11 @@ def parse_search_listing_context(data: Dict[str, Any]) -> Dict[str, Dict[str, An
                 # Exact payload rule:
                 # if available=true and primaryLine.price is '$<num> <ccy>',
                 # parse it as the primary source.
-                if row.get("is_available") and isinstance(price_text, str):
+                # Gate on "not explicitly unavailable" rather than truthiness so
+                # unknown availability still records what the card displayed.
+                # Enforcing the availability contract is collection's job; a
+                # payload parser must not silently drop observed data.
+                if row.get("is_available") is not False and isinstance(price_text, str):
                     strict_val, strict_ccy = _parse_dollar_amount_currency(price_text)
                     if strict_val is not None:
                         if strict_ccy and not row.get("currency"):

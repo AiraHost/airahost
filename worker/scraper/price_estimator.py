@@ -32,10 +32,11 @@ from datetime import datetime as dt, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
+from worker.core.scrape_trace import propagate
 from worker.core.concurrent_runner import execute_day_queries_concurrently
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.comp_utils import build_comp_id
-from worker.core.errors import ReportInputError
+from worker.core.errors import InputListingNotFound, ReportInputError
 from worker.core.geo_filter import apply_geo_filter, haversine_km
 from worker.core.similarity import (
     SIMILARITY_FLOOR,
@@ -306,7 +307,7 @@ def _repair_suspicious_comparable_titles(
     try:
         with ThreadPoolExecutor(max_workers=worker_count) as ex:
             future_map = {
-                ex.submit(_fetch_title, query_arg): (item, url)
+                ex.submit(propagate(_fetch_title), query_arg): (item, url)
                 for (item, url), query_arg in zip(candidates, query_args)
             }
             for future in as_completed(future_map):
@@ -395,7 +396,7 @@ def _repair_incomplete_comparable_specs(
     try:
         with ThreadPoolExecutor(max_workers=worker_count) as ex:
             future_map = {
-                ex.submit(_fetch_spec, query_arg): (item, url)
+                ex.submit(propagate(_fetch_spec), query_arg): (item, url)
                 for (item, url), query_arg in zip(candidates, query_args)
             }
             for future in as_completed(future_map):
@@ -1653,10 +1654,21 @@ def run_scrape(
             if listing_preflight:
                 logger.info("[run_scrape] listing preflight: %s", listing_preflight)
             if listing_missing:
-                transparent = _empty_transparent("scrape", "No such listing")
-                transparent["debug"]["timingsMs"] = timings
-                transparent["debug"]["listingPreflight"] = listing_preflight
-                return [], transparent
+                # Terminal, not an empty scrape. Returning _empty_transparent()
+                # here made the orchestrator read a confirmed 404 as an ordinary
+                # no-results run, so it went on to launch a Playwright daily
+                # retry and the target-listing-only fallback against a listing
+                # that does not exist.
+                logger.warning(
+                    "[run_scrape] input listing not found: %s",
+                    {k: v for k, v in listing_preflight.items() if k != "error"},
+                )
+                raise InputListingNotFound(
+                    room_id=str(listing_preflight.get("roomId") or ""),
+                    detail=f"status={listing_preflight.get('status')} "
+                           f"statusIs404={listing_preflight.get('statusIs404')} "
+                           f"htmlHasOops404={listing_preflight.get('htmlHasOops404')}",
+                )
 
             # Step 1: Extract target listing spec (with one retry on degraded pages)
             logger.info(f"Extracting target: {listing_url}")
@@ -2660,7 +2672,7 @@ def run_benchmark_scrape(
                     max_workers=1, thread_name_prefix="bm_discount_probe"
                 )
                 _probe_future = _probe_pool.submit(
-                    probe_benchmark_discounts,
+                    propagate(probe_benchmark_discounts),
                     client,
                     benchmark_url,
                     base_origin,

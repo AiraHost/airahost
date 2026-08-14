@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from worker.core.scrape_trace import propagate
 from worker.core.comp_utils import (
     build_comp_id,
     build_comp_prices_dict,
@@ -29,6 +30,7 @@ from worker.core.comp_utils import (
     to_comparable_payload,
 )
 from worker.core.price_band import apply_price_band_filter
+from worker.scraper.scraper_errors import AirbnbSearchBlocked, BrowserRuntimeUnavailable
 from worker.core.price_sanity import apply_price_sanity, build_price_sanity_weights
 from worker.core.pricing_engine import recommend_price
 from worker.core.similarity import (
@@ -336,8 +338,8 @@ def estimate_base_price_for_date(
 
         # Execute both queries concurrently
         with ThreadPoolExecutor(max_workers=2) as executor:
-            one_night_future = executor.submit(_collect_one_night)
-            two_night_future = executor.submit(_collect_two_night)
+            one_night_future = executor.submit(propagate(_collect_one_night))
+            two_night_future = executor.submit(propagate(_collect_two_night))
             one_night_comps, _one_qn = one_night_future.result()
             two_night_comps, _two_qn = two_night_future.result()
 
@@ -710,6 +712,14 @@ def estimate_base_price_for_date(
             selection_mode=selection_mode,
             pricing_confidence=pricing_confidence,
         )
+
+    except (AirbnbSearchBlocked, BrowserRuntimeUnavailable):
+        # Neither is a per-day data gap. Degrading them to an error DayResult
+        # would let every remaining date retry against a session already known
+        # to be blocked — or against a host already known to be unable to spawn
+        # a browser runtime — and the report would end as a misleading zero-comp
+        # result instead of an actionable failure.
+        raise
 
     except Exception as exc:
         logger.warning(f"[day_query] {checkin_str}: error: {exc}")

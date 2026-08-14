@@ -5,6 +5,13 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from worker.scraper.airbnb_client import AirbnbClient
+from worker.scraper.playwright_runtime import (
+    endpoint_label,
+    is_process_spawn_resource_exhaustion,
+    max_playwright_runtimes,
+    normalize_cdp_endpoint,
+)
+from worker.scraper.scraper_errors import BrowserRuntimeResourceExhausted
 
 logger = logging.getLogger(__name__)
 MAX_BROWSER_CLIENTS = 3
@@ -59,13 +66,19 @@ def resolve_cdp_urls(config: Dict[str, Any]) -> List[str]:
 
 
 def _dedupe_urls(urls: List[str]) -> List[str]:
+    """Dedupe by *normalized endpoint*, not by raw string.
+
+    `ws://127.0.0.1:9222/devtools/browser/<id>` and `http://127.0.0.1:9222`
+    address the same browser; keying on the raw text let them through as two
+    "distinct" endpoints, and each one then started its own driver.
+    """
     out: List[str] = []
     seen: set[str] = set()
     for item in urls:
         url = str(item or "").strip()
         if not url:
             continue
-        key = url.lower()
+        key = normalize_cdp_endpoint(url) or url.lower()
         if key in seen:
             continue
         seen.add(key)
@@ -167,12 +180,31 @@ def _discover_local_cdp_urls(seed_cdp_url: str) -> List[str]:
     return discovered
 
 
+def _release_client(client: AirbnbClient) -> None:
+    try:
+        client.close_browser()
+    except Exception as exc:
+        logger.debug("browser client release failed: %s", exc)
+
+
 def build_warmed_browser_client_pool(
     base_config: Dict[str, Any],
     requested_size: int,
     *,
     pool_name: str = "browser_pool",
 ) -> List[AirbnbClient]:
+    """Logical browser clients for concurrent work, round-robin over endpoints.
+
+    Several clients may share one endpoint — callers size their thread pools
+    from ``len(pool)`` — but they share that endpoint's single Playwright
+    runtime, so pool size no longer multiplies driver subprocesses. Concurrency
+    against one browser is expressed with tab leases instead.
+
+    Raises ``BrowserRuntimeResourceExhausted`` when every endpoint failed
+    because the host could not spawn a driver: handing back a cold client there
+    only defers the identical failure into the browser-fallback path, once per
+    date and offset.
+    """
     try:
         parsed_size = int(requested_size)
     except Exception:
@@ -181,44 +213,88 @@ def build_warmed_browser_client_pool(
     cdp_urls = resolve_cdp_urls(base_config)
     if not cdp_urls:
         cdp_urls = [str(base_config.get("CDP_URL") or "http://127.0.0.1:9222")]
-    pool_size = requested_pool_size
-    logger.info(
-        "[%s] browser pool init requested=%s active=%s endpoints=%s urls=%s",
-        pool_name,
-        requested_pool_size,
-        pool_size,
-        len(cdp_urls),
-        cdp_urls,
-    )
+
+    runtime_cap = max_playwright_runtimes()
+    effective_urls = cdp_urls[:runtime_cap]
+    if len(effective_urls) < len(cdp_urls):
+        logger.warning(
+            "[%s] %s CDP endpoints configured but AIRAHOST_MAX_PLAYWRIGHT_RUNTIMES=%s; "
+            "using the first %s",
+            pool_name,
+            len(cdp_urls),
+            runtime_cap,
+            len(effective_urls),
+        )
 
     pool: List[AirbnbClient] = []
-    for idx in range(pool_size):
-        cfg = dict(base_config)
-        cfg["CDP_URL"] = cdp_urls[idx % len(cdp_urls)]
-        client = AirbnbClient(cfg)
-        try:
-            client.ensure_browser_ready()
+    # Warm each *endpoint* once, not each slot: slots sharing an endpoint share
+    # its runtime, so a second warmup would prove nothing and (before the shared
+    # runtime) started a second driver.
+    endpoint_status: Dict[str, Optional[BaseException]] = {}
+    for idx in range(requested_pool_size):
+        url = effective_urls[idx % len(effective_urls)]
+        key = normalize_cdp_endpoint(url) or url
+        client = AirbnbClient({**base_config, "CDP_URL": url})
+        if key not in endpoint_status:
+            try:
+                client.ensure_browser_ready()
+            except BaseException as exc:  # noqa: BLE001 - classified below
+                endpoint_status[key] = exc
+                logger.warning(
+                    "[%s] endpoint warmup failed cdp=%s err=%s — dropping its slots",
+                    pool_name,
+                    endpoint_label(url) or url,
+                    exc,
+                )
+                _release_client(client)
+                continue
+            endpoint_status[key] = None
             logger.info(
-                "[%s] browser slot=%s ready cdp=%s",
-                pool_name,
-                idx,
-                client.cdp_url,
+                "[%s] endpoint ready cdp=%s", pool_name, endpoint_label(url) or url
             )
             pool.append(client)
-        except Exception as exc:
-            logger.warning(
-                "[%s] browser slot=%s warmup failed cdp=%s err=%s — skipping slot",
-                pool_name,
-                idx,
-                client.cdp_url,
-                exc,
-            )
-    # Always return at least one browser even if warmup failed for all.
+            continue
+        if endpoint_status[key] is not None:
+            _release_client(client)
+            continue
+        # Endpoint already warm: a no-op on the shared started runtime, so extra
+        # slots cannot start extra drivers.
+        client.ensure_browser_ready()
+        pool.append(client)
+
+    failures = [exc for exc in endpoint_status.values() if exc is not None]
     if not pool:
+        exhausted = next(
+            (exc for exc in failures if is_process_spawn_resource_exhaustion(exc)), None
+        )
+        if exhausted is not None:
+            raise BrowserRuntimeResourceExhausted(
+                operation=f"{pool_name}:warmup",
+                endpoint=endpoint_label(effective_urls[0]) if effective_urls else "",
+                runtime_cap=runtime_cap,
+                attempt=len(endpoint_status),
+            ) from exhausted
+        # Non-resource failures (browser not up yet, transient CDP refusal) keep
+        # the historical behavior: hand back one cold client and let the normal
+        # bounded retry/recovery path deal with it.
         cfg = dict(base_config)
-        cfg["CDP_URL"] = cdp_urls[0]
-        pool.append(AirbnbClient(cfg))
-        logger.warning("[%s] all warmups failed; falling back to primary endpoint %s", pool_name, cdp_urls[0])
+        cfg["CDP_URL"] = effective_urls[0] if effective_urls else cdp_urls[0]
+        logger.warning(
+            "[%s] all warmups failed; falling back to primary endpoint %s",
+            pool_name,
+            endpoint_label(cfg["CDP_URL"]) or cfg["CDP_URL"],
+        )
+        return [AirbnbClient(cfg)]
+
+    logger.info(
+        "[%s] browser pool init requested=%s clients=%s endpoints=%s/%s runtime_cap=%s",
+        pool_name,
+        requested_pool_size,
+        len(pool),
+        sum(1 for exc in endpoint_status.values() if exc is None),
+        len(cdp_urls),
+        runtime_cap,
+    )
     return pool
 
 
