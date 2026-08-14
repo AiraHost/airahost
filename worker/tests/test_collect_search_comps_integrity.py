@@ -99,11 +99,17 @@ def test_id_only_rows_are_rejected_for_unknown_availability_not_silently_kept(ca
     assert "unknown_availability=3" in funnel
 
 
-# ── Required test 8: unknown availability is not availability ───────────────
+# ── Required test 1/6: unknown availability + positive price is accepted ────
+# when there is no explicit negative signal (unavailable / min-stay). This is
+# the corrected policy: the parser records a displayed price whenever
+# availability is *not explicitly false*, and the collector must accept on
+# that same basis or a valid, priced row is silently discarded (the root
+# cause of the "couldn't collect enough trustworthy nightly prices" incident).
 
-def test_priced_row_with_unknown_availability_is_rejected():
-    # A card that shows a price but never claims availability for these dates
-    # cannot back a date-specific comp.
+def test_priced_row_with_unknown_availability_and_no_negative_signal_is_accepted():
+    # A well-formed card with a positive price for the exact dates but no
+    # explicit `available` field: no negative signal exists, so the row is
+    # usable for date-specific pricing.
     row = {
         "demandStayListing": {"id": _gid("111")},
         "title": "Home 111",
@@ -113,6 +119,23 @@ def test_priced_row_with_unknown_availability_is_rejected():
     client = _ScriptedClient([(200, _wrap([row]))])
 
     comps, _ = _collect(client)
+    assert [c.url for c in comps] == ["https://www.airbnb.com/rooms/111"]
+
+
+def test_priced_row_with_unknown_availability_but_min_stay_blocked_is_rejected():
+    # Unknown availability does not override an explicit min-stay signal: a
+    # card blocked for the requested nights must never be promoted into the
+    # priced pool just because its `available` field is absent.
+    row = {
+        "demandStayListing": {"id": _gid("111")},
+        "title": "Home 111",
+        "personCapacity": 2,
+        "structuredDisplayPrice": {"primaryLine": {"price": "$200 CAD", "qualifier": "total"}},
+        "minNightsText": "Minimum stay of 2 nights",
+    }
+    client = _ScriptedClient([(200, _wrap([row]))])
+
+    comps, _ = _collect(client, prefer_one_night=True)
     assert comps == []
 
 

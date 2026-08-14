@@ -31,7 +31,7 @@ from worker.scraper.search_result_contract import (
     USABLE as PAYLOAD_USABLE,
     VALID_EMPTY as PAYLOAD_VALID_EMPTY,
     classify_search_payload,
-    row_is_priced,
+    row_is_bookable_priced,
 )
 from worker.scraper.target_extractor import (
     ListingSpec,
@@ -721,7 +721,9 @@ def collect_search_comps(
                 # page. Treating every 2xx as page_ok is what let a synthesized
                 # ID-only payload seed the candidate pool.
                 page_ctx = parse_search_listing_context(search_data)
-                payload_state = classify_search_payload(search_data, status, context=page_ctx)
+                payload_state = classify_search_payload(
+                    search_data, status, context=page_ctx, query_nights=query_nights
+                )
                 if payload_state.is_blocked:
                     page_counters["blocked_pages"] += 1
                     logger.warning(
@@ -783,7 +785,9 @@ def collect_search_comps(
                     existing = context.get(sid)
                     if existing is None:
                         context[sid] = row
-                    elif row_is_priced(row) and not row_is_priced(existing):
+                    elif row_is_bookable_priced(row, query_nights) and not row_is_bookable_priced(
+                        existing, query_nights
+                    ):
                         context[sid] = row
 
                 # When the result set is exhausted, Airbnb serves the same page
@@ -892,10 +896,13 @@ def collect_search_comps(
                 comps = new_comps
                 structural_excluded = before - len(comps)
 
-            # Keep only listings with a positive nightly price AND explicitly
-            # marked available. Unknown availability is rejected here: a card
-            # that never claimed availability provides no authoritative basis
-            # for a date-specific price.
+            # Keep listings with a positive nightly price for the exact dates
+            # and no explicit negative signal. `row_is_bookable_priced()` is
+            # the single acceptance rule shared with the payload classifier
+            # above: explicit availability=True is accepted, and so is
+            # unknown availability (the card simply did not say) as long as
+            # nothing explicitly says otherwise. Only explicit
+            # unavailable/min-stay signals reject a priced row.
             priced: List[ListingSpec] = []
             # Rows that failed only for want of a price — the sole population
             # the unpriced fallback may draw from. Rows rejected for
@@ -906,31 +913,38 @@ def collect_search_comps(
             unpriced_eligible: List[ListingSpec] = []
             unavailable_count = 0
             unknown_availability_count = 0
+            unknown_availability_priced_count = 0
             min_stay_blocked_count = 0
             no_price_count = 0
+            malformed_count = 0
             for c in comps:
                 lid = c.url.rsplit("/", 1)[-1] if c.url else ""
                 row = context.get(str(lid), {})
                 is_available = row.get("is_available")
                 min_nights = row.get("min_nights")
+                has_price = bool(c.nightly_price and c.nightly_price > 0)
+                if not (str(c.title or "").strip() or str(c.location or "").strip()) and c.accommodates is None:
+                    malformed_count += 1
                 if isinstance(min_nights, int) and min_nights > int(query_nights):
                     min_stay_blocked_count += 1
                     rejected_log.append(f"{lid}: min-stay-blocked")
                 elif is_available is False:
                     unavailable_count += 1
                     rejected_log.append(f"{lid}: unavailable")
+                elif c.url and row_is_bookable_priced(row, query_nights):
+                    priced.append(c)
+                    if is_available is None:
+                        unknown_availability_priced_count += 1
                 elif is_available is None:
                     unknown_availability_count += 1
                     rejected_log.append(f"{lid}: unknown-availability")
-                    if c.url and not bool(c.nightly_price and c.nightly_price > 0):
+                    if c.url and not has_price:
                         unpriced_eligible.append(c)
-                elif not bool(c.nightly_price and c.nightly_price > 0):
+                else:
                     no_price_count += 1
                     rejected_log.append(f"{lid}: no-price")
                     if c.url:
                         unpriced_eligible.append(c)
-                elif c.url:
-                    priced.append(c)
             page_counters["unknown_availability"] += unknown_availability_count
             page_counters["missing_price"] += no_price_count
 
@@ -940,8 +954,8 @@ def collect_search_comps(
             logger.info(
                 "[%s] %s: candidate_funnel query_nights=%s offsets=%s "
                 "fetched=%s parsed=%s self_excluded=%s structural_excluded=%s "
-                "unavailable=%s unknown_availability=%s min_stay_blocked=%s "
-                "no_price=%s priced=%s blocked_pages=%s malformed_pages=%s "
+                "unavailable=%s unknown_availability=%s unknown_availability_priced=%s "
+                "min_stay_blocked=%s no_price=%s priced=%s blocked_pages=%s malformed_pages=%s "
                 "valid_empty_pages=%s elapsed_ms=%s",
                 log_prefix,
                 checkin_str,
@@ -953,6 +967,7 @@ def collect_search_comps(
                 structural_excluded,
                 unavailable_count,
                 unknown_availability_count,
+                unknown_availability_priced_count,
                 min_stay_blocked_count,
                 no_price_count,
                 len(priced),
@@ -960,6 +975,25 @@ def collect_search_comps(
                 page_counters["malformed_pages"],
                 page_counters["valid_empty_pages"],
                 round((time.perf_counter() - collect_start) * 1000),
+            )
+
+            # Concise, bounded, single-line diagnostic summary at the
+            # acceptance boundary. `priced_but_unknown_availability` is a
+            # subset of `priced_and_accepted` (not a rejection) — it exists so
+            # a future incident can see how much of the trusted pool relies on
+            # unstated-but-priced evidence rather than explicit availability.
+            logger.info(
+                "[%s] %s: acceptance_diagnostics priced_and_accepted=%s "
+                "priced_but_unknown_availability=%s explicitly_unavailable=%s "
+                "min_stay_blocked=%s missing_price=%s malformed=%s",
+                log_prefix,
+                checkin_str,
+                len(priced),
+                unknown_availability_priced_count,
+                unavailable_count,
+                min_stay_blocked_count,
+                unknown_availability_count + no_price_count,
+                malformed_count,
             )
 
             # Stop paging once min_priced_target available comps are found (default

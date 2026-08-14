@@ -315,6 +315,12 @@ class PlaywrightScraper:
         # Why the direct-HTTP path last declined to serve a search. Read by the
         # fallback event so "why Playwright?" is answerable without joining logs.
         self._last_direct_search_reason: Optional[str] = None
+        # The attempt_id of the network attempt that produced the current
+        # fetch_search_direct() result, so the wrapper-level success event in
+        # search_listings_with_overrides() can join back to it. Without this,
+        # the outcome of the overwhelming majority of searches (the direct-HTTP
+        # success path) could not be correlated to a specific network attempt.
+        self._last_direct_search_attempt_id: Optional[str] = None
         # Standalone airbnb_pdp_api client (public API key, no CDP browser
         # required) tried before the captured-template replay / browser
         # fallback below. Lazily constructed; hash override is refreshed
@@ -1427,6 +1433,7 @@ class PlaywrightScraper:
                     request_class=CLASS_BROWSER_NAVIGATION,
                     operation=op_name,
                     source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
                     attempt_number=attempt,
                     status=status_code,
                     outcome=OUTCOME_SUCCESS,
@@ -1452,14 +1459,30 @@ class PlaywrightScraper:
                 raise AirbnbSearchBlocked(
                     exc.reason_code, detail="admission circuit open"
                 ) from exc
-            except BrowserRuntimeUnavailable:
+            except BrowserRuntimeUnavailable as exc:
                 # Nothing about the search is retryable here: the worker could
                 # not get a browser runtime at all. Retrying would spend another
                 # driver spawn against a host that just refused one, and
                 # wrapping it in a generic RuntimeError would hide the typed,
                 # sanitized failure from the report boundary.
+                #
+                # This previously logged only a plain-text warning, so a search
+                # that ended here left no terminal event in the JSONL stream —
+                # its playwright_started had no matching outcome anywhere.
                 logger.warning(
                     "Browser StaysSearch %s aborted: browser runtime unavailable", op_name
+                )
+                scrape_events.emit(
+                    scrape_events.PLAYWRIGHT_FAILED,
+                    level=logging.WARNING,
+                    request_class=CLASS_BROWSER_NAVIGATION,
+                    operation=op_name,
+                    source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
+                    attempt_number=attempt,
+                    outcome=OUTCOME_TRANSPORT_ERROR,
+                    reason_code=exc.reason_code,
+                    fatal=True,
                 )
                 raise
             except AirbnbSearchBlocked as exc:
@@ -1478,6 +1501,7 @@ class PlaywrightScraper:
                     request_class=CLASS_BROWSER_NAVIGATION,
                     operation=op_name,
                     source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
                     attempt_number=attempt,
                     outcome=OUTCOME_BLOCKED,
                     reason_code=exc.reason_code,
@@ -1515,6 +1539,7 @@ class PlaywrightScraper:
                     request_class=CLASS_BROWSER_NAVIGATION,
                     operation=op_name,
                     source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
                     attempt_number=attempt,
                     outcome=OUTCOME_OVERLOAD if is_rate_limited else OUTCOME_DEGRADED,
                     reason_code=getattr(exc, "reason_code", None) or type(exc).__name__,
@@ -2704,6 +2729,7 @@ class PlaywrightScraper:
                     outcome=OUTCOME_SUCCESS,
                     reason_code="stayssearch_direct_ok",
                     result_count=self._count_search_results(data),
+                    attempt_id=getattr(self, "_last_direct_search_attempt_id", None),
                 )
                 return direct
 
@@ -2998,6 +3024,7 @@ class PlaywrightScraper:
             endpoint_url=url,
             graphql_operation="StaysSearch",
         )
+        self._last_direct_search_attempt_id = attempt.attempt_id
         endpoint = scrape_events.sanitize_endpoint(url)
         base_fields: Dict[str, Any] = {
             "request_class": CLASS_SEARCH,
@@ -3586,6 +3613,7 @@ class PlaywrightScraper:
                     request_class=CLASS_BROWSER_NAVIGATION,
                     operation="get_listing_details",
                     source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
                     attempt_number=attempt,
                     outcome=OUTCOME_SUCCESS,
                     reason_code="stayspdp_captured",
@@ -3607,6 +3635,11 @@ class PlaywrightScraper:
                 raise
             except Exception as exc:
                 last_exc = exc
+                # Every branch below previously logged only a plain-text
+                # warning: a browser PDP failure that was not an
+                # AdmissionCircuitOpen left no terminal event, so its
+                # playwright_started had no matching outcome in the JSONL
+                # stream. One event per attempt now covers all of them.
                 if isinstance(exc, AirbnbRateLimited):
                     controller.record_overload(
                         CLASS_BROWSER_NAVIGATION, reason_code="browser_pdp_overload"
@@ -3617,7 +3650,21 @@ class PlaywrightScraper:
                         listing_id,
                         exc,
                     )
-                    if attempt < max_attempts:
+                    will_retry = attempt < max_attempts
+                    scrape_events.emit(
+                        scrape_events.PLAYWRIGHT_FAILED,
+                        level=logging.WARNING,
+                        request_class=CLASS_BROWSER_NAVIGATION,
+                        operation="get_listing_details",
+                        source=SOURCE_PLAYWRIGHT_CAPTURE,
+                        attempt_id=ticket.attempt_id,
+                        attempt_number=attempt,
+                        outcome=OUTCOME_OVERLOAD,
+                        reason_code="browser_pdp_overload",
+                        will_retry=will_retry,
+                        listing_id=str(listing_id),
+                    )
+                    if will_retry:
                         time.sleep(2.0 + random.random() * 2.0)
                         continue
                     break
@@ -3635,7 +3682,21 @@ class PlaywrightScraper:
                     will_retry,
                     exc,
                 )
-                if _is_cdp_connect_error(exc):
+                is_cdp_connect_failure = _is_cdp_connect_error(exc)
+                scrape_events.emit(
+                    scrape_events.PLAYWRIGHT_FAILED,
+                    level=logging.WARNING,
+                    request_class=CLASS_BROWSER_NAVIGATION,
+                    operation="get_listing_details",
+                    source=SOURCE_PLAYWRIGHT_CAPTURE,
+                    attempt_id=ticket.attempt_id,
+                    attempt_number=attempt,
+                    outcome=OUTCOME_DEGRADED,
+                    reason_code="cdp_connect_error" if is_cdp_connect_failure else type(exc).__name__,
+                    will_retry=(will_retry and not is_cdp_connect_failure),
+                    listing_id=str(listing_id),
+                )
+                if is_cdp_connect_failure:
                     logger.warning(
                         "Browser PDP fast-fail on CDP connect error for listing=%s (skip retry)",
                         listing_id,

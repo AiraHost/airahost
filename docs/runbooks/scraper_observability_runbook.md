@@ -124,6 +124,31 @@ Get-Content worker\logs\worker.jsonl |
 jq -c 'select(.search_id == "<SEARCH_ID>")' worker/logs/worker.jsonl
 ```
 
+### Did a Playwright fallback actually succeed?
+
+`search_id` tells you *that* the search escalated to Playwright; it does not by
+itself say whether the escalation worked. For that, follow `attempt_id`:
+`playwright_started` and its matching outcome — `playwright_captured_json`
+(succeeded) or `playwright_failed` (did not) — share the same `attempt_id`.
+`playwright_failed` carries `outcome` and `reason_code` explaining why.
+
+```bash
+jq -c 'select(.search_id == "<SEARCH_ID>" and (.event|startswith("playwright_")))' \
+  worker/logs/worker.jsonl
+```
+
+```powershell
+Get-Content worker\logs\worker.jsonl |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Where-Object { $_.search_id -eq '<SEARCH_ID>' -and $_.event -like 'playwright_*' } |
+  Sort-Object ts |
+  Format-Table ts, event, attempt_id, attempt_number, outcome, reason_code
+```
+
+A `playwright_started` with no `playwright_captured_json`/`playwright_failed`
+sharing its `attempt_id` means the outcome wasn't recorded — treat that as a
+logging gap to fix, not as "it must have worked."
+
 ### One target listing
 
 ```bash

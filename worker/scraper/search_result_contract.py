@@ -128,16 +128,57 @@ def auth_error_evidence_paths(data: Any) -> List[str]:
 
 
 def row_is_priced(row: Dict[str, Any]) -> bool:
-    """A row usable for date-specific pricing.
+    """A row with an *explicit* availability claim plus a positive price.
 
-    Requires an explicitly available listing plus a positive parsed price for
-    the queried dates. Unknown availability (`is_available is None`) is not
-    availability — the search card simply did not say, and defaulting it to
-    True is what let ID-only rows through.
+    Stricter than `row_is_bookable_priced()`: this only counts rows where the
+    card itself said `available: true`. Kept for callers that want that
+    narrower signal specifically (e.g. distinguishing explicit-True evidence
+    from the weaker "unknown but priced" evidence in diagnostics).
     """
     if not isinstance(row, dict):
         return False
     if row.get("is_available") is not True:
+        return False
+    nightly = row.get("nightly_price")
+    total = row.get("total_price")
+    return bool(
+        (isinstance(nightly, (int, float)) and nightly > 0)
+        or (isinstance(total, (int, float)) and total > 0)
+    )
+
+
+def row_is_bookable_priced(row: Dict[str, Any], query_nights: Optional[int] = None) -> bool:
+    """A row that may contribute a trusted date-specific nightly price.
+
+    This is the single acceptance rule for the "is this row's price usable"
+    question. Parser classification (`parse_search_listing_context()`) and
+    collector acceptance (`collect_search_comps()`) must both call this
+    function rather than each re-deriving the rule, so they cannot diverge
+    the way they did in the incident: the parser kept an observed price for
+    unknown availability while the collector rejected every such row outright.
+
+    Accepts:
+      - `is_available is True` (explicit), or
+      - `is_available is None` (the card simply did not state it) — an
+        *absence* of an availability claim is not itself a negative signal.
+
+    Rejects:
+      - `is_available is False` (explicit negative signal) — the ghost-price
+        protection for sold-out/unavailable cards.
+      - a minimum-stay requirement that exceeds `query_nights`, when both are
+        known.
+      - no positive parsed price for the exact queried dates.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("is_available") is False:
+        return False
+    min_nights = row.get("min_nights")
+    if (
+        query_nights is not None
+        and isinstance(min_nights, int)
+        and min_nights > int(query_nights)
+    ):
         return False
     nightly = row.get("nightly_price")
     total = row.get("total_price")
@@ -152,11 +193,16 @@ def classify_search_payload(
     status: Any = None,
     *,
     context: Optional[Dict[str, Dict[str, Any]]] = None,
+    query_nights: Optional[int] = None,
 ) -> SearchPayloadState:
     """Classify a StaysSearch response.
 
     `context` is the output of `parse_search_listing_context()`; when supplied,
     priced-row counting uses it so callers do not each re-derive the rule.
+    `priced_count` reflects `row_is_bookable_priced()` (explicit availability
+    or unknown-but-otherwise-clean availability), not the stricter
+    `row_is_priced()`, so this count matches what the collector will actually
+    accept.
     """
     evidence: Dict[str, Any] = {"status": status}
 
@@ -194,7 +240,7 @@ def classify_search_payload(
 
     priced = 0
     if context is not None:
-        priced = sum(1 for row in context.values() if row_is_priced(row))
+        priced = sum(1 for row in context.values() if row_is_bookable_priced(row, query_nights))
     evidence["priced_count"] = priced
     return SearchPayloadState(
         USABLE, "well_formed_results", result_count=len(results), priced_count=priced, evidence=evidence
