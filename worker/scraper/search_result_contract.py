@@ -59,6 +59,23 @@ class SearchPayloadState:
         return self.outcome in (USABLE, VALID_EMPTY)
 
 
+def build_empty_search_payload() -> Dict[str, Any]:
+    """Canonical valid-empty StaysSearch payload.
+
+    Shape matches what `_search_results()` (and every downstream parser/
+    counter that walks the same path) expects, so a synthesized "no direct
+    response, but nothing to fall back for" result is indistinguishable from
+    a genuine empty page from Airbnb.
+    """
+    return {
+        "data": {
+            "presentation": {
+                "staysSearch": {"results": {"searchResults": []}}
+            }
+        }
+    }
+
+
 def _search_results(data: Any) -> Optional[List[Any]]:
     if not isinstance(data, dict):
         return None

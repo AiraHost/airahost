@@ -73,6 +73,30 @@ class BrowserRuntimeResourceExhausted(BrowserRuntimeUnavailable):
         super().__init__(reason_code, **kwargs)
 
 
+class CdpAttachFailed(RuntimeError):
+    """Could not attach to an externally managed CDP browser, and launching a
+    replacement is disabled by default (``AIRAHOST_ALLOW_BROWSER_LAUNCH=false``).
+
+    Raised instead of silently falling back to ``chromium.launch()`` — that
+    fallback is the exact bug this error replaces: a transient CDP hiccup would
+    otherwise spawn a fresh, logged-out browser instead of the operator's
+    already-running, already-authenticated Chrome. Carries only the normalized
+    host:port and a sanitized reason (the causing exception's type name) —
+    never the full CDP URL, which can carry an opaque debugger-session token.
+    """
+
+    def __init__(self, endpoint: str, reason: str):
+        self.endpoint = str(endpoint or "")
+        self.reason = str(reason or "unknown")
+        super().__init__(
+            f"Could not attach to externally managed Chrome via CDP at {self.endpoint} "
+            f"(reason={self.reason}). Launching a replacement browser is disabled by "
+            "default; verify Chrome is running with --remote-debugging-port and the "
+            "configured CDP_URL/CDP_URLS, or set AIRAHOST_ALLOW_BROWSER_LAUNCH=true to "
+            "opt in to a standalone browser for local development."
+        )
+
+
 class AirbnbSearchBlocked(RuntimeError):
     """StaysSearch is unreachable because the session is logged out / challenged.
 

@@ -60,6 +60,7 @@ from worker.scraper.search_result_contract import (
     DEGRADED as SEARCH_DEGRADED,
     VALID_EMPTY as SEARCH_VALID_EMPTY,
     auth_error_evidence_paths,
+    build_empty_search_payload,
     classify_search_payload,
     payload_has_auth_error,
 )
@@ -79,6 +80,13 @@ logger = logging.getLogger(__name__)
 # authenticate StaysSearch over plain HTTP with this public api-key header
 # instead of relying on a captured browser tab / session headers.
 PUBLIC_AIRBNB_API_KEY = "d306zoyjsyarp7ifhu67rjxn52tv0t20"
+
+# StaysSearch direct-HTTP failure reasons that a browser retry essentially
+# never recovers from (see docs/scraper implementation prompts/
+# skip_futile_playwright_fallbacks.md for the log evidence). Escalating these
+# to Playwright only spends a navigation to relearn what the direct attempt
+# already established, so they return an empty result immediately instead.
+SEARCH_SKIP_FALLBACK_REASONS = frozenset({"empty_result_set", "direct_http_failed"})
 
 
 class AirbnbRateLimited(RuntimeError):
@@ -2674,22 +2682,16 @@ class PlaywrightScraper:
             )
             return None
         if payload_state.outcome == SEARCH_VALID_EMPTY:
-            # An authoritative, error-free empty page at a deeper pagination
-            # offset is genuine end-of-results (the base page already succeeded
-            # via this session), so trust it. A browser fallback here would cost
-            # a multi-second navigation only to have Airbnb re-serve page 1.
-            try:
-                items_offset = int(overrides.get("itemsOffset") or 0)
-            except (TypeError, ValueError):
-                items_offset = 0
-            if items_offset > 0:
-                logger.info(
-                    "[direct_search] empty results at itemsOffset=%s; treating as end of results",
-                    items_offset,
-                )
-                return status_code, data
-            logger.info("[direct_search] empty first page; falling back to browser")
-            return None
+            # An authoritative, error-free empty page is genuine end-of-results
+            # (or a genuinely empty market) regardless of offset — a browser
+            # fallback almost never recovers listings from it (see
+            # SEARCH_SKIP_FALLBACK_REASONS) and for a deeper offset would cost a
+            # multi-second navigation only to have Airbnb re-serve page 1.
+            logger.info(
+                "[direct_search] empty results at itemsOffset=%s; treating as end of results",
+                overrides.get("itemsOffset") or 0,
+            )
+            return status_code, data
         logger.info(
             "[direct_search] StaysSearch served via direct HTTP status=%s results=%s",
             status_code,
@@ -2718,9 +2720,24 @@ class PlaywrightScraper:
         ):
             self._raise_if_search_circuit_open()
             direct = self._try_direct_search(overrides)
+            reason = getattr(self, "_last_direct_search_reason", None)
             if direct is not None:
                 self._reset_search_circuit()
                 status_code, data = direct
+                if reason == "empty_result_set":
+                    # Authoritative empty page: nothing here for Playwright to
+                    # recover (see SEARCH_SKIP_FALLBACK_REASONS), so this is a
+                    # deliberate skip, not a fallback decision or a "found
+                    # results" success.
+                    scrape_events.emit(
+                        scrape_events.FALLBACK_SKIPPED,
+                        request_class=CLASS_SEARCH,
+                        source=SOURCE_DIRECT_JSON,
+                        status=status_code,
+                        reason_code=reason,
+                        result_count=self._count_search_results(data),
+                    )
+                    return direct
                 scrape_events.emit(
                     scrape_events.DIRECT_HTTP_SUCCEEDED,
                     request_class=CLASS_SEARCH,
@@ -2733,13 +2750,28 @@ class PlaywrightScraper:
                 )
                 return direct
 
+            if reason in SEARCH_SKIP_FALLBACK_REASONS:
+                # direct_http_failed: no response to classify at all, so there is
+                # nothing Playwright would be replaying differently either — the
+                # log evidence in SEARCH_SKIP_FALLBACK_REASONS shows this reason
+                # essentially never recovers via browser. Return a canonical
+                # empty result rather than spending a browser navigation on it.
+                payload = build_empty_search_payload()
+                scrape_events.emit(
+                    scrape_events.FALLBACK_SKIPPED,
+                    request_class=CLASS_SEARCH,
+                    source=SOURCE_DIRECT_JSON,
+                    reason_code=reason,
+                    result_count=0,
+                )
+                return 200, payload
+
             scrape_events.emit(
                 scrape_events.FALLBACK_SELECTED,
                 request_class=CLASS_BROWSER_NAVIGATION,
                 fallback_from=SOURCE_DIRECT_JSON,
                 source=SOURCE_PLAYWRIGHT_CAPTURE,
-                fallback_reason=getattr(self, "_last_direct_search_reason", None)
-                or "direct_search_unavailable",
+                fallback_reason=reason or "direct_search_unavailable",
             )
             return self._run_browser_search(ov, op_name="search_listings_with_overrides")
 

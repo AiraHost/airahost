@@ -53,6 +53,7 @@ from worker.scraper.scraper_errors import (
     AirbnbSearchBlocked,
     BrowserRuntimeUnavailable,
 )
+from worker.scraper import cdp_preflight
 from worker.core.report_policy import (
     resolve_execution_policy,
     NIGHTLY_POLICIES,
@@ -368,32 +369,61 @@ def _run_startup_auto_login_for_cdp(cdp_url: str, slot_index: int) -> bool:
         / f"slot_{slot_index + 1}"
     )
 
-    prior_cdp_url = os.getenv("CDP_URL")
-    os.environ["CDP_URL"] = cdp_url
+    # cdp_url is passed explicitly (not via a mutated CDP_URL env var) so this
+    # slot's login attempt can never race another slot's.
     try:
-        run_login_flow(out_dir=out_dir, dump_only=False)
+        run_login_flow(out_dir=out_dir, dump_only=False, cdp_url=cdp_url)
         return True
     except Exception as exc:
         logger.warning(f"Startup auto-login flow failed for slot={slot_index + 1} cdp={cdp_url}: {exc}")
         return False
-    finally:
-        if prior_cdp_url is None:
-            os.environ.pop("CDP_URL", None)
-        else:
-            os.environ["CDP_URL"] = prior_cdp_url
+
+
+class StartupCdpUnavailable(RuntimeError):
+    """Every configured/discovered CDP endpoint failed preflight at startup.
+
+    Raised — not caught — so ``main()`` exits nonzero before the worker claims
+    any job. Without this, a misconfigured or unreachable CDP endpoint turns
+    queued jobs into misleading empty-search, Airbnb-challenge, or generic
+    parsing failures instead of a clear, immediate startup error.
+    """
 
 
 def _maybe_run_startup_auto_login() -> None:
     cdp_urls = _resolve_startup_cdp_urls()
     logger.info(
-        "Startup Airbnb auth check: validating %s browser slot(s): %s",
+        "Startup Airbnb auth check: validating %s CDP endpoint(s): %s",
         len(cdp_urls),
         cdp_urls,
     )
 
+    preflight_results = cdp_preflight.check_cdp_endpoints(cdp_urls)
+    logger.info("CDP preflight: %s", cdp_preflight.summarize_preflight(preflight_results))
+
+    healthy_results = [r for r in preflight_results if r.ready]
+    unhealthy_results = [r for r in preflight_results if not r.ready]
+    for result in unhealthy_results:
+        logger.warning(
+            "CDP endpoint unhealthy: cdp=%s status=%s reason=%s. Verify Chrome is running "
+            "with --remote-debugging-port on this port and the configured CDP_URL/CDP_URLS "
+            "(see worker/README.md). This endpoint will not be used.",
+            result.label,
+            result.status,
+            result.reason or "-",
+        )
+
+    if not healthy_results:
+        raise StartupCdpUnavailable(
+            "No configured CDP endpoint is reachable: "
+            + ", ".join(f"{r.label}={r.status}" for r in preflight_results)
+            + ". Start Chrome with --remote-debugging-port on the configured port(s) "
+            "(see worker/README.md) before starting the worker."
+        )
+
     _state_label = {True: "logged_in", False: "logged_out", None: "unavailable"}
     all_slots_verified = True
-    for idx, cdp_url in enumerate(cdp_urls):
+    for idx, result in enumerate(healthy_results):
+        cdp_url = result.url
         auth_state = _probe_airbnb_login_state(cdp_url, CDP_CONNECT_TIMEOUT_MS)
         if auth_state is True:
             logger.info(
@@ -403,8 +433,23 @@ def _maybe_run_startup_auto_login() -> None:
             )
             continue
 
-        # Not confirmed logged in (logged out, or probe unavailable) — attempt the
-        # auto-login flow with retries, re-verifying login state after each try.
+        if auth_state is None:
+            # Transport is confirmed ready (preflight passed), but the
+            # login-state probe itself failed — a transient navigation/render
+            # issue, not evidence of a logged-out session. Auto-login must not
+            # run against an unconfirmed state, so this slot is left
+            # unverified rather than guessed at.
+            logger.warning(
+                "Startup Airbnb auth probe unavailable: slot=%s cdp=%s (transport ready, "
+                "login-state probe failed). Skipping auto-login for this endpoint this cycle.",
+                idx + 1,
+                cdp_url,
+            )
+            all_slots_verified = False
+            continue
+
+        # auth_state is False: confirmed logged out. Auto-login runs only
+        # against this exact endpoint and is re-verified afterward.
         logger.warning(
             "Startup Airbnb auth probe: slot=%s cdp=%s state=%s. Running auto-login (up to %s attempts).",
             idx + 1,
@@ -448,7 +493,7 @@ def _maybe_run_startup_auto_login() -> None:
             all_slots_verified = False
 
     if all_slots_verified:
-        logger.info("Startup Airbnb auth check: all browser slots verified logged in.")
+        logger.info("Startup Airbnb auth check: all healthy browser slots verified logged in.")
     else:
         logger.warning(
             "Startup Airbnb auth check: not all browser slots could be verified logged in. "

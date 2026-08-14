@@ -79,6 +79,34 @@ The worker connects to your **locally running Chrome** via CDP so it can use you
 
 To verify CDP is running, open `http://127.0.0.1:9222/json` in another browser — you should see a JSON array.
 
+#### Running three CDP browser slots (recommended for local dev)
+
+The worker distributes work across up to three CDP endpoints. Start three
+separately profiled Chrome instances:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\chrome-cdp-profile-9222"
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 --user-data-dir="$env:USERPROFILE\chrome-cdp-profile-9223"
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9224 --user-data-dir="$env:USERPROFILE\chrome-cdp-profile-9224"
+```
+
+and set in `worker/.env`:
+
+```dotenv
+CDP_URLS=http://127.0.0.1:9222,http://127.0.0.1:9223,http://127.0.0.1:9224
+```
+
+**CDP startup contract:** on every start, the worker runs a bounded preflight
+against each configured/discovered endpoint (an HTTP `/json/version` check,
+then a real bounded `connect_over_cdp` attach) before it checks Airbnb login
+state or claims any job. Endpoints that fail preflight are logged and
+excluded; the worker still starts with whatever subset is healthy. If **no**
+configured endpoint passes preflight, the worker fails to start (nonzero
+exit) with a message identifying each failing port and reason — it never
+launches a replacement browser and never silently starts polling with a
+browser it can't reach. See `docs/scraper implementation prompts/
+implementation_prompt_cdp_attach_no_browser_launch.md` for the full contract.
+
 ### 5. Start the worker (manual)
 
 ```powershell
@@ -282,6 +310,7 @@ The `worker/logs/` directory is created automatically on first run.
 | `FIXED_COMP_POOL_GLOBAL_LIMIT` | `30` | Max reusable fixed-pool comps retained for daily coverage fill |
 | `AIRBNB_DISABLE_MAP_SEARCH` | `0` | Set `1` to disable map search payload path |
 | `AIRBNB_ENABLE_AI_SEARCH` | `0` | Set `1` to force `aiSearchEnabled=true` in search payload |
+| `AIRAHOST_ALLOW_BROWSER_LAUNCH` | `0` (false) | Auto-login opt-in only: when a configured CDP endpoint can't be attached to, allow launching a standalone Playwright-managed browser instead of failing loud. Leave `false` in production and on the worker startup path — a launched browser is not the operator's logged-in Chrome profile. |
 
 ## Processing Modes
 
@@ -384,6 +413,11 @@ sudo journalctl -u ariahost-worker -f  # view logs
 - Visit `http://127.0.0.1:9222/json` in a browser to verify CDP is active
 - Log into Airbnb in the CDP Chrome profile
 - Check if Airbnb is showing captchas (may need to solve manually in the CDP Chrome window)
+
+### Worker exits immediately with "No configured CDP endpoint is reachable"
+- The startup CDP preflight found every configured/discovered port unhealthy — the worker refuses to start rather than run with no working browser or launch a replacement one
+- The error lists each port with a reason code (`tcp_or_http_unavailable`, `invalid_version_response`, or `cdp_attach_failed`) — start Chrome with `--remote-debugging-port` on that port, or fix `CDP_URL`/`CDP_URLS`, then restart the worker
+- If running `scripts\run-local-stack.ps1`, rerun without `-SkipChrome` so it starts Chrome for you, or check that any Chrome you started manually is actually bound to the expected port
 
 ### Jobs stuck in "running" state
 - If a worker crashes, jobs are automatically reclaimed after `WORKER_STALE_MINUTES` (default 15 min)

@@ -185,11 +185,13 @@ class FetchSearchDirectTest(unittest.TestCase):
         # Challenge-like payload -> _try_direct_search returns None (browser fallback).
         self.assertIsNone(scraper._try_direct_search({"checkin": "2026-06-27"}))
 
-    def test_try_direct_search_falls_back_on_empty(self):
+    def test_try_direct_search_trusts_empty_result_instead_of_falling_back(self):
         scraper = _new_scraper()
         scraper.captured_search_req = _make_template()
-        scraper.session = _FakeSession([_FakeResponse(200, _ok_payload([]))])
-        self.assertIsNone(scraper._try_direct_search({"checkin": "2026-06-27"}))
+        empty_payload = _ok_payload([])
+        scraper.session = _FakeSession([_FakeResponse(200, empty_payload)])
+        result = scraper._try_direct_search({"checkin": "2026-06-27"})
+        self.assertEqual(result, (200, empty_payload))
 
     def test_try_direct_search_returns_results(self):
         scraper = _new_scraper()

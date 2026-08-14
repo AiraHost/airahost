@@ -59,6 +59,7 @@ PLAYWRIGHT_CAPTURED_JSON = "playwright_captured_json"
 PLAYWRIGHT_FAILED = "playwright_failed"
 
 FALLBACK_SELECTED = "fallback_selected"
+FALLBACK_SKIPPED = "fallback_skipped"
 COOLDOWN_STARTED = "cooldown_started"
 CIRCUIT_OPENED = "circuit_opened"
 CIRCUIT_HALF_OPEN = "circuit_half_open"

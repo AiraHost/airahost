@@ -94,6 +94,7 @@ class PlaywrightFactory:
         self.start_calls = 0
         self.connect_targets: List[str] = []
         self.instances: List[FakePlaywright] = []
+        self.browsers: List[FakeBrowser] = []
         self._lock = threading.Lock()
 
     def _error_for(self, target: str) -> Optional[BaseException]:
@@ -110,7 +111,10 @@ class PlaywrightFactory:
             raise scoped
         if self.connect_error is not None:
             raise self.connect_error
-        return FakeBrowser(with_context=self.with_context)
+        browser = FakeBrowser(with_context=self.with_context)
+        with self._lock:
+            self.browsers.append(browser)
+        return browser
 
     def __call__(self) -> "PlaywrightFactory._Manager":
         return self._Manager(self)

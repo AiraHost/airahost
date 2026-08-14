@@ -45,6 +45,9 @@ from email.utils import parsedate_to_datetime
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from worker.scraper.playwright_runtime import endpoint_label
+from worker.scraper.scraper_errors import CdpAttachFailed
+
 
 LOGIN_URL = "https://www.airbnb.ca/login"
 # Auth entry point: hitting a profile page redirects logged-out users to /login;
@@ -668,24 +671,41 @@ def _advance_to_code_input(page: Page, email_value: str, max_steps: int = 6) -> 
     return _code_input_visible()
 
 
-def run_login_flow(out_dir: Path, dump_only: bool) -> None:
+def run_login_flow(out_dir: Path, dump_only: bool, cdp_url: Optional[str] = None) -> None:
+    """Run the auto-login flow against one externally managed CDP browser.
+
+    ``cdp_url`` is the endpoint to attach to. Callers driving multiple browser
+    slots (see ``worker.main``) must pass it explicitly rather than routing
+    through a mutated ``CDP_URL`` environment variable, so one slot's login
+    attempt can never race another's. When omitted (e.g. the CLI entry point),
+    falls back to the ``CDP_URL`` environment variable for backward compatibility.
+    """
     email_value = os.getenv("AIRAHOST_EMAIL", "").strip()
     if not email_value:
         raise RuntimeError("Missing AIRAHOST_EMAIL")
 
     headless = _env_bool("AIRAHOST_HEADLESS", False)
-    cdp_url = os.getenv("CDP_URL", DEFAULT_CDP_URL).strip() or DEFAULT_CDP_URL
+    resolved_cdp_url = str(cdp_url or os.getenv("CDP_URL", DEFAULT_CDP_URL)).strip() or DEFAULT_CDP_URL
+    allow_browser_launch = _env_bool("AIRAHOST_ALLOW_BROWSER_LAUNCH", False)
 
     with sync_playwright() as pw:
         browser = None
         created_new_browser = False
         try:
-            browser = pw.chromium.connect_over_cdp(cdp_url, timeout=15000)
-            print(f"[auto_login] connected to existing browser via CDP: {cdp_url}")
-        except Exception:
+            browser = pw.chromium.connect_over_cdp(resolved_cdp_url, timeout=15000)
+            print(f"[auto_login] connected to existing browser via CDP: {resolved_cdp_url}")
+        except Exception as exc:
+            if not allow_browser_launch:
+                # Externally managed Chrome is the default and expected contract:
+                # a transient CDP hiccup must never silently open a fresh, logged-out
+                # browser in its place. Fail loud with a typed, sanitized error instead.
+                raise CdpAttachFailed(endpoint_label(resolved_cdp_url), type(exc).__name__) from exc
             browser = pw.chromium.launch(headless=headless)
             created_new_browser = True
-            print("[auto_login] no attachable existing browser; launched a new browser")
+            print(
+                "[auto_login] no attachable existing browser; launched a new browser "
+                "(AIRAHOST_ALLOW_BROWSER_LAUNCH=true)"
+            )
 
         if browser.contexts:
             context = browser.contexts[0]
