@@ -2909,8 +2909,26 @@ def _execute_analysis(job: Dict[str, Any], worker_token: uuid.UUID, *, is_nightl
 # ---------------------------------------------------------------------------
 
 
-def main():
+def _log_worker_startup_identity() -> str:
+    """Log a non-secret identity line so a log/report can be tied back to the
+    exact process/host/revision that produced it. See
+    docs/scraper implementation prompts/investigate_idle_worker_pdp_failure.md
+    (an incident's error text and inspected logs may not share a process,
+    revision, host, lane, or environment).
+    """
+    worker_instance_id = uuid.uuid4().hex[:12]
+    process_start_utc = datetime.now(timezone.utc).isoformat()
     logger.info(f"AriaHost Worker starting (version={WORKER_VERSION})")
+    logger.info(
+        f"  instance_id={worker_instance_id}, host={socket.gethostname()}, pid={os.getpid()}, "
+        f"start_time_utc={process_start_utc}"
+    )
+    logger.info(f"  executable={sys.executable}, cwd={os.getcwd()}")
+    return worker_instance_id
+
+
+def main():
+    _log_worker_startup_identity()
     logger.info(f"  env={WORKER_ENV}, lane={WORKER_LANE}, poll={POLL_SECONDS}s, stale={STALE_MINUTES}min, max_attempts={MAX_ATTEMPTS}")
     logger.info(f"  heartbeat={HEARTBEAT_SECONDS}s, max_runtime={MAX_RUNTIME_SECONDS}s")
     logger.info(f"  CDP={CDP_URL}, connect_timeout={CDP_CONNECT_TIMEOUT_MS}ms")

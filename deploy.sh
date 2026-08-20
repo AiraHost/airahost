@@ -41,6 +41,7 @@ docker run -d \
   -e "SUPABASE_URL=${SUPABASE_URL}" \
   -e "SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}" \
   -e "CDP_URL=${CDP_URL}" \
+  -e "WORKER_VERSION=${GITHUB_SHA}" \
   "${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "Deployment initiated. Giving container 5 seconds to start..."
