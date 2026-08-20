@@ -11,23 +11,35 @@ export function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchReports = useCallback(async () => {
-    setLoading(true);
+  const loadReports = useCallback(async () => {
     const { data, error: fetchError } = await supabase
       .from("pricing_reports")
       .select("id, created_at, input_address, status, generation_time_ms, result_summary")
       .order("created_at", { ascending: false })
       .limit(200);
 
-    if (fetchError) setError(fetchError.message);
-    else setError(null);
-    setReports((data as PricingReportRow[] | null) ?? []);
-    setLoading(false);
+    return {
+      data: (data as PricingReportRow[] | null) ?? [],
+      errorMessage: fetchError ? fetchError.message : null,
+    };
   }, []);
 
+  const refresh = useCallback(() => {
+    setLoading(true);
+    void loadReports().then(({ data, errorMessage }) => {
+      setReports(data);
+      setError(errorMessage);
+      setLoading(false);
+    });
+  }, [loadReports]);
+
   useEffect(() => {
-    void fetchReports();
-  }, [fetchReports]);
+    void loadReports().then(({ data, errorMessage }) => {
+      setReports(data);
+      setError(errorMessage);
+      setLoading(false);
+    });
+  }, [loadReports]);
 
   const totalReports = reports.length;
   const readyReports = reports.filter((r) => r.status === "ready" && r.generation_time_ms !== null);
@@ -50,7 +62,7 @@ export function DashboardPage() {
             <p className="mt-1 text-sm text-base-400">Pricing report activity across all users</p>
           </div>
           <button
-            onClick={() => void fetchReports()}
+            onClick={refresh}
             disabled={loading}
             className="glass-panel flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium text-base-200 transition-colors hover:text-base-100 disabled:opacity-50"
           >
