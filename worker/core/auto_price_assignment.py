@@ -6,8 +6,12 @@ import urllib.request
 import urllib.error
 from playwright.sync_api import sync_playwright
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# No logging.basicConfig() here. main.py imports this module before installing
+# its own root handlers, so basicConfig's stderr handler was added first and
+# every worker log record was then emitted twice — once unformatted by that
+# handler and once by main.py's formatted console handler. That is the
+# duplicated console/formatted output seen throughout production logs.
+# A library module must leave root-logger configuration to the entrypoint.
 logger = logging.getLogger(__name__)
 
 def load_cookies_from_file(filepath: str) -> dict:

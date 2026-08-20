@@ -15,7 +15,7 @@ from worker.scraper.target_extractor import ListingSpec
 
 # Total of all component weights — used to express expected scores as the
 # fraction of weight retained after one feature is degraded.
-_TOTAL_WEIGHT = 23.5
+_TOTAL_WEIGHT = 20.5
 
 
 def _spec(
@@ -129,18 +129,3 @@ def test_missing_non_location_feature_gets_half_partial():
     assert score == pytest.approx((_TOTAL_WEIGHT - 1.0) / _TOTAL_WEIGHT)
 
 
-# ── Amenities (weight 3.0, premium-weighted Jaccard) ──────────────────────────
-def test_amenity_aliases_normalize_for_matching():
-    target = _spec(amenities=["Wi-Fi", "Air conditioning", "Free parking on premises", "Allows pets"])
-    cand = _spec(amenities=["wifi", "ac", "free_parking", "pets_allowed"])
-    assert similarity_score(target, cand) == pytest.approx(1.0)
-
-
-def test_missing_premium_amenity_penalized_more_than_wifi():
-    target = _spec(amenities=["wifi", "kitchen", "beach_access"])
-    missing_beach = _spec(amenities=["wifi", "kitchen"])
-    missing_wifi = _spec(amenities=["kitchen", "beach_access"])
-    assert similarity_score(target, missing_beach) < similarity_score(target, missing_wifi)
-    assert (
-        similarity_score(target, missing_wifi) - similarity_score(target, missing_beach)
-    ) > 0.08

@@ -32,9 +32,11 @@ from datetime import datetime as dt, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
+from worker.core.scrape_trace import propagate
 from worker.core.concurrent_runner import execute_day_queries_concurrently
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.comp_utils import build_comp_id
+from worker.core.errors import InputListingNotFound, ReportInputError
 from worker.core.geo_filter import apply_geo_filter, haversine_km
 from worker.core.similarity import (
     SIMILARITY_FLOOR,
@@ -48,13 +50,11 @@ from worker.scraper.browser_runtime import (
     close_browser_client_pool,
 )
 from worker.scraper.parsers import (
-    parse_pdp_response,
     parse_search_listing_context,
     parse_search_response,
 )
 from worker.scraper.comp_collection import (
     collect_search_comps,
-    _enrich_comps_baths_and_property_type_from_pdp,
 )
 from worker.scraper.price_normalizer import normalize_raw_price
 from worker.scraper.day_query import (
@@ -63,17 +63,15 @@ from worker.scraper.day_query import (
     DayResult,
     MAP_RADIUS_CAP_KM,
     MAX_NIGHTS,
-    MAX_SAMPLE_QUERIES,
     PER_DAY_MAX_RETRIES,
-    SAMPLE_THRESHOLD,
     SIMILARITY_FLOOR_FALLBACK,
-    compute_sample_dates,
     daterange_nights,
     estimate_base_price_for_date,
     interpolate_missing_days,
 )
 from worker.scraper.target_extractor import (
     ListingSpec,
+    extract_listing_coords_from_html,
     extract_listing_id_from_url,
     extract_nightly_price_from_listing_page,
     extract_target_spec,
@@ -90,6 +88,24 @@ try:
 except Exception:
     MIN_DAILY_COMPS_PER_DAY = 10
 MIN_DAILY_COMPS_PER_DAY = max(1, MIN_DAILY_COMPS_PER_DAY)
+
+# Interactive reports sample one representative day per fixed-size span (the
+# span's first night) and apply that nightly price across the whole span,
+# instead of querying every night. e.g. 7/1..7/15 -> query 7/1, 7/6, 7/11.
+try:
+    INTERACTIVE_CHUNK_DAYS = int(os.getenv("INTERACTIVE_CHUNK_DAYS", "5"))
+except Exception:
+    INTERACTIVE_CHUNK_DAYS = 5
+INTERACTIVE_CHUNK_DAYS = max(1, INTERACTIVE_CHUNK_DAYS)
+
+# Comparable-listing POOL discovery searches a single multi-night window so the
+# pool reflects listings available across the span. Per-date PRICE scraping
+# (day_query) keeps using accurate 1/2-night windows.
+try:
+    POOL_SEARCH_SPAN_NIGHTS = int(os.getenv("POOL_SEARCH_SPAN_NIGHTS", "5"))
+except Exception:
+    POOL_SEARCH_SPAN_NIGHTS = 5
+POOL_SEARCH_SPAN_NIGHTS = max(1, POOL_SEARCH_SPAN_NIGHTS)
 
 try:
     FIXED_COMP_BASELINE_SIZE = int(os.getenv("FIXED_COMP_BASELINE_SIZE", "20"))
@@ -108,6 +124,37 @@ try:
 except Exception:
     FIXED_COMP_POOL_GLOBAL_LIMIT = FIXED_COMP_BASELINE_SIZE
 FIXED_COMP_POOL_GLOBAL_LIMIT = max(FIXED_COMP_BASELINE_SIZE, FIXED_COMP_POOL_GLOBAL_LIMIT)
+
+# Maps target listing amenity keys (from target_extractor.AMENITY_HINTS) to
+# Airbnb search filter IDs for amenities listed in amenities.json.
+# Only high-signal amenities with a clear Airbnb filter counterpart are included.
+_AMENITY_KEY_TO_AIRBNB_FILTER_ID: Dict[str, int] = {
+    "hot_tub": 25,       # Hot Tub
+    "pool": 11,          # Private Pool (Airbnb uses generic "pool" filter)
+    "ev_charger": 41,    # EV Charger
+    "fire_pit": 45,      # Fire Pits / Outdoor Living Space
+    "ac": 5,             # Air Conditioning
+    "heating": 7,        # Heating
+    "wifi": 4,           # Fast, Reliable Wi-Fi
+    "kitchen": 8,        # Full Kitchen & Essentials
+    "washer": 21,        # In-Unit Washer & Dryer (washer)
+    "dryer": 22,         # In-Unit Washer & Dryer (dryer)
+    "pets_allowed": 24,  # Pet-Friendly
+}
+
+
+def _amenity_ids_for_search(target: "ListingSpec") -> List[int]:
+    """Return Airbnb amenity filter IDs for the target's amenities that appear in amenities.json."""
+    ids: List[int] = []
+    seen: set[int] = set()
+    for amenity_key in (target.amenities or []):
+        key = str(amenity_key or "").strip().lower()
+        aid = _AMENITY_KEY_TO_AIRBNB_FILTER_ID.get(key)
+        if aid is not None and aid not in seen:
+            ids.append(aid)
+            seen.add(aid)
+    return ids
+
 
 def _bounded_workers(env_name: str, default: int = 2) -> int:
     """Read worker count from env with defensive bounds."""
@@ -260,7 +307,7 @@ def _repair_suspicious_comparable_titles(
     try:
         with ThreadPoolExecutor(max_workers=worker_count) as ex:
             future_map = {
-                ex.submit(_fetch_title, query_arg): (item, url)
+                ex.submit(propagate(_fetch_title), query_arg): (item, url)
                 for (item, url), query_arg in zip(candidates, query_args)
             }
             for future in as_completed(future_map):
@@ -349,7 +396,7 @@ def _repair_incomplete_comparable_specs(
     try:
         with ThreadPoolExecutor(max_workers=worker_count) as ex:
             future_map = {
-                ex.submit(_fetch_spec, query_arg): (item, url)
+                ex.submit(propagate(_fetch_spec), query_arg): (item, url)
                 for (item, url), query_arg in zip(candidates, query_args)
             }
             for future in as_completed(future_map):
@@ -485,10 +532,11 @@ def _build_daily_transparent_result(
         day_date = day_result.get("date")
         day_comp_prices: Dict[str, float] = day_result.get("comp_prices") or {}
         reused_comp_price_ids = set(str(cid) for cid in (day_result.get("reused_comp_price_ids") or []))
-        day_has_valid_sample = bool(
-            day_result.get("is_sampled", False)
-            and isinstance(day_result.get("median_price"), (int, float))
-        )
+        # A day can carry comp prices if it has a real nightly price. True for
+        # sampled days and for chunk-filled days (is_sampled=False) that inherit
+        # the chunk anchor's price + comps. Linearly-interpolated days carry no
+        # comps, so they contribute nothing regardless of this gate.
+        day_has_valid_price = isinstance(day_result.get("median_price"), (int, float))
         seen_top_comp_ids: set[str] = set()
 
         for comp in day_result.get("top_comps", []) or []:
@@ -531,7 +579,7 @@ def _build_daily_transparent_result(
                 comparable_index[comp_id]["count"] += 1
                 if qn > comparable_index[comp_id]["max_query_nights"]:
                     comparable_index[comp_id]["max_query_nights"] = qn
-            if day_has_valid_sample and day_date and isinstance(price, (int, float)) and price > 0:
+            if day_has_valid_price and day_date and isinstance(price, (int, float)) and price > 0:
                 _price_rounded = round(float(price), 2)
                 comparable_index[comp_id]["price_by_date"][day_date] = _price_rounded
                 day_detail: Dict[str, Any] = {"price": _price_rounded}
@@ -562,7 +610,7 @@ def _build_daily_transparent_result(
             _pool_url = str(pool_comp.get("url") or "").strip()
             _pool_title = str(pool_comp.get("title") or "").strip()
             if not _pool_url and not _pool_title:
-                if day_has_valid_sample and day_date and isinstance(price, (int, float)) and price > 0:
+                if day_has_valid_price and day_date and isinstance(price, (int, float)) and price > 0:
                     _price_rounded = round(float(price), 2)
                     pending_comp_price_by_date.setdefault(comp_id, {})[day_date] = _price_rounded
                     pending_comp_price_details.setdefault(comp_id, {})[day_date] = {"price": _price_rounded}
@@ -592,7 +640,7 @@ def _build_daily_transparent_result(
                     comparable_index[comp_id]["price_by_date_details"].update(
                         pending_comp_price_details.get(comp_id, {})
                     )
-            if day_has_valid_sample and day_date and isinstance(price, (int, float)) and price > 0:
+            if day_has_valid_price and day_date and isinstance(price, (int, float)) and price > 0:
                 _price_rounded = round(float(price), 2)
                 comparable_index[comp_id]["price_by_date"][day_date] = _price_rounded
                 day_detail: Dict[str, Any] = {"price": _price_rounded}
@@ -845,37 +893,26 @@ def _build_fixed_comp_pool(
         max(30, int(max_cards)),
     )
 
-    def _collect_at_radius(radius_km: float, label_suffix: str = "") -> Tuple[List[ListingSpec], List[ListingSpec]]:
+    _target_amenity_ids = _amenity_ids_for_search(target)
+
+    def _collect_at_radius(radius_km: float, label_suffix: str = "") -> List[ListingSpec]:
+        # Pool discovery uses a single multi-night window so the pool reflects
+        # listings available across the span. Per-date pricing happens later in
+        # day_query with accurate 1/2-night windows.
         radius_arg = radius_km if query_center_lat is not None and query_center_lng is not None else None
-        # Run 1-night and 2-night searches concurrently; no structural filter and no per-search
-        # PDP enrichment here — a single shared batch enrichment runs after both merge.
-        def _one():
-            return collect_search_comps(
-                client, search_location, base_origin, anchor_date, adults,
-                max_scroll_rounds=max_scroll_rounds, max_cards=fixed_search_cards,
-                rate_limit_seconds=rate_limit_seconds, timeout_ms=15000,
-                exclude_url=target.url, log_prefix=f"fixed_pool_one_night{label_suffix}",
-                page_offsets=_page_offsets, center_lat=query_center_lat,
-                center_lng=query_center_lng, map_radius_km=radius_arg,
-                target_accommodates=None, pdp_structural_enrichment=False,
-                prefer_one_night=True,
-            )
-        def _two():
-            return collect_search_comps(
-                client, search_location, base_origin, anchor_date, adults,
-                max_scroll_rounds=max_scroll_rounds, max_cards=fixed_search_cards,
-                rate_limit_seconds=rate_limit_seconds, timeout_ms=15000,
-                exclude_url=target.url, log_prefix=f"fixed_pool_two_night{label_suffix}",
-                page_offsets=_page_offsets, center_lat=query_center_lat,
-                center_lng=query_center_lng, map_radius_km=radius_arg,
-                target_accommodates=None, pdp_structural_enrichment=False,
-                prefer_two_night=True,
-            )
-        with ThreadPoolExecutor(max_workers=2) as _ex:
-            _f1, _f2 = _ex.submit(_one), _ex.submit(_two)
-            one_night, _ = _f1.result()
-            two_night, _ = _f2.result()
-        return one_night, two_night
+        pool_comps, _ = collect_search_comps(
+            client, search_location, base_origin, anchor_date, adults,
+            max_scroll_rounds=max_scroll_rounds, max_cards=fixed_search_cards,
+            rate_limit_seconds=rate_limit_seconds, timeout_ms=15000,
+            exclude_url=target.url,
+            log_prefix=f"fixed_pool_{POOL_SEARCH_SPAN_NIGHTS}night{label_suffix}",
+            page_offsets=_page_offsets, center_lat=query_center_lat,
+            center_lng=query_center_lng, map_radius_km=radius_arg,
+            target_accommodates=None, pdp_structural_enrichment=False,
+            span_nights=POOL_SEARCH_SPAN_NIGHTS,
+            target_amenity_ids=_target_amenity_ids,
+        )
+        return pool_comps
 
     def _merge_comps(comps_by_id: Dict[str, ListingSpec], comps_in: List[ListingSpec]) -> None:
         for comp in comps_in:
@@ -915,30 +952,19 @@ def _build_fixed_comp_pool(
         return selected_items, filtered, debug
 
     _anchor_checkin = anchor_date.isoformat() if hasattr(anchor_date, "isoformat") else str(anchor_date)
-    _anchor_checkout = (anchor_date + timedelta(days=1)).isoformat() if hasattr(anchor_date, "isoformat") else _anchor_checkin
-
-    def _enrich_new_comps(all_comps: List[ListingSpec]) -> None:
-        """PDP-enrich the full comp list; the PDP cache makes re-visits instant."""
-        if all_comps:
-            _enrich_comps_baths_and_property_type_from_pdp(
-                client, all_comps, checkin=_anchor_checkin, checkout=_anchor_checkout, adults=adults,
-            )
 
     comps_by_id: Dict[str, ListingSpec] = {}
-    one_night_comps, two_night_comps = _collect_at_radius(map_radius_limit_km)
-    _merge_comps(comps_by_id, one_night_comps)
-    _merge_comps(comps_by_id, two_night_comps)
+    pool_comps = _collect_at_radius(map_radius_limit_km)
+    _merge_comps(comps_by_id, pool_comps)
     comps = list(comps_by_id.values())
     logger.info(
-        "[fixed_pool] %s: one_night=%s two_night=%s merged=%s radius_km=%s",
+        "[fixed_pool] %s: span_nights=%s collected=%s merged=%s radius_km=%s",
         _anchor_checkin,
-        len(one_night_comps),
-        len(two_night_comps),
+        POOL_SEARCH_SPAN_NIGHTS,
+        len(pool_comps),
         len(comps),
         round(float(map_radius_limit_km), 3),
     )
-    # Shared batch PDP enrichment — runs once for all unique comps from both searches.
-    _enrich_new_comps(comps)
 
     selected, filtered_list, _dbg = _select_comps(comps) if comps else ([], [], {"stage": "empty"})
     filtered_count = len(filtered_list)
@@ -962,20 +988,17 @@ def _build_fixed_comp_pool(
             float(map_radius_limit_km),
             expanded_radius_km,
         )
-        expanded_one, expanded_two = _collect_at_radius(expanded_radius_km, "_geo_expanded")
+        expanded_comps = _collect_at_radius(expanded_radius_km, "_geo_expanded")
         before_expand = len(comps_by_id)
-        _merge_comps(comps_by_id, expanded_one)
-        _merge_comps(comps_by_id, expanded_two)
+        _merge_comps(comps_by_id, expanded_comps)
         comps = list(comps_by_id.values())
-        # Enrich only truly new comps (cached ones return instantly).
-        _enrich_new_comps(comps)
         selected, filtered_list, _dbg = _select_comps(comps) if comps else ([], [], {"stage": "empty"})
         filtered_count = len(filtered_list)
         logger.info(
-            "[fixed_pool] %s: geo_expanded one_night=%s two_night=%s new_unique=%s merged=%s selected=%s",
+            "[fixed_pool] %s: geo_expanded span_nights=%s collected=%s new_unique=%s merged=%s selected=%s",
             _anchor_checkin,
-            len(expanded_one),
-            len(expanded_two),
+            POOL_SEARCH_SPAN_NIGHTS,
+            len(expanded_comps),
             len(comps_by_id) - before_expand,
             len(comps),
             len(selected),
@@ -1078,332 +1101,6 @@ def _merge_fixed_comp_entry(existing: Dict[str, Any], incoming: Dict[str, Any]) 
     return out
 
 
-def _fetch_pdp_prices_for_pool(
-    client,
-    pool: Dict[str, Dict[str, Any]],
-    date_i,
-    adults: int,
-) -> Dict[str, float]:
-    """
-    Directly visit each pool comp's PDP for the given date to get its nightly price.
-    Bypasses Airbnb search (which gets rate-limited) by going straight to listing pages.
-    Returns {comp_id: nightly_price} for successfully priced comps.
-    """
-    checkin_str = date_i.isoformat()
-    checkout_str = (date_i + timedelta(days=1)).isoformat()
-
-    work_items: List[Tuple[str, str, str]] = []
-    for cid, payload in pool.items():
-        url = str(payload.get("url") or "")
-        lid = extract_listing_id_from_url(url)
-        if lid:
-            work_items.append((cid, str(lid), url))
-
-    if not work_items:
-        return {}
-
-    detail_fetcher = getattr(client, "get_listing_details", None)
-    if detail_fetcher is None:
-        logger.warning("[pdp_price_pool] client has no get_listing_details")
-        return {}
-
-    prices: Dict[str, float] = {}
-    prices_lock = threading.Lock()
-
-    def _fetch_one(work_item: Tuple[str, str, str]) -> None:
-        cid, lid, url = work_item
-        try:
-            pdp_data = detail_fetcher(
-                lid,
-                checkin=checkin_str,
-                checkout=checkout_str,
-                adults=adults,
-            )
-            parsed = parse_pdp_response(pdp_data, lid, safe_domain_base(url))
-            price = parsed.get("nightly_price")
-            if isinstance(price, (int, float)) and float(price) > 0:
-                with prices_lock:
-                    prices[cid] = round(float(price), 2)
-        except Exception as exc:
-            logger.debug(
-                "[pdp_price_pool] %s listing=%s fetch failed: %s",
-                checkin_str, lid, str(exc)[:120],
-            )
-
-    max_concurrent = min(len(work_items), _tabs_per_browser())
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        list(executor.map(_fetch_one, work_items))
-
-    logger.info(
-        "[pdp_price_pool] %s: direct PDP pricing %s/%s comps priced",
-        checkin_str, len(prices), len(work_items),
-    )
-    return prices
-
-
-def _interleave_by_date_round_robin(
-    per_date_items: List[List[Any]],
-) -> List[Any]:
-    """
-    Round-robin interleave per-date work lists into a single flat list.
-
-    Input is one list of work items per date; output cycles one item from each
-    date before taking the next from any date: [d1c1, d2c1, d3c1, d1c2, d2c2, ...].
-    This keeps every date's coverage balanced when downstream processing degrades
-    over time (Airbnb throttling/challenges), instead of starving the later dates.
-    """
-    return [
-        item
-        for column in itertools.zip_longest(*per_date_items)
-        for item in column
-        if item is not None
-    ]
-
-
-def _prefetch_pool_pdp_prices_all_dates(
-    clients: list,
-    pool: Dict[str, Dict[str, Any]],
-    sample_dates: List,
-    adults: int,
-) -> Dict[str, Dict[str, float]]:
-    """
-    Pre-fetch PDP prices for all (date, comp) pairs BEFORE day queries begin.
-
-    Phase 1: Direct HTTP POST to StaysPdpSections (~300ms each, up to 50 concurrent).
-    Phase 2: Browser-tab fallback for any Phase-1 failures (limited to tab count).
-
-    Returns {date_iso: {comp_id: nightly_price}}.
-    """
-    if not pool or not sample_dates or not clients:
-        return {}
-
-    # Build per-date work lists, then interleave them round-robin across dates.
-    # executor.map preserves submission order, so a date-grouped order ([all of
-    # date1's comps, then date2's, ...]) means that when Airbnb throttling or
-    # challenges accumulate mid-run, the LAST dates get starved — which shows up
-    # as comp counts steadily declining toward later dates. Round-robin
-    # interleaving ([d1c1, d2c1, d3c1, ..., d1c2, d2c2, ...]) spreads any
-    # progressive degradation evenly so every date keeps comparable coverage.
-    per_date_items: List[List[Tuple[str, str, str, str, Any]]] = []
-    for date_i in sample_dates:
-        checkin_str = date_i.isoformat()
-        items_for_date: List[Tuple[str, str, str, str, Any]] = []
-        for cid, payload in pool.items():
-            url = str(payload.get("url") or "")
-            lid = extract_listing_id_from_url(url)
-            if lid:
-                items_for_date.append((cid, str(lid), url, checkin_str, date_i))
-        if items_for_date:
-            per_date_items.append(items_for_date)
-
-    work_items: List[Tuple[str, str, str, str, Any]] = _interleave_by_date_round_robin(
-        per_date_items
-    )
-
-    if not work_items:
-        return {}
-
-    n_clients = len(clients)
-    pre_prices: Dict[str, Dict[str, float]] = {}
-    prices_lock = threading.Lock()
-    fetch_start = time.time()
-    logger.info(
-        "[prefetch_pdp] Pre-fetching %s dates × %s comps = %s PDPs",
-        len(sample_dates), len(pool), len(work_items),
-    )
-
-    def _try_store_price(pdp_data: Any, cid: str, lid: str, url: str, checkin_str: str) -> bool:
-        if pdp_data is None:
-            return False
-        parsed = parse_pdp_response(pdp_data, lid, safe_domain_base(url))
-        price = parsed.get("nightly_price")
-        if isinstance(price, (int, float)) and float(price) > 0:
-            with prices_lock:
-                pre_prices.setdefault(checkin_str, {})[cid] = round(float(price), 2)
-            return True
-        return False
-
-    # Phase 1: direct HTTP (no browser tabs, high concurrency)
-    direct_fetchers = [getattr(c, "fetch_pdp_price_direct", None) for c in clients]
-    has_direct = any(f is not None for f in direct_fetchers)
-    failed_items: List[Tuple] = []
-    direct_succeeded = 0
-
-    if has_direct:
-        direct_lock = threading.Lock()
-
-        def _direct_fetch(i_item: Tuple[int, Tuple]) -> None:
-            nonlocal direct_succeeded
-            i, (cid, lid, url, checkin_str, date_i) = i_item
-            fetcher = direct_fetchers[i % n_clients]
-            checkout_str = (date_i + timedelta(days=1)).isoformat()
-            if fetcher is None:
-                failed_items.append((cid, lid, url, checkin_str, date_i))
-                return
-            # Small random jitter to spread requests and reduce rate-limit hits
-            time.sleep(random.uniform(0.02, 0.15))
-            try:
-                pdp_data = fetcher(lid, checkin=checkin_str, checkout=checkout_str, adults=adults)
-                if _try_store_price(pdp_data, cid, lid, url, checkin_str):
-                    with direct_lock:
-                        direct_succeeded += 1
-                    return
-            except Exception:
-                pass
-            failed_items.append((cid, lid, url, checkin_str, date_i))
-
-        phase1_start = time.time()
-        # Limit to 15 concurrent direct HTTP requests to avoid Airbnb rate limiting (503/429)
-        direct_concurrency = min(15, len(work_items))
-        logger.info("[prefetch_pdp] Phase1: direct HTTP, concurrency=%s", direct_concurrency)
-        with ThreadPoolExecutor(max_workers=direct_concurrency) as executor:
-            list(executor.map(_direct_fetch, enumerate(work_items)))
-        phase1_ms = round((time.time() - phase1_start) * 1000)
-        logger.info(
-            "[prefetch_pdp] Phase1 done: %s/%s priced, %s need browser fallback, %sms",
-            direct_succeeded, len(work_items), len(failed_items), phase1_ms,
-        )
-    else:
-        failed_items = list(work_items)
-
-    # Phase 2: browser fallback only for dates still lacking sufficient prices
-    if failed_items:
-        dates_needing_prices = {
-            date_i.isoformat()
-            for date_i in sample_dates
-            if len(pre_prices.get(date_i.isoformat(), {})) < 3
-        }
-        needed_items = [item for item in failed_items if item[3] in dates_needing_prices]
-        if not needed_items:
-            logger.info(
-                "[prefetch_pdp] Phase2 skipped -- all %s dates have >=3 prices from Phase1",
-                len(sample_dates),
-            )
-        else:
-            browser_succeeded = 0
-            browser_lock = threading.Lock()
-
-            def _browser_fetch(i_item: Tuple[int, Tuple]) -> None:
-                nonlocal browser_succeeded
-                i, (cid, lid, url, checkin_str, date_i) = i_item
-                client = clients[i % n_clients]
-                checkout_str = (date_i + timedelta(days=1)).isoformat()
-                detail_fetcher = getattr(client, "get_listing_details", None)
-                if detail_fetcher is None:
-                    return
-                try:
-                    pdp_data = detail_fetcher(lid, checkin=checkin_str, checkout=checkout_str, adults=adults)
-                    if _try_store_price(pdp_data, cid, lid, url, checkin_str):
-                        with browser_lock:
-                            browser_succeeded += 1
-                except Exception as exc:
-                    logger.debug(
-                        "[prefetch_pdp] browser %s comp=%s failed: %s", checkin_str, lid, str(exc)[:80]
-                    )
-
-            phase2_start = time.time()
-            browser_concurrency = n_clients * _tabs_per_browser()
-            logger.info(
-                "[prefetch_pdp] Phase2: browser fallback for %s/%s items (%s dates need prices), concurrency=%s",
-                len(needed_items), len(failed_items), len(dates_needing_prices), browser_concurrency,
-            )
-            with ThreadPoolExecutor(max_workers=browser_concurrency) as executor:
-                list(executor.map(_browser_fetch, enumerate(needed_items)))
-            phase2_ms = round((time.time() - phase2_start) * 1000)
-            logger.info(
-                "[prefetch_pdp] Phase2 done: %s/%s additional prices, %sms",
-                browser_succeeded, len(needed_items), phase2_ms,
-            )
-
-    total_priced = sum(len(v) for v in pre_prices.values())
-    elapsed_ms = round((time.time() - fetch_start) * 1000)
-    logger.info(
-        "[prefetch_pdp] Done: %s/%s prices fetched across %s dates in %sms",
-        total_priced, len(work_items), len(sample_dates), elapsed_ms,
-    )
-    return pre_prices
-
-
-def _build_day_result_from_pool_pdp_prices(
-    pool: Dict[str, Dict[str, Any]],
-    prices: Dict[str, float],
-    date_i,
-    top_k: int = 20,
-) -> DayResult:
-    """
-    Build a DayResult from known pool structural data + freshly fetched PDP prices.
-    Uses pre-computed similarity scores from pool build — no re-scoring needed.
-    """
-    checkin_str = date_i.isoformat()
-    is_weekend = date_i.weekday() >= 4  # Fri=4, Sat=5
-
-    priced_comps: List[Tuple[str, Dict[str, Any], float, float]] = []
-    for cid, price in prices.items():
-        payload = pool.get(cid)
-        if not payload:
-            continue
-        sim = float(payload.get("similarity") or 0.0)
-        if sim < SIMILARITY_FLOOR:
-            continue
-        if not isinstance(price, (int, float)) or float(price) <= 0:
-            continue
-        priced_comps.append((cid, payload, float(price), sim))
-
-    if not priced_comps:
-        return DayResult(
-            date=checkin_str,
-            median_price=None,
-            error="direct_pdp_fallback: no comps priced above similarity floor",
-            selection_mode="direct_pdp_fallback",
-            pricing_confidence="low",
-            flags=["direct_pdp_fallback", "no_pool_prices"],
-            is_weekend=is_weekend,
-        )
-
-    priced_comps.sort(key=lambda x: x[3], reverse=True)
-    top_items = priced_comps[: max(1, int(top_k))]
-
-    all_prices = [p for _, _, p, _ in top_items]
-    median_price = round(statistics.median(all_prices), 2) if all_prices else None
-
-    comp_prices: Dict[str, float] = {cid: p for cid, _, p, _ in top_items}
-    top_comps: List[Dict[str, Any]] = []
-    for cid, payload, price, sim in top_items:
-        top_comps.append({
-            "id": cid,
-            "url": payload.get("url"),
-            "title": payload.get("title") or "Comparable listing",
-            "propertyType": payload.get("property_type") or "entire_home",
-            "accommodates": payload.get("accommodates"),
-            "bedrooms": payload.get("bedrooms"),
-            "baths": payload.get("baths"),
-            "nightlyPrice": price,
-            "currency": payload.get("currency") or "USD",
-            "similarity": round(sim, 3),
-            "rating": payload.get("rating"),
-            "reviews": payload.get("reviews"),
-            "amenities": list(payload.get("amenities") or []),
-            "location": payload.get("location"),
-            "lat": payload.get("lat"),
-            "lng": payload.get("lng"),
-        })
-
-    return DayResult(
-        date=checkin_str,
-        median_price=median_price,
-        comps_collected=len(prices),
-        comps_used=len(top_items),
-        below_similarity_floor=max(0, len(priced_comps) - len(top_items)),
-        is_weekend=is_weekend,
-        selection_mode="direct_pdp_fallback",
-        pricing_confidence="medium" if len(top_items) >= 3 else "low",
-        comp_prices=comp_prices,
-        top_comps=top_comps,
-        flags=["direct_pdp_fallback"],
-        filter_stage="pdp_pool_direct",
-    )
-
-
 def _build_fixed_comp_pool_by_stride(
     client,
     target: ListingSpec,
@@ -1485,6 +1182,8 @@ def _preferred_comp_id(listing_url: str) -> str:
 def _build_url_mode_benchmark_info(
     all_day_results: List[Dict[str, Any]],
     preferred_comps: Optional[List[Dict[str, Any]]],
+    client: Optional[Any] = None,
+    rate_limit_seconds: float = 1.0,
 ) -> Optional[Dict[str, Any]]:
     if not preferred_comps:
         return None
@@ -1498,7 +1197,13 @@ def _build_url_mode_benchmark_info(
     if total_days == 0:
         return None
 
-    from worker.core.benchmark import BENCHMARK_MARKET_WEIGHT, BENCHMARK_MAX_ADJ
+    from worker.core.benchmark import (
+        BENCHMARK_MARKET_WEIGHT,
+        BENCHMARK_MAX_ADJ,
+        FETCH_STATUS_DIRECT_PAGE,
+        FETCH_STATUS_SEARCH_HIT,
+        _extract_benchmark_price_with_min_stay_fallback,
+    )
 
     primary_id = _preferred_comp_id(primary_url)
     benchmark_prices: List[float] = []
@@ -1506,7 +1211,9 @@ def _build_url_mode_benchmark_info(
     market_adjustments: List[float] = []
     outlier_days = 0
     search_hits = 0
+    direct_fetches = 0
     failed = 0
+    dates_unavailable_days = 0
 
     secondary_urls = [
         str(pc.get("listingUrl") or "").strip()
@@ -1515,9 +1222,15 @@ def _build_url_mode_benchmark_info(
     ]
     secondary_found: Dict[str, List[float]] = {url: [] for url in secondary_urls}
 
+    # Real display name for the benchmark: user-saved name first, else the
+    # first title resolved from a search hit or direct PDP fetch below.
+    _pc_name = str((preferred_comps[0] or {}).get("name") or "").strip()
+    benchmark_title: Optional[str] = _pc_name or None
+
     for day in sampled_days:
         comp_prices = day.get("comp_prices") or {}
         primary_price = comp_prices.get(primary_id)
+        fetch_method = FETCH_STATUS_SEARCH_HIT
         if primary_price is None:
             for tc in day.get("top_comps", []) or []:
                 tc_url = str(tc.get("url") or "").strip()
@@ -1525,11 +1238,59 @@ def _build_url_mode_benchmark_info(
                     price = tc.get("nightlyPrice")
                     if isinstance(price, (int, float)) and price > 0:
                         primary_price = float(price)
+                        if benchmark_title is None:
+                            benchmark_title = str(tc.get("title") or "").strip() or None
                         break
+
+        # The benchmark didn't surface in this day's search results (e.g. it's
+        # outside the search's ranking window). Fall back to a direct PDP fetch
+        # of the benchmark listing page itself, same as the Mode C pipeline.
+        if primary_price is None and client is not None:
+            try:
+                day_date = dt.strptime(str(day.get("date")), "%Y-%m-%d").date()
+                checkin_str = day_date.isoformat()
+                checkout_str = (day_date + timedelta(days=1)).isoformat()
+                time.sleep(min(rate_limit_seconds * 0.5, 0.5))
+                pdp_price, _pdp_confidence, _pdp_title = _extract_benchmark_price_with_min_stay_fallback(
+                    client, primary_url, checkin_str, checkout_str
+                )
+                if _pdp_title and benchmark_title is None:
+                    benchmark_title = _pdp_title
+                if pdp_price is None and _pdp_confidence == "unavailable":
+                    dates_unavailable_days += 1
+                if pdp_price:
+                    primary_price = float(pdp_price)
+                    fetch_method = FETCH_STATUS_DIRECT_PAGE
+                    # A PDP-only price never went through the day's normal
+                    # top_comps/comp_prices assembly, so without this it would
+                    # count toward benchmarkInfo but never appear in
+                    # comparableListings. Inject it the same way Mode C does.
+                    _rounded_price = round(primary_price, 2)
+                    if not isinstance(day.get("comp_prices"), dict):
+                        day["comp_prices"] = dict(comp_prices)
+                    day["comp_prices"][primary_id] = _rounded_price
+                    if not isinstance(day.get("top_comps"), list):
+                        day["top_comps"] = []
+                    if not any(str(tc.get("id") or "") == primary_id for tc in day["top_comps"]):
+                        day["top_comps"].append({
+                            "id": primary_id,
+                            "title": benchmark_title or "Your benchmark listing",
+                            "nightlyPrice": _rounded_price,
+                            "similarity": 0.98,
+                            "url": primary_url,
+                            "isPinnedBenchmark": True,
+                        })
+            except Exception as _pdp_exc:
+                logger.warning(
+                    f"[url-mode-benchmark] {day.get('date')}: direct PDP fetch failed: {_pdp_exc}"
+                )
 
         if primary_price is not None:
             benchmark_prices.append(round(float(primary_price), 2))
-            search_hits += 1
+            if fetch_method == FETCH_STATUS_DIRECT_PAGE:
+                direct_fetches += 1
+            else:
+                search_hits += 1
             market_price = day.get("median_price")
             if isinstance(market_price, (int, float)) and market_price > 0:
                 market_prices.append(round(float(market_price), 2))
@@ -1590,11 +1351,19 @@ def _build_url_mode_benchmark_info(
         or consensus_signal == "divergent"
     )
 
+    if search_hits >= direct_fetches and search_hits > 0:
+        primary_method = FETCH_STATUS_SEARCH_HIT
+    elif direct_fetches > 0:
+        primary_method = FETCH_STATUS_DIRECT_PAGE
+    else:
+        primary_method = "failed"
+
     return {
         "benchmarkUsed": benchmark_used,
         "benchmarkUrl": primary_url,
-        "benchmarkFetchStatus": "search_hit" if benchmark_used else "failed",
-        "benchmarkFetchMethod": "search_hit" if benchmark_used else "failed",
+        "benchmarkTitle": benchmark_title,
+        "benchmarkFetchStatus": primary_method,
+        "benchmarkFetchMethod": primary_method,
         "avgBenchmarkPrice": avg_benchmark,
         "avgMarketPrice": avg_market,
         "marketAdjustmentPct": avg_adj,
@@ -1603,13 +1372,23 @@ def _build_url_mode_benchmark_info(
         "maxAdjCap": BENCHMARK_MAX_ADJ,
         "outlierDays": outlier_days,
         "conflictDetected": conflict_detected,
-        "fallbackReason": None if benchmark_used else "benchmark_not_found_in_url_mode",
+        "fallbackReason": (
+            None
+            if benchmark_used
+            else (
+                # The benchmark's own page said the dates are not bookable —
+                # the listing exists but its calendar is blocked/closed.
+                "benchmark_unavailable_for_dates"
+                if dates_unavailable_days > 0
+                else "benchmark_not_found_in_url_mode"
+            )
+        ),
         "fetchStats": {
             "searchHits": search_hits,
-            "directFetches": 0,
+            "directFetches": direct_fetches,
             "failed": failed,
             "totalDays": total_days,
-            "highConfidenceDays": search_hits,
+            "highConfidenceDays": search_hits + direct_fetches,
             "mediumConfidenceDays": 0,
             "lowConfidenceDays": 0,
         },
@@ -1792,7 +1571,6 @@ def run_scrape(
     target_lng: Optional[float] = None,
     max_radius_km: Optional[float] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
     fallback_attributes: Optional[Dict[str, Any]] = None,
     fallback_address: Optional[str] = None,
     target_spec_override: Optional[ListingSpec] = None,
@@ -1837,33 +1615,26 @@ def run_scrape(
     if total_nights < 1:
         return [], _empty_transparent("scrape", "Invalid date range: checkout must be after checkin")
     if total_nights > MAX_NIGHTS:
-        raise ValueError(
+        raise ReportInputError(
             f"Date range of {total_nights} nights exceeds maximum of {MAX_NIGHTS}. "
             f"Please select a shorter range."
         )
 
     all_nights = daterange_nights(d_start, d_end)
 
-    # Query every night in the requested range.
-    if nightly_plan is not None:
-        sample_indices = list(range(total_nights))
-        _eff_scroll_rounds = nightly_plan.scroll_rounds
-        _eff_max_cards = nightly_plan.max_cards
-        _early_stop_threshold = None
-        logger.info(
-            f"Day-by-day pipeline (nightly): {total_nights} nights, "
-            f"querying all {len(sample_indices)} nights "
-            f"(scroll_rounds={_eff_scroll_rounds}, max_cards={_eff_max_cards})"
-        )
-    else:
-        sample_indices = list(range(total_nights))
-        _eff_scroll_rounds = max_scroll_rounds
-        _eff_max_cards = max_cards
-        _early_stop_threshold = None
-        logger.info(
-            f"Day-by-day pipeline: {total_nights} nights, "
-            f"querying all {len(sample_indices)} days (sampling=no)"
-        )
+    # Every job (nightly and interactive) prices every night with accurate
+    # 1/2-night day queries so each day's comp prices are real (not reused
+    # across days). Comparable-listing POOL discovery is the part chunked
+    # into 5-day spans (see _fixed_pool_nights below).
+    sample_indices = list(range(total_nights))
+    _eff_scroll_rounds = max_scroll_rounds
+    _eff_max_cards = max_cards
+    _early_stop_threshold = None
+    logger.info(
+        f"Day-by-day pipeline: {total_nights} nights, "
+        f"pricing all {len(sample_indices)} days "
+        f"(pool discovery chunked every {INTERACTIVE_CHUNK_DAYS} days)"
+    )
 
     client = AirbnbClient(
         {
@@ -1883,10 +1654,21 @@ def run_scrape(
             if listing_preflight:
                 logger.info("[run_scrape] listing preflight: %s", listing_preflight)
             if listing_missing:
-                transparent = _empty_transparent("scrape", "No such listing")
-                transparent["debug"]["timingsMs"] = timings
-                transparent["debug"]["listingPreflight"] = listing_preflight
-                return [], transparent
+                # Terminal, not an empty scrape. Returning _empty_transparent()
+                # here made the orchestrator read a confirmed 404 as an ordinary
+                # no-results run, so it went on to launch a Playwright daily
+                # retry and the target-listing-only fallback against a listing
+                # that does not exist.
+                logger.warning(
+                    "[run_scrape] input listing not found: %s",
+                    {k: v for k, v in listing_preflight.items() if k != "error"},
+                )
+                raise InputListingNotFound(
+                    room_id=str(listing_preflight.get("roomId") or ""),
+                    detail=f"status={listing_preflight.get('status')} "
+                           f"statusIs404={listing_preflight.get('statusIs404')} "
+                           f"htmlHasOops404={listing_preflight.get('htmlHasOops404')}",
+                )
 
             # Step 1: Extract target listing spec (with one retry on degraded pages)
             logger.info(f"Extracting target: {listing_url}")
@@ -2190,6 +1972,14 @@ def run_scrape(
 
             fixed_comp_pool: Dict[str, Dict[str, Any]] = {}
             fixed_pool_start = time.time()
+            # Fixed pool anchors the same chunk anchors as the day queries
+            # above (one per INTERACTIVE_CHUNK_DAYS-day span). Pool discovery
+            # is chunked into 5-day spans: one 5-night anchor per span
+            # (pricing above still runs per day).
+            _fixed_pool_nights = [
+                all_nights[i] for i in range(0, total_nights, INTERACTIVE_CHUNK_DAYS)
+            ]
+            _fixed_pool_stride = 1
             try:
                 (
                     fixed_comp_pool,
@@ -2200,9 +1990,9 @@ def run_scrape(
                     client,
                     target,
                     base_origin,
-                    all_nights,
+                    _fixed_pool_nights,
                     effective_adults,
-                    stride_days=FIXED_COMP_POOL_STRIDE_DAYS,
+                    stride_days=_fixed_pool_stride,
                     max_scroll_rounds=max(1, min(int(_eff_scroll_rounds), 2)),
                     max_cards=_eff_max_cards,
                     rate_limit_seconds=rate_limit_seconds,
@@ -2248,31 +2038,6 @@ def run_scrape(
             # across the physical pool so load is spread evenly.
             _day_query_workers = min(_day_query_workers, len(sample_indices))
 
-            # Propagate primary client's cookies + PDP template to all pool clients.
-            # Pool clients are freshly created with empty sessions; without this they
-            # cannot make authenticated direct HTTP calls in Phase 1 pre-fetch.
-            for _pool_client in _day_query_pool:
-                try:
-                    _pool_client.copy_session_state_from(client)
-                except Exception:
-                    pass
-
-            # Pre-fetch comp prices for all sample dates using the full browser pool
-            # BEFORE any searches start. This avoids the circular rate-limiting issue
-            # where on-demand PDP fallback runs after searches have slowed down the browser.
-            _pre_fetched_prices: Dict[str, Dict[str, float]] = {}
-            if fixed_comp_pool:
-                sample_dates_for_prefetch = [all_nights[i] for i in sample_indices]
-                try:
-                    _pre_fetched_prices = _prefetch_pool_pdp_prices_all_dates(
-                        _day_query_pool,
-                        fixed_comp_pool,
-                        sample_dates_for_prefetch,
-                        effective_adults,
-                    )
-                except Exception as _pf_exc:
-                    logger.warning("[prefetch_pdp] pre-fetch failed (non-fatal): %s", _pf_exc)
-
             _day_query_args = [
                 {"night_idx": night_idx, "browser_slot": i % _pool_size}
                 for i, night_idx in enumerate(sample_indices)
@@ -2283,78 +2048,7 @@ def run_scrape(
                 f"rate_limit_seconds={rate_limit_seconds}"
             )
 
-            def _day_positive_comp_ids(day_result: Optional[DayResult]) -> set[str]:
-                if day_result is None:
-                    return set()
-                # Count comps at or above the daily similarity floor (consistent with
-                # the floor used inside estimate_base_price_for_date).
-                top_ids = {
-                    str(comp.get("id") or build_comp_id(comp.get("url") or "") or "").strip()
-                    for comp in (day_result.top_comps or [])
-                    if float(comp.get("similarity") or 0.0) >= SIMILARITY_FLOOR
-                }
-                return {
-                    str(cid)
-                    for cid, price in (day_result.comp_prices or {}).items()
-                    if str(cid) in top_ids
-                    and isinstance(price, (int, float))
-                    and float(price) > 0
-                }
-
-            def _merge_hybrid_day_results(
-                fixed_result: DayResult,
-                dynamic_result: DayResult,
-            ) -> DayResult:
-                merged_prices = dict(fixed_result.comp_prices or {})
-                for cid, price in (dynamic_result.comp_prices or {}).items():
-                    if (
-                        cid not in merged_prices
-                        and isinstance(price, (int, float))
-                        and float(price) > 0
-                    ):
-                        merged_prices[cid] = price
-
-                merged_top: List[Dict[str, Any]] = []
-                seen_top: set[str] = set()
-                for comp in list(fixed_result.top_comps or []) + list(dynamic_result.top_comps or []):
-                    cid = str(comp.get("id") or build_comp_id(comp.get("url") or "") or "").strip()
-                    if not cid or cid in seen_top:
-                        continue
-                    if float(comp.get("similarity") or 0.0) <= 0.50:
-                        continue
-                    seen_top.add(cid)
-                    merged_top.append(comp)
-
-                flags = list(dict.fromkeys(
-                    list(fixed_result.flags or [])
-                    + list(dynamic_result.flags or [])
-                    + ["dynamic_day_query"]
-                ))
-                return DayResult(
-                    date=fixed_result.date,
-                    median_price=dynamic_result.median_price or fixed_result.median_price,
-                    comps_collected=int(fixed_result.comps_collected or 0) + int(dynamic_result.comps_collected or 0),
-                    comps_used=max(int(fixed_result.comps_used or 0), int(dynamic_result.comps_used or 0)),
-                    below_similarity_floor=int(fixed_result.below_similarity_floor or 0)
-                    + int(dynamic_result.below_similarity_floor or 0),
-                    price_outliers_excluded=int(fixed_result.price_outliers_excluded or 0)
-                    + int(dynamic_result.price_outliers_excluded or 0),
-                    price_outliers_downweighted=int(fixed_result.price_outliers_downweighted or 0)
-                    + int(dynamic_result.price_outliers_downweighted or 0),
-                    geo_excluded=int(fixed_result.geo_excluded or 0) + int(dynamic_result.geo_excluded or 0),
-                    price_band_excluded=int(fixed_result.price_band_excluded or 0)
-                    + int(dynamic_result.price_band_excluded or 0),
-                    filter_stage="hybrid_fixed_dynamic",
-                    flags=flags,
-                    is_sampled=True,
-                    is_weekend=fixed_result.is_weekend,
-                    price_distribution=dynamic_result.price_distribution or fixed_result.price_distribution,
-                    top_comps=merged_top,
-                    comp_prices=merged_prices,
-                    error=dynamic_result.error if dynamic_result.error and not merged_prices else None,
-                    selection_mode="hybrid_fixed_dynamic",
-                    pricing_confidence=dynamic_result.pricing_confidence or fixed_result.pricing_confidence,
-                )
+            _day_query_target_amenity_ids = _amenity_ids_for_search(target)
 
             def _run_day_query(*, night_idx: int, browser_slot: int) -> DayResult:
                 night_idx = int(night_idx)
@@ -2364,21 +2058,6 @@ def run_scrape(
                 date_i = all_nights[night_idx]
                 date_str = date_i.isoformat()
 
-                # Fast path: enough pre-fetched PDP prices → skip StaysSearch entirely
-                if fixed_comp_pool and _pre_fetched_prices.get(date_str):
-                    pdp_prices = _pre_fetched_prices[date_str]
-                    if len(pdp_prices) >= 3:
-                        pdp_result = _build_day_result_from_pool_pdp_prices(
-                            fixed_comp_pool, pdp_prices, date_i, top_k,
-                        )
-                        if pdp_result.median_price is not None:
-                            logger.info(
-                                "[day_query] %s: fast-path skip search, %s pre-fetched prices -> median=$%s",
-                                date_str, len(pdp_prices), pdp_result.median_price,
-                            )
-                            return pdp_result
-
-                # Slow path: StaysSearch with retries and PDP fallback
                 result: Optional[DayResult] = None
                 for attempt in range(1, PER_DAY_MAX_RETRIES + 1):
                     time.sleep(rate_limit_seconds)
@@ -2398,46 +2077,73 @@ def run_scrape(
                             max_radius_km=_effective_radius,
                             known_comp_pool=fixed_comp_pool or None,
                             allow_relaxed_similarity=False,
+                            target_amenity_ids=_day_query_target_amenity_ids,
                         )
                     if result.median_price is not None:
-                        break
-                    # Search rate-limited and we have pre-fetched prices — skip retry
-                    if fixed_comp_pool and _pre_fetched_prices.get(date_str):
                         break
                     if attempt < PER_DAY_MAX_RETRIES:
                         logger.info(
                             f"[day_query] {date_str}: retry {attempt+1}/{PER_DAY_MAX_RETRIES}"
                         )
-                fixed_yield = len(_day_positive_comp_ids(result))
-                if fixed_comp_pool and result is not None and (result.median_price is None or fixed_yield < 3):
-                    pdp_prices = _pre_fetched_prices.get(date_str)
-                    source = "pre_fetched"
-                    if not pdp_prices:
-                        source = "on_demand"
-                        pdp_prices = _fetch_pdp_prices_for_pool(
-                            day_client, fixed_comp_pool, date_i, effective_adults,
-                        )
+
+                # Still no price after the normal retries: refresh the comp
+                # pool with a fresh anchor search for this specific date and
+                # try once more before giving up. Handles the case where the
+                # job-wide fixed_comp_pool's cached comps are no longer
+                # priceable for this date (e.g. booked/blocked) even though
+                # the market itself isn't empty. Exactly one refresh attempt;
+                # if it still finds no price, the day is left for interpolation.
+                if result is not None and result.median_price is None:
                     logger.info(
-                        "[hybrid_comps] %s: fixed pool yielded %s prices; using %s PDP prices for %s/%s pool comps",
-                        date_str, fixed_yield, source,
-                        len(pdp_prices) if pdp_prices else 0, len(fixed_comp_pool),
+                        f"[day_query] {date_str}: no price after {PER_DAY_MAX_RETRIES} "
+                        f"attempt(s); refreshing comp pool and retrying once"
                     )
-                    if pdp_prices:
-                        pdp_result = _build_day_result_from_pool_pdp_prices(
-                            fixed_comp_pool, pdp_prices, date_i, top_k,
+                    try:
+                        with day_lock:
+                            refreshed_pool = _build_fixed_comp_pool(
+                                day_client,
+                                target,
+                                base_origin,
+                                date_i,
+                                effective_adults,
+                                max_scroll_rounds=_eff_scroll_rounds,
+                                max_cards=_eff_max_cards,
+                                rate_limit_seconds=rate_limit_seconds,
+                                max_radius_km=_effective_radius,
+                                pool_size=FIXED_COMP_POOL_GLOBAL_LIMIT,
+                            )
+                    except Exception as refresh_exc:
+                        logger.warning(
+                            f"[day_query] {date_str}: comp pool refresh failed "
+                            f"(non-fatal): {refresh_exc}"
                         )
-                        pdp_yield = len(_day_positive_comp_ids(pdp_result))
-                        if pdp_yield > 0:
-                            result = _merge_hybrid_day_results(result, pdp_result)
+                        refreshed_pool = {}
+                    merged_pool = {**(fixed_comp_pool or {}), **refreshed_pool}
+                    time.sleep(rate_limit_seconds)
+                    with day_lock:
+                        refreshed_result = estimate_base_price_for_date(
+                            day_client,
+                            target,
+                            base_origin,
+                            date_i,
+                            effective_adults,
+                            max_scroll_rounds=_eff_scroll_rounds,
+                            max_cards=_eff_max_cards,
+                            rate_limit_seconds=rate_limit_seconds,
+                            top_k=top_k,
+                            preferred_comps=preferred_comps,
+                            excluded_room_ids=excluded_room_ids,
+                            max_radius_km=_effective_radius,
+                            known_comp_pool=merged_pool or None,
+                            allow_relaxed_similarity=False,
+                            target_amenity_ids=_day_query_target_amenity_ids,
+                        )
+                    if refreshed_result.median_price is not None:
                         logger.info(
-                            "[hybrid_comps] %s: PDP yield=%s merged_yield=%s source=%s",
-                            date_str, pdp_yield,
-                            len(_day_positive_comp_ids(result)), source,
+                            f"[day_query] {date_str}: recovered price after comp pool refresh"
                         )
-                    else:
-                        logger.info(
-                            "[hybrid_comps] %s: PDP returned no prices (source=%s)", date_str, source,
-                        )
+                    result = refreshed_result
+
                 if result is None:
                     return DayResult(
                         date=date_i.isoformat(),
@@ -2473,37 +2179,9 @@ def run_scrape(
                 )
 
             timings["day_queries_ms"] = round((time.time() - day_loop_start) * 1000)
-            # Record nightly crawl metadata for debug visibility.
-            if nightly_plan is not None:
-                # Compute actual observed/inferred from execution tracking, not from the
-                # original plan.  If early-stop fired, unqueried planned dates must not
-                # be counted as observed or as the plan's original infer set.
-                _actual_observed = [
-                    _queried_night_indices[i]
-                    for i, r in enumerate(sampled_results)
-                    if r.median_price is not None
-                ]
-                _actual_inferred = sorted(
-                    set(range(nightly_plan.total_nights)) - set(_actual_observed)
-                )
-                timings["nightly_crawl_debug"] = {
-                    "total_nights": nightly_plan.total_nights,
-                    "observed_count": len(_actual_observed),
-                    "queried_count": len(_queried_night_indices),
-                    "infer_count": len(_actual_inferred),
-                    "early_stop_triggered": _early_stop_triggered,
-                    "consecutive_empty_peak": _consecutive_empty_peak,
-                    "tiers": nightly_plan.tier_debug,
-                    "planned_observe_indices": nightly_plan.observe_indices,
-                    "actual_queried_indices": _queried_night_indices,
-                    "actual_observed_indices": _actual_observed,
-                    "actual_inferred_indices": _actual_inferred,
-                    "scroll_rounds": nightly_plan.scroll_rounds,
-                    "max_cards": nightly_plan.max_cards,
-                    "query_workers": _day_query_workers,
-                }
 
-            # Step 3: Interpolate unsampled/failed days
+            # Step 3: Interpolate unsampled/failed days. Every night is priced
+            # per day, so interpolation only fills days whose query failed.
             interp_start = time.time()
             all_day_results_obj = interpolate_missing_days(sampled_results, all_nights)
             timings["interpolation_ms"] = round((time.time() - interp_start) * 1000)
@@ -2597,6 +2275,8 @@ def run_scrape(
                 benchmark_info=_build_url_mode_benchmark_info(
                     all_day_results,
                     preferred_comps,
+                    client=client,
+                    rate_limit_seconds=rate_limit_seconds,
                 ),
                 target_price_confidence=_target_price_confidence,
                 spec_backfill=_spec_backfill_meta,
@@ -2671,9 +2351,9 @@ def run_benchmark_scrape(
     max_radius_km: Optional[float] = None,
     excluded_room_ids: Optional[set[str]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
     fallback_address: Optional[str] = None,
     target_url: Optional[str] = None,
+    benchmark_name: Optional[str] = None,
 ) -> tuple:
     """
     Benchmark-first pipeline.
@@ -2684,13 +2364,8 @@ def run_benchmark_scrape(
     Returns (daily_results, transparent_result).
     Fallback: if benchmark price fetch fails entirely, raises ValueError
     so the caller can fall back to the standard run_scrape pipeline.
-
-    nightly_plan: when provided (nightly jobs only), overrides sample indices
-    with the tiered nightly plan and applies reduced per-query limits and
-    circuit-breaker early-stop.
     """
     from worker.core.benchmark import (
-        BENCHMARK_MAX_SAMPLE_QUERIES,
         BenchmarkDayResult,
         aggregate_benchmark_transparency,
         benchmark_day_result_to_dict,
@@ -2713,33 +2388,23 @@ def run_benchmark_scrape(
     if total_nights < 1:
         return [], _empty_transparent("benchmark", "Invalid date range")
     if total_nights > MAX_NIGHTS:
-        raise ValueError(
+        raise ReportInputError(
             f"Date range of {total_nights} nights exceeds maximum of {MAX_NIGHTS}."
         )
 
     all_nights = daterange_nights(d_start, d_end)
 
-    # Nightly jobs use the tiered plan; benchmark interactive uses standard sampling.
-    if nightly_plan is not None:
-        sample_indices = nightly_plan.observe_indices
-        _bm_eff_scroll_rounds = nightly_plan.scroll_rounds
-        _bm_eff_max_cards = nightly_plan.max_cards
-        _bm_early_stop_threshold: Optional[int] = nightly_plan.early_stop_threshold
-        logger.info(
-            f"Benchmark pipeline (nightly): {benchmark_url} | {total_nights} nights, "
-            f"observing {len(sample_indices)} / inferring {len(nightly_plan.infer_indices)}"
-        )
-    else:
-        if total_nights <= SAMPLE_THRESHOLD:
-            sample_indices = list(range(total_nights))
-        else:
-            sample_indices = compute_sample_dates(total_nights, BENCHMARK_MAX_SAMPLE_QUERIES)
-        from worker.core.benchmark import BENCHMARK_SCROLL_ROUNDS as _bm_eff_scroll_rounds, BENCHMARK_MAX_CARDS as _bm_eff_max_cards  # noqa: E501
-        _bm_early_stop_threshold = None
-        logger.info(
-            f"Benchmark pipeline: {benchmark_url} | {total_nights} nights, "
-            f"querying {len(sample_indices)} days"
-        )
+    # The report UI only shows a comparable on a selected day when that
+    # listing has an exact price for the day. Interpolated benchmark prices do
+    # not provide that evidence, so benchmark reports must query every day just
+    # like the standard URL-scrape pipeline.
+    sample_indices = list(range(total_nights))
+    from worker.core.benchmark import BENCHMARK_SCROLL_ROUNDS as _bm_eff_scroll_rounds, BENCHMARK_MAX_CARDS as _bm_eff_max_cards  # noqa: E501
+    _bm_early_stop_threshold = None
+    logger.info(
+        f"Benchmark pipeline: {benchmark_url} | {total_nights} nights, "
+        f"querying {len(sample_indices)} days"
+    )
 
     client = AirbnbClient(
         {
@@ -2752,15 +2417,10 @@ def run_benchmark_scrape(
         }
     )
     if True:
-        # Step 0: Probe Discounts
-        # 在開始逐日抓取前，先對 Benchmark 進行「定價策略探測」
-        # 這會額外花費約 3-5 秒，但能大幅提升準確度
-        discount_info = {}
-        try:
-            discount_info = probe_benchmark_discounts(client, benchmark_url, base_origin, d_start)
-        except Exception as e:
-            logger.warning(f"[benchmark] Discount probe failed: {e}")
-        # ────────────────────────────────────────────────────────────────
+        # Discount probing moved off the critical path: it now runs on a
+        # background thread concurrently with the day queries (see below),
+        # after the benchmark coordinates are known.
+        discount_info: Dict[str, Any] = {}
 
         try:
             # Step 1: Extract benchmark listing spec (location, capacity, etc.)
@@ -2950,6 +2610,79 @@ def run_benchmark_scrape(
                         f"({bm_mismatch_level})"
                     )
 
+            # ── Benchmark's own coordinates (per-day micro map-search) ────────
+            # When the target spec was extracted from the benchmark listing
+            # itself, its coords may already be on `target`; otherwise one
+            # direct-HTTP page GET + regex resolves them (~1s, no browser).
+            # Without coords the micro-search is skipped and per-day pricing
+            # falls back to direct-HTTP PDP.
+            _bm_lat: Optional[float] = None
+            _bm_lng: Optional[float] = None
+            _bm_coords_start = time.time()
+            if target_spec_override is None and not target_url:
+                _bm_lat, _bm_lng = target.lat, target.lng
+            if _bm_lat is None or _bm_lng is None:
+                try:
+                    _bm_room_id = extract_listing_id_from_url(benchmark_url)
+                    if _bm_room_id:
+                        _bm_html = client.fetch_listing_page_html(_bm_room_id)
+                        _bm_lat, _bm_lng = extract_listing_coords_from_html(_bm_html)
+                except Exception as _bm_coords_exc:
+                    logger.warning(
+                        f"[benchmark] Benchmark coords fetch failed "
+                        f"(micro-search disabled): {_bm_coords_exc}"
+                    )
+            timings["benchmark_coords_ms"] = round(
+                (time.time() - _bm_coords_start) * 1000
+            )
+            logger.info(
+                f"[benchmark] Benchmark coords: lat={_bm_lat} lng={_bm_lng}"
+            )
+
+            # ── Stay-window discovery (once per job) ──────────────────────────
+            # Long-min-stay benchmarks (e.g. 30-night furnished rentals) have no
+            # 1-2 night price anywhere; discover the shortest bookable window so
+            # each day query issues exactly one micro-search with it.
+            from worker.core.benchmark import discover_benchmark_stay_nights
+            _bm_stay_start = time.time()
+            _bm_stay_nights = discover_benchmark_stay_nights(
+                client,
+                benchmark_url,
+                _bm_lat,
+                _bm_lng,
+                all_nights[sample_indices[0]] if sample_indices else d_start,
+                search_location=str(target.location or ""),
+            )
+            timings["benchmark_stay_discovery_ms"] = round(
+                (time.time() - _bm_stay_start) * 1000
+            )
+
+            # ── Discount probe (background, concurrent with day queries) ──────
+            # Skipped when discovery already proved there is no bookable window
+            # at the report start date — the probe's base fetch targets the same
+            # date and would fail the same way (4 wasted requests).
+            _probe_pool: Optional[ThreadPoolExecutor] = None
+            _probe_future = None
+            if _bm_lat is not None and _bm_lng is not None and _bm_stay_nights is None:
+                logger.info(
+                    "[benchmark] Discount probe skipped: no bookable stay window found"
+                )
+            else:
+                _probe_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="bm_discount_probe"
+                )
+                _probe_future = _probe_pool.submit(
+                    propagate(probe_benchmark_discounts),
+                    client,
+                    benchmark_url,
+                    base_origin,
+                    d_start,
+                    bm_lat=_bm_lat,
+                    bm_lng=_bm_lng,
+                    search_location=str(target.location or ""),
+                    bm_stay_nights=_bm_stay_nights,
+                )
+
             effective_adults = adults
             if target.accommodates and target.accommodates > 0:
                 effective_adults = min(int(target.accommodates), 16)
@@ -2969,7 +2702,11 @@ def run_benchmark_scrape(
             }
 
             # Step 2: Benchmark day-by-day queries
-            from worker.core.benchmark import BENCHMARK_TOP_K
+            from worker.core.benchmark import BENCHMARK_TOP_K, RadiusEscalation
+
+            # Shared across all concurrent day queries: the first day that
+            # finds zero comps doubles the map radius for the rest of the job.
+            _bm_radius_escalation = RadiusEscalation(factor=2.0)
             sampled_results: List[BenchmarkDayResult] = []
             day_loop_start = time.time()
             _bm_day_query_workers = _bounded_workers("BENCHMARK_DAY_QUERY_MAX_WORKERS", 12)
@@ -2997,24 +2734,51 @@ def run_benchmark_scrape(
                 day_client = _bm_day_query_pool[browser_slot]
                 day_lock = _bm_day_query_locks[browser_slot]
                 date_i = all_nights[night_idx]
-                time.sleep(rate_limit_seconds)
-                with day_lock:
-                    return estimate_benchmark_price_for_date(
-                        day_client,
-                        target,
-                        benchmark_url,
-                        base_origin,
-                        date_i,
-                        effective_adults,
-                        secondary_benchmark_urls=secondary_benchmark_urls or [],
-                        benchmark_target_similarity=bm_target_similarity,
-                        max_scroll_rounds=_bm_eff_scroll_rounds,
-                        max_cards=_bm_eff_max_cards,
-                        rate_limit_seconds=rate_limit_seconds,
-                        top_k=BENCHMARK_TOP_K,
-                        max_radius_km=_effective_radius,
-                        excluded_room_ids=excluded_room_ids,
+                date_str = date_i.isoformat()
+
+                def _query_once() -> BenchmarkDayResult:
+                    time.sleep(rate_limit_seconds)
+                    with day_lock:
+                        return estimate_benchmark_price_for_date(
+                            day_client,
+                            target,
+                            benchmark_url,
+                            base_origin,
+                            date_i,
+                            effective_adults,
+                            secondary_benchmark_urls=secondary_benchmark_urls or [],
+                            benchmark_target_similarity=bm_target_similarity,
+                            max_scroll_rounds=_bm_eff_scroll_rounds,
+                            max_cards=_bm_eff_max_cards,
+                            rate_limit_seconds=rate_limit_seconds,
+                            top_k=BENCHMARK_TOP_K,
+                            max_radius_km=_effective_radius,
+                            excluded_room_ids=excluded_room_ids,
+                            benchmark_name=benchmark_name,
+                            benchmark_lat=_bm_lat,
+                            benchmark_lng=_bm_lng,
+                            benchmark_stay_nights=_bm_stay_nights,
+                            radius_escalation=_bm_radius_escalation,
+                        )
+
+                result = _query_once()
+                # No comparable listings found and no price: refresh with one
+                # fresh re-query of the market search before giving up on this
+                # date. Exactly one retry; if it still finds nothing, the day
+                # is left for interpolation like any other unpriced day.
+                if result.median_price is None and result.comps_collected == 0:
+                    logger.info(
+                        f"[benchmark/day_query] {date_str}: no comparable listings found; "
+                        f"refreshing and re-querying once"
                     )
+                    refreshed = _query_once()
+                    if refreshed.median_price is not None or refreshed.comps_collected > 0:
+                        logger.info(
+                            f"[benchmark/day_query] {date_str}: recovered on refresh "
+                            f"(comps={refreshed.comps_collected})"
+                        )
+                    result = refreshed
+                return result
 
             try:
                 sampled_results, _bm_runner_state = execute_day_queries_concurrently(
@@ -3038,31 +2802,21 @@ def run_benchmark_scrape(
                 )
 
             timings["day_queries_ms"] = round((time.time() - day_loop_start) * 1000)
-            if nightly_plan is not None:
-                _bm_actual_observed = [
-                    _bm_queried_night_indices[i]
-                    for i, r in enumerate(sampled_results)
-                    if r.median_price is not None
-                ]
-                _bm_actual_inferred = sorted(
-                    set(range(nightly_plan.total_nights)) - set(_bm_actual_observed)
+
+            # ── Market-only rescue ────────────────────────────────────────────
+            # Benchmark unbookable on every sampled day (calendar blocked or
+            # closed): price the days from the market medians these same
+            # queries already collected instead of returning empty — which
+            # would discard all of this work and re-run the full standard
+            # pipeline, roughly doubling report time.
+            from worker.core.benchmark import apply_market_only_rescue
+            _market_rescued = apply_market_only_rescue(sampled_results)
+            if _market_rescued:
+                logger.warning(
+                    f"[benchmark] No benchmark anchors on any sampled day — "
+                    f"priced {_market_rescued} day(s) from market medians "
+                    f"(market-only mode, standard-pipeline fallback avoided)"
                 )
-                timings["nightly_crawl_debug"] = {
-                    "total_nights": nightly_plan.total_nights,
-                    "observed_count": len(_bm_actual_observed),
-                    "queried_count": len(_bm_queried_night_indices),
-                    "infer_count": len(_bm_actual_inferred),
-                    "early_stop_triggered": _bm_early_stop_triggered,
-                    "consecutive_empty_peak": _bm_consecutive_empty_peak,
-                    "tiers": nightly_plan.tier_debug,
-                    "planned_observe_indices": nightly_plan.observe_indices,
-                    "actual_queried_indices": _bm_queried_night_indices,
-                    "actual_observed_indices": _bm_actual_observed,
-                    "actual_inferred_indices": _bm_actual_inferred,
-                    "scroll_rounds": nightly_plan.scroll_rounds,
-                    "max_cards": nightly_plan.max_cards,
-                    "query_workers": _bm_day_query_workers,
-                }
 
             # Step 3: Interpolate
             # Reuse standard interpolation — BenchmarkDayResult.median_price is the blended price
@@ -3189,8 +2943,21 @@ def run_benchmark_scrape(
                         f"(avg_price=${avg_sec_price}, n={len(sec_prices_found)} days)"
                     )
 
+            # Collect the background discount probe (started before day queries).
+            if _probe_future is not None:
+                try:
+                    discount_info = _probe_future.result(timeout=45)
+                except Exception as _probe_exc:
+                    logger.warning(f"[benchmark] Discount probe failed: {_probe_exc}")
+                    discount_info = {}
+                finally:
+                    if _probe_pool is not None:
+                        _probe_pool.shutdown(wait=False)
+
             # Aggregate benchmark transparency
             benchmark_info = aggregate_benchmark_transparency(benchmark_url, sampled_results)
+            if not benchmark_info.get("benchmarkTitle") and (benchmark_name or "").strip():
+                benchmark_info["benchmarkTitle"] = benchmark_name.strip()
             # Attach benchmark-to-target similarity (computed once above)
             if discount_info:
                 benchmark_info["detectedDiscounts"] = discount_info
@@ -3823,7 +3590,6 @@ def run_criteria_search(
     target_lng: Optional[float] = None,
     max_radius_km: Optional[float] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    nightly_plan: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Criteria-based search: search Airbnb for listings matching the user's
@@ -4068,7 +3834,7 @@ def run_criteria_search(
     n_coords_assigned = 0
     anchor_debug: Dict[str, Any] = {}
 
-    _p1_max_cards = nightly_plan.max_cards if nightly_plan is not None else max_cards
+    _p1_max_cards = max_cards
     search_start = time.time()
     _clean_location = re.sub(r"\*+", "", str(search_location or "")).strip()
     _clean_location = re.sub(r"\s+", " ", _clean_location)
@@ -4264,7 +4030,6 @@ def run_criteria_search(
         target_lng=target_lng,
         max_radius_km=max_radius_km,
         progress_callback=progress_callback,
-        nightly_plan=nightly_plan,
         fallback_attributes=attributes,
         fallback_address=address,
         target_spec_override=user_spec,

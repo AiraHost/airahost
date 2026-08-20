@@ -125,6 +125,22 @@ class _MockLoginHandler(BaseHTTPRequestHandler):
             self._send_html(self._render_code_page(branch, code_mode, state))
             return
 
+        if route == "/users/profile":
+            # authed=1 simulates a logged-in session (profile loads, no redirect).
+            # Otherwise simulate logged-out: redirect to the login page, carrying
+            # the scenario/code_mode so the parametrized flows still apply.
+            if params.get("authed", ["0"])[0] == "1":
+                self._send_html(
+                    "<!doctype html><html><body><main>PROFILE_OK</main></body></html>"
+                )
+                return
+            scenario = params.get("scenario", ["email-entry"])[0]
+            code_mode = params.get("code_mode", ["button"])[0]
+            self.send_response(302)
+            self.send_header("Location", f"/login?scenario={scenario}&code_mode={code_mode}")
+            self.end_headers()
+            return
+
         if route == "/hosting":
             branch = params.get("branch", ["unknown"])[0]
             code = params.get("code", [""])[0]
@@ -155,6 +171,140 @@ class _MockLoginHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _render_login_page(self, scenario: str, code_mode: str) -> str:
+        if scenario == "google-sso":
+            # Account that normally logs in with Google: welcome-back -> "Log in
+            # with Google / Try another way" -> options -> email -> code.
+            # Clicking any Google button navigates to result=wrong-button.
+            return f"""
+            <!doctype html>
+            <html>
+              <body>
+                <main>
+                  <section id="s-welcome">
+                    <h1>Welcome back</h1>
+                    <button id="wb-login" type="button">Log in</button>
+                    <button id="wb-notyou" type="button">Not you?</button>
+                  </section>
+                  <section id="s-sso" hidden>
+                    <p>You logged in to Airbnb this way in the past.</p>
+                    <button id="sso-google" type="button">Log in with Google</button>
+                    <button id="sso-try" type="button">Try another way</button>
+                  </section>
+                  <section id="s-options" hidden>
+                    <button id="opt-google" type="button">Continue with Google</button>
+                    <button id="opt-email" type="button">Continue with email</button>
+                  </section>
+                  <section id="s-email" hidden>
+                    <label for="email">Email</label>
+                    <input id="email" name="email" type="email" autocomplete="email" />
+                    <button id="submit-email" type="button">Continue</button>
+                  </section>
+                </main>
+                <script>
+                  const codeMode = "{code_mode}";
+                  const show = (id) => {{
+                    for (const s of ["s-welcome", "s-sso", "s-options", "s-email"]) {{
+                      document.getElementById(s).hidden = (s !== id);
+                    }}
+                  }};
+                  const wrong = (b) => {{
+                    window.location.href = `/hosting?branch=${{b}}&result=wrong-button`;
+                  }};
+                  document.getElementById("wb-login").addEventListener("click", () => show("s-sso"));
+                  document.getElementById("wb-notyou").addEventListener("click", () => show("s-options"));
+                  document.getElementById("sso-google").addEventListener("click", () => wrong("google"));
+                  document.getElementById("sso-try").addEventListener("click", () => show("s-options"));
+                  document.getElementById("opt-google").addEventListener("click", () => wrong("google"));
+                  document.getElementById("opt-email").addEventListener("click", () => show("s-email"));
+                  document.getElementById("submit-email").addEventListener("click", () => {{
+                    const v = encodeURIComponent(document.getElementById("email").value || "");
+                    window.location.href = `/login/code?branch=email-entry&email=${{v}}&code_mode=${{codeMode}}`;
+                  }});
+                </script>
+              </body>
+            </html>
+            """
+
+        if scenario == "social":
+            # Mimics Airbnb's default modal: a phone field plus social SSO
+            # buttons, with "Continue with email" revealing the email form.
+            # Any phone/social click navigates to result=wrong-button.
+            return f"""
+            <!doctype html>
+            <html>
+              <body>
+                <main>
+                  <section id="default-form">
+                    <label for="phone">Phone number</label>
+                    <input id="phone" name="phoneNumber" type="tel" />
+                    <button id="continue-phone" type="button">Continue</button>
+                    <div>or</div>
+                    <button id="continue-google" type="button">Continue with Google</button>
+                    <button id="continue-apple" type="button">Continue with Apple</button>
+                    <button id="continue-email" type="button">Continue with email</button>
+                  </section>
+                  <section id="email-form" hidden>
+                    <label for="email">Email</label>
+                    <input id="email" name="email" type="email" autocomplete="email" />
+                    <button id="submit-email" type="button">Continue</button>
+                  </section>
+                </main>
+                <script>
+                  const codeMode = "{code_mode}";
+                  const wrong = (branch) => {{
+                    window.location.href = `/hosting?branch=${{branch}}&result=wrong-button`;
+                  }};
+                  document.getElementById("continue-phone").addEventListener("click", () => wrong("phone"));
+                  document.getElementById("continue-google").addEventListener("click", () => wrong("google"));
+                  document.getElementById("continue-apple").addEventListener("click", () => wrong("apple"));
+                  document.getElementById("continue-email").addEventListener("click", () => {{
+                    document.getElementById("default-form").hidden = true;
+                    document.getElementById("email-form").hidden = false;
+                    document.getElementById("email").focus();
+                  }});
+                  document.getElementById("submit-email").addEventListener("click", () => {{
+                    const value = encodeURIComponent(document.getElementById("email").value || "");
+                    window.location.href = `/login/code?branch=email-entry&email=${{value}}&code_mode=${{codeMode}}`;
+                  }});
+                </script>
+              </body>
+            </html>
+            """
+
+        if scenario == "phone-or-email":
+            # Airbnb's combined "phone or email" entry field, as seen on the real
+            # login page: a single text input with inputmode="email",
+            # id="phone-or-email", autocomplete="tel-national" and NO name/type
+            # matching the older email selectors. Typing an email + Continue
+            # begins the email-code flow.
+            return f"""
+            <!doctype html>
+            <html>
+              <body>
+                <main>
+                  <h1>Log in or sign up</h1>
+                  <input
+                    id="phone-or-email"
+                    inputmode="email"
+                    type="text"
+                    autocomplete="tel-national"
+                  />
+                  <button id="submit-email" type="button">Continue</button>
+                </main>
+                <script>
+                  const codeMode = "{code_mode}";
+                  document.getElementById("submit-email").addEventListener("click", () => {{
+                    const value = encodeURIComponent(
+                      document.getElementById("phone-or-email").value || ""
+                    );
+                    window.location.href =
+                      `/login/code?branch=email-entry&email=${{value}}&code_mode=${{codeMode}}`;
+                  }});
+                </script>
+              </body>
+            </html>
+            """
+
         if scenario == "welcome-back":
             return f"""
             <!doctype html>
@@ -300,6 +450,109 @@ def _run_login_test_server():
         server.server_close()
 
 
+class _FakeImap:
+    """Minimal in-memory IMAP stand-in for wait_for_airbnb_code.
+
+    messages: list of (numeric_id, raw_rfc822_bytes) in ascending id order
+    (oldest first), mirroring how a real mailbox numbers messages.
+    """
+
+    def __init__(self, messages: list[tuple[int, bytes]]) -> None:
+        self._messages = messages
+
+    def login(self, *_args, **_kwargs) -> None:
+        return None
+
+    def select(self, *_args, **_kwargs) -> tuple[str, list]:
+        return "OK", [b""]
+
+    def search(self, _charset, _criteria) -> tuple[str, list[bytes]]:
+        ids = b" ".join(str(mid).encode() for mid, _ in self._messages)
+        return "OK", [ids]
+
+    def fetch(self, msg_id: bytes, _parts: str) -> tuple[str, list]:
+        wanted = int(msg_id.decode())
+        for mid, raw in self._messages:
+            if mid == wanted:
+                return "OK", [(b"", raw)]
+        return "NO", [None]
+
+    def close(self) -> None:
+        return None
+
+    def logout(self) -> None:
+        return None
+
+
+def _build_email(subject: str, body: str, from_addr: str = "Airbnb <automated@airbnb.com>") -> bytes:
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    return msg.as_bytes()
+
+
+def _imap_config(**overrides) -> "airbnb_auto_login.ImapConfig":
+    base = dict(
+        email_address=TEST_EMAIL,
+        app_password="unused",
+        host="imap.example.com",
+        port=993,
+        use_ssl=True,
+        folder="INBOX",
+        from_filter="automated@airbnb.com",
+        code_regex=r"(?<!\d)(\d{6})(?!\d)",
+        timeout_seconds=2,
+        poll_seconds=1,
+    )
+    base.update(overrides)
+    return airbnb_auto_login.ImapConfig(**base)
+
+
+def test_wait_for_airbnb_code_ignores_new_login_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real failure: Airbnb sends a "Your confirmation code is NNNNNN" email
+    AND a newer "Account activity: New login from <browser> using <os>"
+    notification whose BODY contains a stray 6-digit number. Scanning newest-first
+    over the body picked the notification's number (wrong code) or, with the old
+    device-match filter, dropped the code email entirely and timed out. The code
+    must come from the confirmation-code SUBJECT and the notification must be
+    skipped.
+    """
+    code_email = _build_email(
+        subject=f"Your confirmation code is {TEST_CODE}",
+        body="Enter this code to finish logging in.",
+    )
+    # Higher id => newer; the poller sees this one first.
+    notification_email = _build_email(
+        subject="Account activity: New login from Chrome using Windows 10.0",
+        body="We noticed a new login. Reference 999999 from Chrome on Windows.",
+    )
+    fake = _FakeImap([(1, code_email), (2, notification_email)])
+    monkeypatch.setattr(airbnb_auto_login.imaplib, "IMAP4_SSL", lambda *a, **k: fake)
+
+    result = airbnb_auto_login.wait_for_airbnb_code(
+        _imap_config(),
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36",
+        return_message_id=True,
+    )
+    assert result == (TEST_CODE, 1)
+
+
+def test_wait_for_airbnb_code_reads_localized_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The code lives in the subject regardless of locale (e.g. Chinese)."""
+    code_email = _build_email(subject=f"你的確認碼是 {TEST_CODE}", body="确认码")
+    fake = _FakeImap([(7, code_email)])
+    monkeypatch.setattr(airbnb_auto_login.imaplib, "IMAP4_SSL", lambda *a, **k: fake)
+
+    assert airbnb_auto_login.wait_for_airbnb_code(_imap_config()) == TEST_CODE
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_branch", "code_mode", "patch_sleep"),
     [
@@ -354,8 +607,8 @@ def test_run_login_flow_handles_known_and_first_time_login_states(
         monkeypatch.setenv("CDP_URL", cdp_url)
         monkeypatch.setattr(
             airbnb_auto_login,
-            "LOGIN_URL",
-            f"{base_url}/login?scenario={scenario}&code_mode={code_mode}",
+            "PROFILE_URL",
+            f"{base_url}/users/profile?scenario={scenario}&code_mode={code_mode}",
         )
         monkeypatch.setattr(airbnb_auto_login, "_read_imap_config_from_env", _fake_read_imap_config)
         monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)
@@ -382,6 +635,208 @@ def test_run_login_flow_handles_known_and_first_time_login_states(
     assert captured_wait_args["after_message_id"] == 0
     assert captured_wait_args["return_message_id"] is True
     assert str(captured_wait_args["user_agent"]).strip()
+
+
+def test_run_login_flow_uses_email_not_social_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    On a login modal that shows phone + social SSO buttons, the flow must select
+    'Continue with email' and complete via email — never click 'Continue with
+    Google/Apple' or the phone 'Continue' (which would land on result=wrong-button).
+    """
+
+    def _fake_read_imap_config() -> airbnb_auto_login.ImapConfig:
+        return airbnb_auto_login.ImapConfig(
+            email_address=TEST_EMAIL,
+            app_password="unused",
+            host="unused",
+            port=993,
+            use_ssl=True,
+            folder="INBOX",
+            from_filter="automated@airbnb.com",
+            code_regex=r"(?<!\d)(\d{6})(?!\d)",
+            timeout_seconds=5,
+            poll_seconds=1,
+        )
+
+    def _fake_wait_for_airbnb_code(
+        config: airbnb_auto_login.ImapConfig,
+        request_time: float = 0.0,
+        user_agent: str = "",
+        after_message_id: int = 0,
+        return_message_id: bool = False,
+    ) -> str | tuple[str, int]:
+        return (TEST_CODE, 101) if return_message_id else TEST_CODE
+
+    with _run_login_test_server() as base_url, _run_cdp_browser(tmp_path / "cdp-social") as cdp_url:
+        monkeypatch.setenv("AIRAHOST_EMAIL", TEST_EMAIL)
+        monkeypatch.setenv("CDP_URL", cdp_url)
+        monkeypatch.setattr(
+            airbnb_auto_login,
+            "PROFILE_URL",
+            f"{base_url}/users/profile?scenario=social&code_mode=button",
+        )
+        monkeypatch.setattr(airbnb_auto_login, "_read_imap_config_from_env", _fake_read_imap_config)
+        monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)
+        monkeypatch.setattr(airbnb_auto_login.time, "sleep", lambda _seconds: None)
+
+        out_dir = tmp_path / "artifacts-social"
+        airbnb_auto_login.run_login_flow(out_dir=out_dir, dump_only=False)
+
+    final_html = (out_dir / "03_after_submit.html").read_text(encoding="utf-8")
+    assert "LOGIN_OK" in final_html
+    assert "branch=email-entry" in final_html
+    assert "result=ok" in final_html
+    # Critical: a social/phone button was never clicked.
+    assert "wrong-button" not in final_html
+
+
+def test_run_login_flow_handles_combined_phone_or_email_field(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Reproduces the observed failure where the flow reached /login, recognized the
+    redirect, but "didn't do any login action". Airbnb's login page renders a
+    single combined "phone or email" input (type="text", inputmode="email",
+    id="phone-or-email", autocomplete="tel-national") that matched none of the
+    email selectors, so the field was never filled. The flow must now find this
+    field, enter the email, click Continue and complete via the code step.
+    """
+
+    def _fake_read_imap_config() -> airbnb_auto_login.ImapConfig:
+        return airbnb_auto_login.ImapConfig(
+            email_address=TEST_EMAIL,
+            app_password="unused",
+            host="unused",
+            port=993,
+            use_ssl=True,
+            folder="INBOX",
+            from_filter="automated@airbnb.com",
+            code_regex=r"(?<!\d)(\d{6})(?!\d)",
+            timeout_seconds=5,
+            poll_seconds=1,
+        )
+
+    def _fake_wait_for_airbnb_code(
+        config: airbnb_auto_login.ImapConfig,
+        request_time: float = 0.0,
+        user_agent: str = "",
+        after_message_id: int = 0,
+        return_message_id: bool = False,
+    ) -> str | tuple[str, int]:
+        return (TEST_CODE, 101) if return_message_id else TEST_CODE
+
+    with _run_login_test_server() as base_url, _run_cdp_browser(tmp_path / "cdp-phone-or-email") as cdp_url:
+        monkeypatch.setenv("AIRAHOST_EMAIL", TEST_EMAIL)
+        monkeypatch.setenv("CDP_URL", cdp_url)
+        monkeypatch.setattr(
+            airbnb_auto_login,
+            "PROFILE_URL",
+            f"{base_url}/users/profile?scenario=phone-or-email&code_mode=button",
+        )
+        monkeypatch.setattr(airbnb_auto_login, "_read_imap_config_from_env", _fake_read_imap_config)
+        monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)
+        monkeypatch.setattr(airbnb_auto_login.time, "sleep", lambda _seconds: None)
+
+        out_dir = tmp_path / "artifacts-phone-or-email"
+        airbnb_auto_login.run_login_flow(out_dir=out_dir, dump_only=False)
+
+    code_html = (out_dir / "02_code_page.html").read_text(encoding="utf-8")
+    final_html = (out_dir / "03_after_submit.html").read_text(encoding="utf-8")
+    # The email address (not a phone number) must have been submitted.
+    assert "verification code" in code_html.lower()
+    assert "LOGIN_OK" in final_html
+    assert "branch=email-entry" in final_html
+    assert "result=ok" in final_html
+
+
+def test_run_login_flow_reaches_email_code_from_google_sso_suggestion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Reproduces the real failure: a Google-SSO account shows a "Log in with Google
+    / you logged in this way in the past / Try another way" interstitial after
+    welcome-back. The flow must click 'Try another way' then 'Continue with email'
+    to reach the code step — never 'Log in with Google'.
+    """
+
+    def _fake_read_imap_config() -> airbnb_auto_login.ImapConfig:
+        return airbnb_auto_login.ImapConfig(
+            email_address=TEST_EMAIL,
+            app_password="unused",
+            host="unused",
+            port=993,
+            use_ssl=True,
+            folder="INBOX",
+            from_filter="automated@airbnb.com",
+            code_regex=r"(?<!\d)(\d{6})(?!\d)",
+            timeout_seconds=5,
+            poll_seconds=1,
+        )
+
+    def _fake_wait_for_airbnb_code(
+        config: airbnb_auto_login.ImapConfig,
+        request_time: float = 0.0,
+        user_agent: str = "",
+        after_message_id: int = 0,
+        return_message_id: bool = False,
+    ) -> str | tuple[str, int]:
+        return (TEST_CODE, 101) if return_message_id else TEST_CODE
+
+    with _run_login_test_server() as base_url, _run_cdp_browser(tmp_path / "cdp-sso") as cdp_url:
+        monkeypatch.setenv("AIRAHOST_EMAIL", TEST_EMAIL)
+        monkeypatch.setenv("CDP_URL", cdp_url)
+        monkeypatch.setattr(
+            airbnb_auto_login,
+            "PROFILE_URL",
+            f"{base_url}/users/profile?scenario=google-sso&code_mode=button",
+        )
+        monkeypatch.setattr(airbnb_auto_login, "_read_imap_config_from_env", _fake_read_imap_config)
+        monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)
+        monkeypatch.setattr(airbnb_auto_login.time, "sleep", lambda _seconds: None)
+
+        out_dir = tmp_path / "artifacts-sso"
+        airbnb_auto_login.run_login_flow(out_dir=out_dir, dump_only=False)
+
+    final_html = (out_dir / "03_after_submit.html").read_text(encoding="utf-8")
+    assert "LOGIN_OK" in final_html
+    assert "branch=email-entry" in final_html
+    assert "result=ok" in final_html
+    # Critical: never clicked "Log in with Google" / "Continue with Google".
+    assert "wrong-button" not in final_html
+
+
+def test_run_login_flow_skips_login_when_profile_loads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When /users/profile loads without redirecting to /login, the session is
+    already authenticated — the flow verifies and performs no sign-in."""
+    wait_calls = {"count": 0}
+
+    def _fake_wait_for_airbnb_code(*_args, **kwargs) -> str | tuple[str, int]:
+        wait_calls["count"] += 1
+        return (TEST_CODE, 101) if kwargs.get("return_message_id") else TEST_CODE
+
+    with _run_login_test_server() as base_url, _run_cdp_browser(tmp_path / "cdp-authed") as cdp_url:
+        monkeypatch.setenv("AIRAHOST_EMAIL", TEST_EMAIL)
+        monkeypatch.setenv("CDP_URL", cdp_url)
+        monkeypatch.setattr(airbnb_auto_login, "PROFILE_URL", f"{base_url}/users/profile?authed=1")
+        monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)
+
+        out_dir = tmp_path / "artifacts-authed"
+        airbnb_auto_login.run_login_flow(out_dir=out_dir, dump_only=False)
+
+    landed_html = (out_dir / "01_login_page.html").read_text(encoding="utf-8")
+    assert "PROFILE_OK" in landed_html
+    # No login was attempted: no code wait, no code/after-submit artifacts.
+    assert wait_calls["count"] == 0
+    assert not (out_dir / "02_code_page.html").exists()
+    assert not (out_dir / "03_after_submit.html").exists()
 
 
 def test_run_login_flow_requests_new_code_after_expired_message(
@@ -432,8 +887,8 @@ def test_run_login_flow_requests_new_code_after_expired_message(
         monkeypatch.setenv("CDP_URL", cdp_url)
         monkeypatch.setattr(
             airbnb_auto_login,
-            "LOGIN_URL",
-            f"{base_url}/login?scenario=email-entry&code_mode=expired-then-resend",
+            "PROFILE_URL",
+            f"{base_url}/users/profile?scenario=email-entry&code_mode=expired-then-resend",
         )
         monkeypatch.setattr(airbnb_auto_login, "_read_imap_config_from_env", _fake_read_imap_config)
         monkeypatch.setattr(airbnb_auto_login, "wait_for_airbnb_code", _fake_wait_for_airbnb_code)

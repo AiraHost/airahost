@@ -106,6 +106,86 @@ def test_price_by_date_backfills_early_day_from_full_comp_prices():
     assert comp_b["priceByDate"]["2026-05-02"] == 150
 
 
+def test_chunk_filled_day_comps_appear_in_price_by_date():
+    """
+    Chunk-filled days are is_sampled=False but carry the chunk anchor's price and
+    comps. Their date must still land in each comp's priceByDate, otherwise the
+    later days of every 5-day span show no comparable listings.
+    """
+    target = ListingSpec(
+        url="https://www.airbnb.com/rooms/999",
+        title="Target listing",
+        location="Belmont, CA",
+        property_type="entire_home",
+        accommodates=4,
+        bedrooms=2,
+        baths=1.5,
+        nightly_price=200,
+    )
+
+    comp = {
+        "id": "111",
+        "title": "Comp A",
+        "propertyType": "entire_home",
+        "nightlyPrice": 120,
+        "similarity": 0.91,
+        "url": "https://www.airbnb.com/rooms/111",
+    }
+    anchor_day = {
+        "date": "2026-05-01",
+        "median_price": 180,
+        "comps_collected": 1,
+        "comps_used": 1,
+        "below_similarity_floor": 0,
+        "price_outliers_excluded": 0,
+        "price_outliers_downweighted": 0,
+        "geo_excluded": 0,
+        "price_band_excluded": 0,
+        "filter_stage": "strict",
+        "flags": [],
+        "is_sampled": True,
+        "is_weekend": False,
+        "price_distribution": {},
+        "top_comps": [dict(comp)],
+        "comp_prices": {"111": 120},
+        "error": None,
+        "selection_mode": "strict",
+        "pricing_confidence": "high",
+    }
+    # Non-anchor chunk-filled day: inherits the anchor's price + comps.
+    filled_day = {
+        **anchor_day,
+        "date": "2026-05-02",
+        "is_sampled": False,
+        "filter_stage": "chunk_filled",
+        "flags": ["interpolated"],
+        "top_comps": [dict(comp)],
+        "comp_prices": {"111": 120},
+    }
+
+    transparent = _build_daily_transparent_result(
+        target=target,
+        query_criteria={
+            "locationBasis": "Belmont, CA",
+            "searchAdults": 4,
+            "checkin": "2026-05-01",
+            "checkout": "2026-05-03",
+            "totalNights": 2,
+            "sampledNights": 1,
+            "queryMode": "day_by_day",
+            "propertyTypeFilter": "entire_home",
+        },
+        all_day_results=[anchor_day, filled_day],
+        timings_ms={"total_ms": 10},
+        source="scrape",
+        extraction_warnings=[],
+    )
+
+    comp_a = next(c for c in transparent["comparableListings"] if c["id"] == "111")
+    assert comp_a["priceByDate"]["2026-05-01"] == 120
+    assert comp_a["priceByDate"]["2026-05-02"] == 120  # filled day must be covered
+
+
 def test_comps_summary_uses_unique_counts_not_day_sums():
     target = ListingSpec(
         url="https://www.airbnb.com/rooms/999",

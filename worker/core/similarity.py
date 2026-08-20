@@ -2,7 +2,7 @@
 Similarity scoring and filtering for comparable listings.
 
 Compares candidate listings against a target listing using weighted
-feature matching (property_type, bedrooms, amenities). Supports multi-tier
+feature matching (property_type, bedrooms, location, etc.). Supports multi-tier
 filtering (strict/medium/relaxed).
 
 Extracted from price_estimator.py for modularity.
@@ -29,7 +29,6 @@ Comps must score above 50% similarity to the target (priority #2, after the
 # ── URL matching for preferred comparable ─────────────────────────
 
 _ROOM_ID_RE = re.compile(r"/rooms/(\d+)")
-_AMENITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 # ── Component weights ─────────────────────────────────────────────────────────
 # CMA pricing comps. Candidates are pre-filtered to an 8-mile radius, so Location
@@ -38,7 +37,6 @@ _W_LOCATION: float = 6.0       # lat/lng Haversine, steep decay over 0-8 miles
 _W_ACCOMMODATES: float = 3.5   # primary size metric, tolerance 2
 _W_BEDROOMS: float = 3.0       # near-hard constraint (0 -> 1.0, 1 -> 0.5, >1 -> 0)
 _W_PROPERTY_TYPE: float = 3.0  # similarity matrix, not binary
-_W_AMENITIES: float = 3.0      # premium-weighted Jaccard overlap
 _W_BATHS: float = 2.0          # tolerance 1.5
 _W_QUALITY: float = 2.0        # combined rating + review volume (Bayesian)
 _W_BEDS: float = 1.0           # minor layout tie-breaker, tolerance 3
@@ -46,96 +44,6 @@ _W_BEDS: float = 1.0           # minor layout tie-breaker, tolerance 3
 # Partial score assigned when a feature is missing on either side. Location is
 # exempt — it is mandatory and scores 0.0 when coordinates are unavailable.
 _PARTIAL_MISSING: float = 0.5
-
-# Every amenity gets at least this baseline weight. We then override specific
-# amenities with larger weights where market pricing impact is typically higher.
-# Baseline is intentionally tiny so non-priority amenities barely move score.
-_AMENITY_BASE_WEIGHT: float = 0.05
-_AMENITY_ALIASES: Dict[str, str] = {
-    "wi_fi": "wifi",
-    "wireless_internet": "wifi",
-    "internet": "wifi",
-    "air_conditioning": "ac",
-    "central_air_conditioning": "ac",
-    "portable_air_conditioning": "ac",
-    "a_c": "ac",
-    "laundry": "washer",
-    "washing_machine": "washer",
-    "jacuzzi": "hot_tub",
-    "jacuzzi_tub": "hot_tub",
-    "free_parking_on_premises": "free_parking",
-    "parking_on_premises": "free_parking",
-    "allows_pets": "pets_allowed",
-    "pet_friendly": "pets_allowed",
-    "beach_view": "beach_access",
-    "lakefront": "lake_access",
-    "water_front": "waterfront",
-    "barbecue": "bbq",
-    "grill": "bbq",
-    "fitness": "gym",
-    "ski_in_out": "ski_in_ski_out",
-}
-_AMENITY_WEIGHT_OVERRIDES: Dict[str, float] = {
-    # Premium location/value drivers: these should dominate amenity matching.
-    "beach_access": 12.0,
-    "beachfront": 12.0,
-    "waterfront": 10.0,
-    "lake_access": 8.0,
-    "ski_in_ski_out": 8.0,
-    # High-value leisure amenities.
-    "private_pool": 7.0,
-    "infinity_pool": 6.0,
-    "heated_pool": 5.0,
-    "pool": 4.0,
-    "private_hot_tub": 6.0,
-    "hot_tub": 3.0,
-    # Keep common utilities relatively low-impact.
-    "guest_favorite": 2.0,
-    "ev_charger": 0.5,
-    "kitchen": 0.25,
-    "ac": 0.25,
-    "washer": 0.20,
-    "dryer": 0.20,
-    "free_parking": 0.15,
-    "pets_allowed": 0.15,
-}
-
-
-def _normalize_amenity_key(value: str) -> str:
-    tokens = _AMENITY_TOKEN_RE.findall(str(value or "").casefold())
-    if not tokens:
-        return ""
-    normalized = "_".join(tokens)
-    return _AMENITY_ALIASES.get(normalized, normalized)
-
-
-def _normalize_amenity_set(values: List[str]) -> set[str]:
-    normalized: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        key = _normalize_amenity_key(value)
-        if key:
-            normalized.add(key)
-    return normalized
-
-
-def _amenity_weight(amenity_key: str) -> float:
-    return _AMENITY_WEIGHT_OVERRIDES.get(amenity_key, _AMENITY_BASE_WEIGHT)
-
-
-def _weighted_amenity_overlap(target_set: set[str], cand_set: set[str]) -> float:
-    union = target_set | cand_set
-    if not union:
-        return 0.0
-
-    overlap = target_set & cand_set
-    overlap_weight = sum(_amenity_weight(name) for name in overlap)
-    union_weight = sum(_amenity_weight(name) for name in union)
-    if union_weight <= 0:
-        return 0.0
-
-    return max(0.0, min(1.0, overlap_weight / union_weight))
 
 
 def extract_airbnb_room_id(url: str) -> Optional[str]:
@@ -378,22 +286,6 @@ def similarity_score_with_breakdown(target: ListingSpec, cand: ListingSpec) -> T
         {"target_val": target.property_type, "cand_val": cand.property_type},
     )
 
-    # Amenities (3.0) — premium-weighted Jaccard overlap.
-    # If the target has no amenities defined (e.g. criteria-mode with no amenity selection),
-    # skip this dimension entirely (full credit) rather than penalising every comp equally.
-    t_set = _normalize_amenity_set(list(target.amenities or []))
-    c_set = _normalize_amenity_set(list(cand.amenities or []))
-    if not t_set:
-        am_raw = 1.0  # target amenities unknown — dimension skipped
-    elif not c_set:
-        am_raw = _PARTIAL_MISSING  # comp amenities unknown
-    else:
-        am_raw = _weighted_amenity_overlap(t_set, c_set)
-    add(
-        "amenities", _W_AMENITIES, am_raw,
-        {"overlap_count": len(t_set & c_set), "union_count": len(t_set | c_set)},
-    )
-
     # Baths (2.0, tolerance 1.5).
     add(
         "baths", _W_BATHS,
@@ -434,7 +326,6 @@ def similarity_score(target: ListingSpec, cand: ListingSpec, debug: bool = False
       - accommodates:  3.5  (tolerance 2)
       - bedrooms:      3.0  (0 -> 1.0, 1 -> 0.5, >1 -> 0.0)
       - property_type: 3.0  (similarity matrix; entire-vs-room -> 0.0)
-      - amenities:     3.0  (premium-weighted Jaccard overlap)
       - baths:         2.0  (tolerance 1.5)
       - quality:       2.0  (combined rating + review volume, Bayesian)
       - beds:          1.0  (tolerance 3)

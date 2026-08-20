@@ -36,23 +36,35 @@ import re
 import time
 from dataclasses import dataclass
 from email.header import decode_header
-from email.message import Message
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from email.utils import parsedate_to_datetime
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from worker.scraper.playwright_runtime import endpoint_label
+from worker.scraper.scraper_errors import CdpAttachFailed
+
 
 LOGIN_URL = "https://www.airbnb.ca/login"
+# Auth entry point: hitting a profile page redirects logged-out users to /login;
+# if it loads without redirect, the session is already authenticated.
+PROFILE_URL = "https://www.airbnb.com/users/profile"
 DEFAULT_CDP_URL = os.getenv("CDP_URL", "http://127.0.0.1:9222").strip()
 EMAIL_INPUT_SELECTORS = (
     'input[name="email"]',
     'input[type="email"]',
     'input[autocomplete="email"]',
     'input[data-testid*="email"]',
+    # Airbnb's combined "phone or email" field: type="text",
+    # inputmode="email", id="phone-or-email", autocomplete="tel-national".
+    # It matches none of the selectors above, so without these the flow could
+    # not find the field and never attempted to log in.
+    'input[inputmode="email"]',
+    'input#phone-or-email',
 )
 CODE_INPUT_SELECTORS = (
     'input[autocomplete="one-time-code"]',
@@ -63,7 +75,20 @@ CODE_INPUT_SELECTORS = (
 WELCOME_BACK_HEADING_PATTERN = re.compile(r"welcome back", re.I)
 WELCOME_BACK_LOGIN_BUTTON_PATTERN = re.compile(r"^log\s*in$", re.I)
 NOT_YOU_BUTTON_PATTERN = re.compile(r"not you", re.I)
-CONTINUE_BUTTON_PATTERN = re.compile(r"continue|next", re.I)
+# Email-step submit button only. Anchored to exactly "Continue"/"Next" so social
+# SSO buttons ("Continue with Google/Apple/Facebook") and the "Continue with
+# email" option are NEVER matched as the submit (clicking those was the bug).
+CONTINUE_BUTTON_PATTERN = re.compile(r"^\s*(?:continue|next)\s*$", re.I)
+# The option that switches the modal from phone/social into email entry.
+EMAIL_OPTION_PATTERN = re.compile(r"(?:continue|log in|sign in)\s+with\s+email", re.I)
+# Accounts that normally use social login show a "You logged in this way in the
+# past / Log in with Google" suggestion; "Try another way" / "More options"
+# reveals the email-code path.
+TRY_ANOTHER_WAY_PATTERN = re.compile(
+    r"try another way|more (?:log ?in |sign ?in )?options|other (?:log ?in |sign ?in )?options|"
+    r"more ways to log in|use a different",
+    re.I,
+)
 CODE_SUBMIT_BUTTON_PATTERN = re.compile(r"continue|verify|submit|next", re.I)
 CODE_EXPIRED_PATTERN = re.compile(r"code expired|please request a new one", re.I)
 SEND_NEW_CODE_PATTERN = re.compile(
@@ -140,51 +165,6 @@ def _decode_mime_header(value: str) -> str:
     return "".join(out)
 
 
-def _extract_text_from_message(msg: Message) -> str:
-    chunks = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = (part.get_content_type() or "").lower()
-            disp = (part.get("Content-Disposition") or "").lower()
-            if "attachment" in disp:
-                continue
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                continue
-            charset = part.get_content_charset() or "utf-8"
-            text = payload.decode(charset, errors="replace")
-            if content_type in ("text/plain", "text/html"):
-                chunks.append(text)
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload is not None:
-            charset = msg.get_content_charset() or "utf-8"
-            chunks.append(payload.decode(charset, errors="replace"))
-    return "\n".join(chunks)
-
-
-def get_device_identifiers(ua: str) -> list[str]:
-    ua = (ua or "").lower()
-    identifiers = []
-    if "firefox" in ua:
-        identifiers.append("firefox")
-    elif "edg" in ua or "edge" in ua:
-        identifiers.append("edge")
-    elif "chrome" in ua:
-        identifiers.append("chrome")
-    elif "safari" in ua:
-        identifiers.append("safari")
-
-    if "windows" in ua:
-        identifiers.append("windows")
-    elif "mac os" in ua or "macos" in ua or "macintosh" in ua:
-        identifiers.append("mac")
-    elif "linux" in ua:
-        identifiers.append("linux")
-    
-    return identifiers
-
-
 def wait_for_airbnb_code(
     config: ImapConfig,
     request_time: float = 0.0,
@@ -195,8 +175,6 @@ def wait_for_airbnb_code(
     pattern = re.compile(config.code_regex)
     deadline = time.time() + config.timeout_seconds
     debug_email = _env_bool("AIRAHOST_EMAIL_DEBUG", False)
-
-    device_ids = get_device_identifiers(user_agent)
 
     while time.time() < deadline:
         if config.use_ssl:
@@ -251,23 +229,27 @@ def wait_for_airbnb_code(
                     )
                 if config.from_filter and config.from_filter.lower() not in from_header.lower():
                     continue
-                body = _extract_text_from_message(msg)
-                source = f"{subject}\n{body}"
-                
-                source_lower = source.lower()
-                has_any_browser = any(b in source_lower for b in ["chrome", "firefox", "safari", "edge", "mac", "windows", "linux"])
-                if has_any_browser and device_ids:
-                    if not all(ident in source_lower for ident in device_ids):
-                        if debug_email:
-                            print(f"[auto_login][email_debug] ignoring email due to device mismatch. Expected: {device_ids}")
-                        continue
-
-                m = pattern.search(source)
-                if m:
-                    code = m.group(1)
-                    if return_message_id:
-                        return code, numeric_msg_id
-                    return code
+                # Airbnb always puts the login code in the SUBJECT, regardless of
+                # locale ("Your confirmation code is 123456" / "你的確認碼是
+                # 123456"). Match the subject only — never the body. Airbnb also
+                # sends a separate "Account activity: New login from <browser>
+                # using <os>" notification that (a) carries a stray 6-digit number
+                # in its body and (b) often arrives just after the code email;
+                # scanning the body newest-first was picking that number instead
+                # of the real code. Its subject has no 6-digit run, so a
+                # subject-only match skips it.
+                m = pattern.search(subject)
+                if not m:
+                    if debug_email:
+                        print(
+                            "[auto_login][email_debug] no code in subject; skipping "
+                            f"id={msg_id.decode(errors='ignore')} subject={subject}"
+                        )
+                    continue
+                code = m.group(1)
+                if return_message_id:
+                    return code, numeric_msg_id
+                return code
         finally:
             try:
                 conn.close()
@@ -431,9 +413,41 @@ def detect_login_page_variant(page: Page, timeout_ms: int = 12000) -> str:
             return "welcome_back"
         if _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS) is not None:
             return "email_entry"
+        # Default view may show phone + social buttons with no email field yet;
+        # a "Continue with email" option still means we can do email login.
+        if _find_first_visible_role_locator(page, "button", EMAIL_OPTION_PATTERN) is not None:
+            return "email_entry"
         if time.monotonic() >= deadline:
             return "unknown"
         page.wait_for_timeout(250)
+
+
+def _verify_logged_in(page: Page, timeout_ms: int = 20000) -> bool:
+    """
+    Confirm the session is authenticated by visiting a host-only page. Airbnb
+    redirects logged-out users to /login, so staying off /login means logged in.
+    The origin is taken from the current page so this works against the real
+    site and a test mock server alike.
+    """
+    parsed = urlparse(str(page.url or ""))
+    origin = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else "https://www.airbnb.com"
+    )
+    try:
+        page.goto(
+            f"{origin}/hosting",
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+    except PlaywrightError:
+        return False
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+    return "/login" not in str(page.url or "").lower()
 
 
 def click_welcome_back_login(page: Page) -> None:
@@ -458,6 +472,24 @@ def fill_email_and_continue(page: Page, email_value: str) -> None:
         time.sleep(random.uniform(min_s, max_s))
 
     visible_email_input = _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS)
+    if visible_email_input is None:
+        # The default login view often shows a phone field plus social SSO
+        # buttons and no email input. Choose the "Continue with email" option to
+        # switch to email entry — never click a social ("…with Google/Apple/
+        # Facebook") button.
+        email_option = _find_first_visible_role_locator(page, "button", EMAIL_OPTION_PATTERN)
+        if email_option is not None:
+            print("[auto_login] selecting 'Continue with email' option")
+            _human_pause()
+            email_option.click()
+            for sel in EMAIL_INPUT_SELECTORS:
+                try:
+                    page.locator(sel).first.wait_for(state="visible", timeout=6000)
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+            visible_email_input = _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS)
+
     if visible_email_input is not None:
         sel, loc = visible_email_input
         print(f"[auto_login] filling email with selector: {sel}")
@@ -467,14 +499,22 @@ def fill_email_and_continue(page: Page, email_value: str) -> None:
         # Label fallback.
         print("[auto_login] filling email with label fallback")
         _human_pause()
-        page.get_by_label("Email", exact=False).first.fill(email_value)
+        loc = page.get_by_label("Email", exact=False).first
+        loc.fill(email_value)
 
-    # Continue button candidates.
-    print("[auto_login] clicking Continue/Next")
+    # Submit the email. CONTINUE_BUTTON_PATTERN is anchored to "Continue"/"Next",
+    # so social SSO buttons are never selected here.
+    print("[auto_login] clicking Continue (email submit)")
     _human_pause(0.35, 1.4)
     btn = _find_first_visible_role_locator(page, "button", CONTINUE_BUTTON_PATTERN)
     if btn is None:
-        raise RuntimeError("Could not find a visible Continue/Next button on the email step.")
+        # Fall back to submitting via Enter on the email field.
+        try:
+            loc.press("Enter", timeout=500)
+            return
+        except PlaywrightError:
+            pass
+        raise RuntimeError("Could not find a visible Continue/Next submit button on the email step.")
     btn.click()
 
 
@@ -489,53 +529,29 @@ def fill_code_and_continue(page: Page, code_value: str) -> None:
         loc = page.get_by_label(re.compile(r"code|verification", re.I)).first
         loc.fill(code_value)
 
-    print("[auto_login] clicking code Continue/Verify/Submit")
-    # OTPs are short-lived. Avoid randomized delays on this step and try the
-    # fastest visible submit control immediately after filling the input.
+    print("[auto_login] submitting code")
+    # Click an explicit submit button if present; otherwise Airbnb's one-time-code
+    # input auto-submits once all digits are entered — nudge it with Enter. Do
+    # NOT raise here: the caller (submit_confirmation_code_with_retry) classifies
+    # the outcome (advanced / expired / pending) and retries as needed. The
+    # expired-code page legitimately stays on /login.
     btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
-    if btn is None:
+    if btn is not None:
         try:
-            loc.press("Enter", timeout=250)
+            btn.click(timeout=2000)
+        except PlaywrightError:
+            try:
+                btn.click(timeout=2000, force=True)
+            except PlaywrightError:
+                pass
+    else:
+        try:
+            loc.press("Enter", timeout=500)
         except PlaywrightError:
             pass
-        if _wait_for_login_url_to_change(page, timeout_ms=350):
-            print("[auto_login] code entry advanced login flow without an explicit submit click.")
-            return
-        btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
-        if btn is None:
-            raise RuntimeError("Could not find a visible Continue/Verify/Submit/Next button on the code step.")
-
-    try:
-        btn.click(timeout=1500)
-        if _wait_for_login_url_to_change(page, timeout_ms=350):
-            return
-    except PlaywrightTimeoutError:
-        if _wait_for_login_url_to_change(page, timeout_ms=500):
-            print("[auto_login] login flow advanced during the code submit click.")
-            return
-        print("[auto_login] code submit click timed out; retrying with force=True.")
-    except PlaywrightError:
-        if _wait_for_login_url_to_change(page, timeout_ms=500):
-            print("[auto_login] login flow advanced during the code submit click.")
-            return
-        print("[auto_login] code submit click failed; retrying with force=True.")
-
-    btn = _find_first_visible_role_locator(page, "button", CODE_SUBMIT_BUTTON_PATTERN)
-    if btn is None:
-        if _wait_for_login_url_to_change(page, timeout_ms=500):
-            print("[auto_login] login flow advanced before the forced code submit retry.")
-            return
-        raise RuntimeError("Code submit button disappeared before the forced retry completed.")
-
-    try:
-        btn.click(timeout=2000, force=True)
-        if _wait_for_login_url_to_change(page, timeout_ms=500):
-            return
-    except PlaywrightError:
-        if _wait_for_login_url_to_change(page, timeout_ms=500):
-            print("[auto_login] login flow advanced during the forced code submit click.")
-            return
-        raise
+    # Brief settle so an immediate redirect is observed; the caller waits longer
+    # and classifies the result.
+    _wait_for_login_url_to_change(page, timeout_ms=1500)
 
 
 def submit_confirmation_code_with_retry(
@@ -561,7 +577,8 @@ def submit_confirmation_code_with_retry(
         print("[auto_login] confirmation code received")
         fill_code_and_continue(page, code)
 
-        post_submit_state = _wait_for_post_code_submit_state(page)
+        # Allow time for Airbnb to verify the code server-side and redirect.
+        post_submit_state = _wait_for_post_code_submit_state(page, timeout_ms=15000)
         if post_submit_state != "expired":
             return
         if attempt >= max_expired_retries:
@@ -578,24 +595,117 @@ def submit_confirmation_code_with_retry(
                 continue
 
 
-def run_login_flow(out_dir: Path, dump_only: bool) -> None:
+def _advance_to_code_input(page: Page, email_value: str, max_steps: int = 6) -> bool:
+    """
+    After the initial login action, walk through any interstitials until the OTP
+    code input appears. Handles, in priority order per step:
+      - code input visible                      -> done
+      - email input visible                     -> fill email + Continue
+      - "Continue with email" option            -> click it
+      - "Try another way" / "More options"       -> click it (social-SSO accounts
+        show a "Log in with Google / you logged in this way in the past" page)
+      - welcome-back "Log in" button            -> click it
+
+    Never clicks a social SSO button. Returns True once a code input is visible.
+    """
+    def _code_input_visible() -> bool:
+        return _find_first_visible_locator(page, CODE_INPUT_SELECTORS) is not None
+
+    def _wait_code_input(timeout_ms: int) -> bool:
+        for sel in CODE_INPUT_SELECTORS:
+            try:
+                page.locator(sel).first.wait_for(state="visible", timeout=timeout_ms)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        return False
+
+    for _ in range(max_steps):
+        if _code_input_visible():
+            return True
+
+        # Email entry form -> fill and submit, then wait for the code input to
+        # appear (codes can be short-lived, so submit promptly — no blind sleep).
+        if _find_first_visible_locator(page, EMAIL_INPUT_SELECTORS) is not None:
+            fill_email_and_continue(page, email_value)
+            if _wait_code_input(6000):
+                return True
+            continue
+
+        # Explicit "Continue with email" option.
+        email_option = _find_first_visible_role_locator(page, "button", EMAIL_OPTION_PATTERN)
+        if email_option is not None:
+            print("[auto_login] selecting 'Continue with email'")
+            email_option.click()
+            page.wait_for_timeout(600)
+            continue
+
+        # Social-SSO suggestion -> reveal alternate methods.
+        alt = _find_first_visible_role_locator(page, "button", TRY_ANOTHER_WAY_PATTERN)
+        if alt is None:
+            alt = _find_first_visible_role_locator(page, "link", TRY_ANOTHER_WAY_PATTERN)
+        if alt is None:
+            alt_text = page.get_by_text(TRY_ANOTHER_WAY_PATTERN).first
+            if _locator_is_visible(alt_text):
+                alt = alt_text
+        if alt is not None:
+            print("[auto_login] SSO suggestion detected; clicking 'Try another way'")
+            alt.click()
+            page.wait_for_timeout(1200)
+            continue
+
+        # Remembered welcome-back "Log in".
+        if _is_welcome_back_login_visible(page):
+            print("[auto_login] welcome-back 'Log in' detected")
+            click_welcome_back_login(page)
+            # Wait for the welcome-back view to transition before re-evaluating,
+            # so we don't click "Log in" again mid-navigation.
+            _deadline = time.monotonic() + 5.0
+            while time.monotonic() < _deadline and _is_welcome_back_login_visible(page):
+                page.wait_for_timeout(150)
+            continue
+
+        # Nothing actionable yet — let the page settle and retry.
+        page.wait_for_timeout(900)
+
+    return _code_input_visible()
+
+
+def run_login_flow(out_dir: Path, dump_only: bool, cdp_url: Optional[str] = None) -> None:
+    """Run the auto-login flow against one externally managed CDP browser.
+
+    ``cdp_url`` is the endpoint to attach to. Callers driving multiple browser
+    slots (see ``worker.main``) must pass it explicitly rather than routing
+    through a mutated ``CDP_URL`` environment variable, so one slot's login
+    attempt can never race another's. When omitted (e.g. the CLI entry point),
+    falls back to the ``CDP_URL`` environment variable for backward compatibility.
+    """
     email_value = os.getenv("AIRAHOST_EMAIL", "").strip()
     if not email_value:
         raise RuntimeError("Missing AIRAHOST_EMAIL")
 
     headless = _env_bool("AIRAHOST_HEADLESS", False)
-    cdp_url = os.getenv("CDP_URL", DEFAULT_CDP_URL).strip() or DEFAULT_CDP_URL
+    resolved_cdp_url = str(cdp_url or os.getenv("CDP_URL", DEFAULT_CDP_URL)).strip() or DEFAULT_CDP_URL
+    allow_browser_launch = _env_bool("AIRAHOST_ALLOW_BROWSER_LAUNCH", False)
 
     with sync_playwright() as pw:
         browser = None
         created_new_browser = False
         try:
-            browser = pw.chromium.connect_over_cdp(cdp_url, timeout=15000)
-            print(f"[auto_login] connected to existing browser via CDP: {cdp_url}")
-        except Exception:
+            browser = pw.chromium.connect_over_cdp(resolved_cdp_url, timeout=15000)
+            print(f"[auto_login] connected to existing browser via CDP: {resolved_cdp_url}")
+        except Exception as exc:
+            if not allow_browser_launch:
+                # Externally managed Chrome is the default and expected contract:
+                # a transient CDP hiccup must never silently open a fresh, logged-out
+                # browser in its place. Fail loud with a typed, sanitized error instead.
+                raise CdpAttachFailed(endpoint_label(resolved_cdp_url), type(exc).__name__) from exc
             browser = pw.chromium.launch(headless=headless)
             created_new_browser = True
-            print("[auto_login] no attachable existing browser; launched a new browser")
+            print(
+                "[auto_login] no attachable existing browser; launched a new browser "
+                "(AIRAHOST_ALLOW_BROWSER_LAUNCH=true)"
+            )
 
         if browser.contexts:
             context = browser.contexts[0]
@@ -603,9 +713,30 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
             context = browser.new_context()
         page = context.new_page()
 
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
-        login_html = dump_rendered_html(page, out_dir, "01_login_page")
-        print(f"[auto_login] saved rendered html: {login_html}")
+        # New login method: navigate straight to the profile page. A logged-out
+        # session is redirected to /login; if the profile loads without a redirect
+        # we are already logged in and no sign-in is needed.
+        page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=45000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeoutError:
+            pass
+        # Allow a late client-side redirect to /login to settle.
+        _redirect_deadline = time.monotonic() + 2.5
+        while time.monotonic() < _redirect_deadline and not _is_login_url(page):
+            page.wait_for_timeout(150)
+
+        landed_html = dump_rendered_html(page, out_dir, "01_login_page")
+        print(f"[auto_login] landed on {page.url}; saved rendered html: {landed_html}")
+
+        if not _is_login_url(page):
+            print(
+                "[auto_login] /users/profile loaded without redirect — "
+                "already logged in. Login status verified."
+            )
+            if created_new_browser:
+                browser.close()
+            return
 
         if dump_only:
             if created_new_browser:
@@ -614,14 +745,19 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
 
         user_agent = page.evaluate("navigator.userAgent")
 
-        # Let the page settle in case of redirect
-        try:
-            page.wait_for_load_state("networkidle", timeout=3000)
-        except PlaywrightTimeoutError:
-            pass
-
         login_variant = detect_login_page_variant(page)
         print(f"[auto_login] detected login page variant: {login_variant}")
+        if login_variant == "unknown":
+            # Slow hydration can leave the page in an indeterminate state — reload
+            # once and re-detect before giving up.
+            print("[auto_login] login variant unknown; reloading once and re-detecting")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=4000)
+            except PlaywrightError:
+                pass
+            login_variant = detect_login_page_variant(page)
+            print(f"[auto_login] re-detected login page variant: {login_variant}")
 
         if login_variant == "already_logged_in":
             print(f"[auto_login] URL is now {page.url} - assuming already logged in.")
@@ -630,36 +766,18 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
             return
 
         request_time = time.time()
-        if login_variant == "welcome_back":
-            print("[auto_login] step: submit welcome-back login")
-            click_welcome_back_login(page)
-        elif login_variant == "email_entry":
-            print("[auto_login] step: submit email")
-            fill_email_and_continue(page, email_value)
-        else:
-            raise RuntimeError(
-                f"Airbnb login page state not recognized at {page.url}. "
-                "Expected a welcome-back prompt or visible email input."
-            )
-        # Wait for either OTP/code input or a stable post-submit state.
-        code_ready = False
-        for sel in CODE_INPUT_SELECTORS:
-            try:
-                print(f"[auto_login] waiting for code input selector: {sel}")
-                page.locator(sel).first.wait_for(state="visible", timeout=8000)
-                code_ready = True
-                print(f"[auto_login] code input detected: {sel}")
-                break
-            except PlaywrightTimeoutError:
-                continue
-        if not code_ready:
-            print("[auto_login] code input not detected yet, waiting for domcontentloaded fallback")
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except PlaywrightTimeoutError:
-                pass
+        # Drive through the login states until the OTP code input appears —
+        # welcome-back 'Log in', the social-SSO 'Try another way' interstitial,
+        # 'Continue with email', and email entry are all handled in one loop.
+        print(f"[auto_login] advancing to the code step (variant={login_variant})")
+        code_ready = _advance_to_code_input(page, email_value)
         code_html = dump_rendered_html(page, out_dir, "02_code_page")
         print(f"[auto_login] saved rendered html: {code_html}")
+        if not code_ready:
+            raise RuntimeError(
+                "Could not reach the email verification code step "
+                f"(final url: {page.url}). The login page state was not recognized."
+            )
 
         cfg = _read_imap_config_from_env()
         submit_confirmation_code_with_retry(
@@ -675,8 +793,19 @@ def run_login_flow(out_dir: Path, dump_only: bool) -> None:
         final_html = dump_rendered_html(page, out_dir, "03_after_submit")
         print(f"[auto_login] saved rendered html: {final_html}")
         print(f"[auto_login] final url: {page.url}")
+
+        # Verify the session is actually authenticated before reporting success,
+        # so callers can retry when the flow finished without logging in.
+        pre_verify_url = str(page.url)
+        logged_in = _verify_logged_in(page)
+        print(f"[auto_login] post-login verification: logged_in={logged_in}")
         if created_new_browser:
             browser.close()
+        if not logged_in:
+            raise RuntimeError(
+                "Auto-login flow finished but the session is not logged in "
+                f"(url before verify: {pre_verify_url})."
+            )
 
 
 def main() -> None:

@@ -93,7 +93,7 @@ function BenchmarkListingRow({
 
 // ── Benchmark transparency block ─────────────────────────────────
 
-function BenchmarkBlock({ info }: { info: BenchmarkInfo }) {
+function BenchmarkBlock({ info, name }: { info: BenchmarkInfo; name?: string | null }) {
   const statusUsed = info.benchmarkUsed && info.benchmarkFetchStatus !== "failed";
   const statusColor = statusUsed
     ? "border-emerald-200 bg-emerald-50"
@@ -219,7 +219,7 @@ function BenchmarkBlock({ info }: { info: BenchmarkInfo }) {
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <p className="text-sm font-semibold text-gray-900">
-            Your benchmark listing
+            {name || "Your benchmark listing"}
           </p>
           {info.benchmarkUrl && (
             <a
@@ -332,7 +332,9 @@ function BenchmarkBlock({ info }: { info: BenchmarkInfo }) {
 
       {!statusUsed && info.fallbackReason && (
         <p className="mt-2 text-xs text-amber-700">
-          Fallback reason: {info.fallbackReason.replace(/_/g, " ")}. Market comps were used instead.
+          {info.fallbackReason === "benchmark_unavailable_for_dates"
+            ? "Your benchmark listing isn't bookable for these dates (its calendar appears blocked or closed), so no benchmark price exists. Market comps were used instead."
+            : `Fallback reason: ${info.fallbackReason.replace(/_/g, " ")}. Market comps were used instead.`}
         </p>
       )}
 
@@ -370,6 +372,26 @@ export function HowWeEstimated({
     report.comparableListings ?? report.resultSummary?.comparableListings;
   const benchmarkInfo =
     report.benchmarkInfo ?? report.resultSummary?.benchmarkInfo ?? null;
+
+  // Real name of the pinned benchmark: name saved when the user added it
+  // (matched to benchmarkUrl by room id), else the worker-resolved title.
+  const benchmarkName: string | null = (() => {
+    const compsArr = report.inputAttributes?.preferredComps;
+    const bmUrl = benchmarkInfo?.benchmarkUrl;
+    let savedName: string | null = null;
+    if (Array.isArray(compsArr) && bmUrl) {
+      const roomId = (u: string) => u.match(/\/rooms\/(\d+)/)?.[1] ?? null;
+      const bmRoomId = roomId(bmUrl);
+      const match = compsArr.find(
+        (c) =>
+          c.listingUrl &&
+          ((bmRoomId != null && roomId(c.listingUrl) === bmRoomId) ||
+            c.listingUrl.split("?")[0].toLowerCase() === bmUrl.split("?")[0].toLowerCase())
+      );
+      savedName = match?.name?.trim() || null;
+    }
+    return savedName || benchmarkInfo?.benchmarkTitle?.trim() || null;
+  })();
 
   // Pinned comp URLs (from report input) to mark in comparable list
   const pinnedUrls: string[] = (() => {
@@ -427,7 +449,7 @@ export function HowWeEstimated({
             </p>
           </div>
           <div className="px-4 py-4">
-            <BenchmarkBlock info={benchmarkInfo} />
+            <BenchmarkBlock info={benchmarkInfo} name={benchmarkName} />
           </div>
         </div>
       )}

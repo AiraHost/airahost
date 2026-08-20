@@ -30,7 +30,9 @@ def test_availability_does_not_flip_unavailable_from_generic_word_only():
         "someNestedText": "Unavailable amenity: hot tub",
     }
     out = _extract_availability_context_from_search_result(payload)
-    assert out["is_available"] is True
+    # The card never claimed availability, so the answer is "unknown", not True.
+    # A generic word must still not flip it to explicitly unavailable.
+    assert out["is_available"] is None
     assert out["availability_reason"] is None
 
 
@@ -148,7 +150,7 @@ def test_parse_search_context_parses_currency_prefix_variant_ca_dollar():
 def test_availability_does_not_mark_unavailable_from_popularity_booked_text():
     payload = {"subtitle": "Booked 6 times in the last month"}
     out = _extract_availability_context_from_search_result(payload)
-    assert out["is_available"] is True
+    assert out["is_available"] is None
     assert out["availability_reason"] is None
 
 
@@ -364,6 +366,45 @@ def test_parse_search_context_ceils_direct_nightly_api_decimal_to_display_price(
     row = ctx["1629301846268091180"]
     assert row["nightly_price"] == 41
     assert row["total_price"] == 41
+    assert row["price_nights"] == 1
+
+
+def test_parse_search_context_prefers_primary_line_price_over_accessibility_total():
+    """
+    primaryLine.price is the displayed per-night value and the most accurate one.
+    accessibilityLabel folds small per-night fees into the figure ("$432 for 1
+    night"), shifting the parsed nightly by a few dollars. The parser must use
+    primaryLine.price (430), not the accessibilityLabel amount (432).
+    """
+    payload = {
+        "data": {
+            "presentation": {
+                "staysSearch": {
+                    "results": {
+                        "searchResults": [
+                            {
+                                "demandStayListing": {
+                                    "id": "RGVtYW5kU3RheUxpc3Rpbmc6MTYyOTMwMTg0NjI2ODA5MTE4MA=="
+                                },
+                                "available": True,
+                                "structuredDisplayPrice": {
+                                    "primaryLine": {
+                                        "price": "$430 USD",
+                                        "accessibilityLabel": "$432 USD for 1 night",
+                                        "qualifier": "night",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    ctx = parse_search_listing_context(payload)
+    row = ctx["1629301846268091180"]
+    assert row["nightly_price"] == 430
     assert row["price_nights"] == 1
 
 

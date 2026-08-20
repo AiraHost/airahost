@@ -92,6 +92,17 @@ class _FakeClientSparseFirstPage:
         return 200, {"data": {"presentation": {"staysSearch": {"results": {"searchResults": []}}}}}
 
 
+class _FakeClientRepeatsSamePage:
+    """Sparse market: Airbnb re-serves the identical page for every offset."""
+
+    def __init__(self):
+        self.calls = []
+
+    def search_listings_with_overrides(self, overrides):
+        self.calls.append(dict(overrides))
+        return 200, _payload_many(["111", "222"])
+
+
 class _FakeClientCapacity:
     def __init__(self):
         self.calls = []
@@ -299,6 +310,58 @@ def test_collect_search_comps_default_keeps_paging_until_priced_target():
     assert len(comps) == 20
 
 
+def test_collect_search_comps_min_priced_target_stops_early_when_met():
+    """
+    With min_priced_target set, paging stops as soon as that many priced comps
+    are found, instead of crawling deeper offsets toward the full page size.
+    """
+    client = _FakeClientSparseFirstPage()
+    comps, qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.ca",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=1,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+        min_priced_target=1,
+    )
+
+    offsets = [call.get("itemsOffset", 0) for call in client.calls]
+    assert qn == 1
+    assert offsets == [0]  # one priced comp on page 0 meets the target; no deeper paging
+    assert len(comps) == 1
+
+
+def test_collect_search_comps_stops_deep_sweep_when_page_adds_no_new_listings():
+    """
+    When the market is exhausted, Airbnb re-serves the same page for every
+    deeper offset. Each extra offset costs a full search request (a multi-second
+    browser navigation when direct HTTP is unavailable), so crawling all
+    max_scroll_rounds offsets multiplies report generation time for zero new
+    comps. The sweep must stop at the first page that adds no new listings.
+    """
+    client = _FakeClientRepeatsSamePage()
+    comps, qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.ca",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=12,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+    )
+
+    offsets = [call.get("itemsOffset", 0) for call in client.calls]
+    assert qn == 1
+    # Base page (offset 0), then exactly one deeper page (offset 20) that
+    # repeats the same listings — the remaining 11 offsets must be skipped.
+    assert offsets == [0, 20]
+    assert len(comps) == 2
+
+
 def test_collect_search_comps_two_night_keeps_paging_until_priced_target():
     client = _FakeClientSparseFirstPage()
     comps, qn = collect_search_comps(
@@ -449,6 +512,28 @@ def test_collect_search_comps_prefer_two_night_uses_two_night_window():
         prefer_two_night=True,
     )
     assert qn == 2
+
+
+def test_collect_search_comps_span_nights_uses_n_night_window():
+    """Pool discovery passes span_nights to search a single multi-night window
+    (check_out = check_in + span_nights), distinct from the 1/2-night pricing."""
+    client = _FakeClient()
+    _comps, qn = collect_search_comps(
+        client=client,
+        search_location="Toronto, ON",
+        base_origin="https://www.airbnb.ca",
+        date_i=date(2026, 5, 6),
+        adults=2,
+        max_scroll_rounds=1,
+        max_cards=20,
+        rate_limit_seconds=0.0,
+        page_offsets=[0],
+        span_nights=5,
+    )
+    assert qn == 5
+    call = client.calls[0]
+    assert call["checkin"] == "2026-05-06"
+    assert call["checkout"] == "2026-05-11"  # check_in + 5 nights
 
 
 def test_collect_search_comps_default_retries_two_night_when_one_night_empty():

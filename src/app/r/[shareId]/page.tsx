@@ -539,6 +539,23 @@ export default function ResultsPage({
     const bmNorm = normalize(bmUrl);
     const bmRoomId = roomIdFromUrl(bmUrl);
 
+    // Real name of the pinned benchmark: name saved when the user added it,
+    // else the worker-resolved title — overrides the placeholder title.
+    const bmName = (() => {
+      const compsArr = report.inputAttributes?.preferredComps;
+      let savedName: string | null = null;
+      if (Array.isArray(compsArr)) {
+        const match = compsArr.find(
+          (c) =>
+            c.listingUrl &&
+            ((bmRoomId != null && roomIdFromUrl(c.listingUrl) === bmRoomId) ||
+              normalize(c.listingUrl) === bmNorm)
+        );
+        savedName = match?.name?.trim() || null;
+      }
+      return savedName || contextualBenchmarkInfo?.benchmarkTitle?.trim() || null;
+    })();
+
     const flagged = rawListings.map((listing) => {
       const sameUrl = !!(listing.url && normalize(listing.url) === bmNorm);
       const sameRoomId = !!(
@@ -568,7 +585,7 @@ export default function ResultsPage({
         ...existing,
         isPinnedBenchmark: true,
         url: existing.url ?? bmUrl,
-        title: existing.title || "",
+        title: bmName || existing.title || "",
         nightlyPrice:
           typeof existing.nightlyPrice === "number" && existing.nightlyPrice > 0
             ? existing.nightlyPrice

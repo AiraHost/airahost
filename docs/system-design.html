@@ -273,7 +273,7 @@
     <a href="#s12">12. 比較物件篩選方式</a>
     <a href="#s13">13. 基準優先定價路徑</a>
     <a href="#s14">14. 動態需求與時間調整</a>
-    <a href="#s15">15. 夜間爬取策略</a>
+    <a href="#s15">15. 夜間爬取：與即時對齊</a>
     <a href="#s16">16. 資料真實性規則</a>
     <a href="#s17">17. 快取、重用與觀察說明</a>
     <a href="#s18">18. 已知缺口與保留勾點</a>
@@ -500,7 +500,6 @@
   <tr><td><code>worker/core/pricing_engine.py</code></td><td>相似度加權定價建議 + 透明結果組裝</td></tr>
   <tr><td><code>worker/core/benchmark.py</code></td><td>基準優先流水線（階段 1 錨定 + 階段 2 市場混合）</td></tr>
   <tr><td><code>worker/core/dynamic_pricing.py</code></td><td>逐日需求評分 + 時間乘數 + <code>recommendedDailyPrice</code> 計算</td></tr>
-  <tr><td><code>worker/core/nightly_strategy.py</code></td><td>分層夜間爬取計劃（觀察 / 推算索引、滾動 / 卡片預算）</td></tr>
   <tr><td><code>worker/core/observation_reuse.py</code></td><td>Phase 6A：即時 / 條件任務的觀察優先重用</td></tr>
   <tr><td><code>worker/core/comp_utils.py</code></td><td>共用比較物件 payload 建構（<code>to_comparable_payload</code>、<code>build_comp_id</code> 等）</td></tr>
   <tr><td><code>worker/scraper/comp_collection.py</code></td><td>統一 2 晚優先 / 1 晚備援 Airbnb 搜尋迴圈</td></tr>
@@ -702,9 +701,9 @@
 
 <div class="callout callout-infer">
   <strong>推論</strong>
-  <code>run_nightly_job()</code> 與 <code>run_interactive_job()</code> 目前是薄包裝函式 — 兩者都立即委派給 <code>_execute_analysis(is_nightly=True/False)</code>。此分離作為明確命名的勾點而存在，以供未來夜間專屬或即時專屬的前 / 後處理邏輯使用（例如單獨路由 <code>nightly_alert_training_refresh</code>）。目前除了傳遞 <code>is_nightly</code> 旗標並為夜間任務建構 <code>NightlyCrawlPlan</code> 外，兩個函式之間沒有其他分叉的流水線邏輯。
+  <code>run_nightly_job()</code> 與 <code>run_interactive_job()</code> 目前是薄包裝函式 — 兩者都立即委派給 <code>_execute_analysis(is_nightly=True/False)</code>。此分離作為明確命名的勾點而存在，以供未來夜間專屬或即時專屬的前 / 後處理邏輯使用（例如單獨路由 <code>nightly_alert_training_refresh</code>）。抓取流水線本身（<code>run_scrape</code> / <code>run_benchmark_scrape</code> / <code>run_criteria_search</code>）兩者完全共用同一路徑；<code>is_nightly</code> 旗標只影響排程判斷與爬取後的附帶效果（觀察寫入、ML 佇列）。
 </div>
-<div class="sources">來源：worker/main.py、docs/report-contract.md、worker/core/nightly_strategy.py</div>
+<div class="sources">來源：worker/main.py、docs/report-contract.md</div>
 </section>
 
 <!-- ─────────────────────────────────────────────── -->
@@ -802,7 +801,7 @@
 
     <rect x="112" y="210" width="220" height="60" rx="7" fill="#edf7f1" stroke="#2d9956" stroke-width="1.5"/>
     <text x="222" y="235" text-anchor="middle" font-size="12" font-weight="600">run_nightly_job()</text>
-    <text x="222" y="253" text-anchor="middle" font-size="10.5" fill="#1a6b3a">建構 NightlyCrawlPlan</text>
+    <text x="222" y="253" text-anchor="middle" font-size="10.5" fill="#1a6b3a">爬取流水線與即時共用</text>
     <text x="222" y="266" text-anchor="middle" font-size="10" fill="#1a6b3a">重讀已儲存房源輸入</text>
 
     <!-- No branch (right) -->
@@ -1146,7 +1145,7 @@ final_price   = benchmark_price × (<span class="num">1</span> + capped_adj × e
 
 <div class="callout callout-risk">
   <strong>注意事項 — 基準設定</strong>
-  <code>benchmark.py</code> 中的基準常數無法透過環境變數設定（與夜間策略不同）。更改 <code>BENCHMARK_MARKET_WEIGHT</code>、<code>BENCHMARK_MAX_ADJ</code> 或信心度表格值需要程式碼部署。
+  <code>benchmark.py</code> 中的基準常數無法透過環境變數設定。更改 <code>BENCHMARK_MARKET_WEIGHT</code>、<code>BENCHMARK_MAX_ADJ</code> 或信心度表格值需要程式碼部署。
 </div>
 
 <div class="sources">來源：worker/core/benchmark.py、docs/report-contract.md §Benchmark Architecture</div>
@@ -1209,64 +1208,15 @@ priceAfterTimeAdjustment = baseDailyPrice × final_multiplier
 
 <!-- ─────────────────────────────────────────────── -->
 <section id="s15">
-<h2>15. 夜間爬取策略</h2>
+<h2>15. 夜間爬取：與即時完全對齊</h2>
 
-<p>夜間任務是<strong>有預算的收集器</strong>。與均勻取樣 ~16 / 30 天（即時行為）不同，它們使用分層計劃，將觀察集中在近期日期（警示關鍵），並對較遠日期逐步降低頻率。</p>
+<p>夜間任務現在使用與即時任務完全相同的爬取流水線 — 相同的逐晚取樣（每晚都查詢，沒有分層 observe/infer 切分）、相同的滾動輪數與卡片上限（Mode A/B 用 <code>DAY_QUERY_SCROLL_ROUNDS</code> / <code>DAY_QUERY_MAX_CARDS</code>，Mode C 用 <code>BENCHMARK_SCROLL_ROUNDS</code> / <code>BENCHMARK_MAX_CARDS</code>），也沒有熔斷器。<code>nightly_plan</code> 參數與 <code>result_core_debug.nightly_crawl</code> 區塊已移除。</p>
 
-<h3>四個層級（預設值，均可透過環境變數調整）</h3>
-<div class="table-wrap">
-<table>
-  <tr><th>層級</th><th>日期範圍</th><th>採集頻率</th><th>~觀察次數（30 晚）</th><th>環境變數</th></tr>
-  <tr>
-    <td><code>near_term</code></td>
-    <td>D0–D3</td>
-    <td>每晚</td>
-    <td>4</td>
-    <td><code>NIGHTLY_TIER1_END=4</code></td>
-  </tr>
-  <tr>
-    <td><code>medium</code></td>
-    <td>D4–D10</td>
-    <td>每 2 晚</td>
-    <td>4</td>
-    <td><code>NIGHTLY_TIER2_END=11</code>、<code>TIER2_STEP=2</code></td>
-  </tr>
-  <tr>
-    <td><code>far</code></td>
-    <td>D11–D21</td>
-    <td>每 3 晚</td>
-    <td>4</td>
-    <td><code>NIGHTLY_TIER3_END=22</code>、<code>TIER3_STEP=3</code></td>
-  </tr>
-  <tr>
-    <td><code>sparse</code></td>
-    <td>D22–D29</td>
-    <td>僅首尾兩天</td>
-    <td>2</td>
-    <td><code>NIGHTLY_TIER4_COUNT=2</code></td>
-  </tr>
-</table>
-</div>
+<p>夜間與即時唯一仍不同之處是排程（<code>job_lane</code>、<code>WORKER_LANE</code>）與爬取後的附帶效果（寫入 <code>market_price_observations</code>、排入 ML 預測）— 與找 comp 的邏輯無關。</p>
 
-<p><strong>硬性上限：</strong>觀察日期總數永遠不超過 <code>NIGHTLY_MAX_OBSERVE_DATES=15</code>（基準模式為 10）。分層計算後，計劃集合截斷至前 <code>hard_cap</code> 個索引，保留近期優先順序。剩餘 ~16 天以線性插值填充。</p>
+<p><code>OBS_FRESH_TIER1_END</code> / <code>OBS_FRESH_TIER2_END</code> 環境變數僅供 <code>worker/core/observation_reuse.py</code> 的新鮮度分層政策使用（判斷已儲存的觀察資料多新才能讓即時報表重用而非重新爬取）— 與夜間如何爬取無關。</p>
 
-<h3>每次查詢限制（vs 即時預設值）</h3>
-<div class="table-wrap">
-<table>
-  <tr><th>設定</th><th>即時</th><th>夜間（標準）</th><th>夜間（基準）</th></tr>
-  <tr><td>每次查詢滾動輪數</td><td>2</td><td>1</td><td>1</td></tr>
-  <tr><td>每次查詢最大卡片數</td><td>30</td><td>20</td><td>15</td></tr>
-  <tr><td>最大觀察日期數</td><td>~16（共 30 天）</td><td>15</td><td>10</td></tr>
-</table>
-</div>
-
-<h3>熔斷器（提前停止）</h3>
-<p>若連續 <code>NIGHTLY_EARLY_STOP_THRESHOLD=3</code> 次日期查詢無法取得價格結果（挑戰頁面或空 Airbnb 搜尋），迴圈停止。已收集的觀察資料被保留；剩餘日期以插值處理。若已有足夠有效價格，任務仍完成（不報錯）。<code>result_core_debug.nightly_crawl.early_stop_triggered</code> 記錄是否觸發此機制。</p>
-
-<h3>Debug 區塊</h3>
-<p>每份夜間新鮮爬取報表均包含 <code>result_core_debug.nightly_crawl</code>，含層級明細、計劃 / 查詢 / 觀察 / 推算索引清單，及提前停止狀態。即時報表不包含此區塊 — 其缺席表示這是標準即時執行。</p>
-
-<div class="sources">來源：worker/core/nightly_strategy.py、docs/report-contract.md §Nightly Crawl Strategy</div>
+<div class="sources">來源：worker/core/observation_reuse.py、docs/report-contract.md §Nightly Scraping</div>
 </section>
 
 <!-- ─────────────────────────────────────────────── -->
@@ -1354,7 +1304,7 @@ report_type ≠ "forecast_snapshot"</code></pre>
 </div>
 
 <h3>觀察資料儲存</h3>
-<p><code>target_price_observations</code> 由夜間任務寫入（透過 <code>worker/core/observations.py</code>），由即時任務讀取（透過 <code>worker/core/observation_reuse.py</code>）。層級邊界使用與 <code>nightly_strategy.py</code> 相同的環境變數，確保新鮮度門檻與收集頻率保持一致。</p>
+<p><code>target_price_observations</code> 由夜間任務寫入（透過 <code>worker/core/observations.py</code>），由即時任務讀取（透過 <code>worker/core/observation_reuse.py</code>）。層級邊界（<code>OBS_FRESH_TIER1_END</code> / <code>OBS_FRESH_TIER2_END</code>）由 <code>observation_reuse.py</code> 自行擁有，僅供其新鮮度政策使用。</p>
 
 <div class="sources">來源：worker/core/observation_reuse.py、worker/core/observations.py、docs/report-contract.md</div>
 </section>
@@ -1385,7 +1335,7 @@ report_type ≠ "forecast_snapshot"</code></pre>
 
 <div class="callout callout-risk">
   <strong>風險：基準常數無法透過環境變數設定</strong>
-  <code>benchmark.py</code> 中的 <code>BENCHMARK_MARKET_WEIGHT</code>、<code>BENCHMARK_MAX_ADJ</code> 及信心度權重表為硬編碼。所有夜間策略設定均可透過環境變數調整；基準設定尚未支援。
+  <code>benchmark.py</code> 中的 <code>BENCHMARK_MARKET_WEIGHT</code>、<code>BENCHMARK_MAX_ADJ</code> 及信心度權重表為硬編碼；更改需要程式碼部署。
 </div>
 
 <div class="callout callout-risk">
@@ -1413,11 +1363,10 @@ report_type ≠ "forecast_snapshot"</code></pre>
 <div class="table-wrap">
 <table>
   <tr><th>檔案</th><th>在本文件中的角色</th></tr>
-  <tr><td><code>docs/report-contract.md</code></td><td>正式定價合約、執行政策規格、夜間爬取策略文件、儀表板真實資料來源規則、基準架構文件</td></tr>
+  <tr><td><code>docs/report-contract.md</code></td><td>正式定價合約、執行政策規格、夜間爬取與即時對齊說明、儀表板真實資料來源規則、基準架構文件</td></tr>
   <tr><td><code>docs/PROJECT_MEMORY.md</code></td><td>產品北極星、技術堆疊、API 合約摘要、折扣規則</td></tr>
   <tr><td><code>worker/main.py</code></td><td>輪詢迴圈、認領、心跳、<code>process_job</code>、派送、<code>_execute_analysis</code>、執行時設定常數</td></tr>
   <tr><td><code>worker/core/report_policy.py</code></td><td>政策類型定義、<code>NIGHTLY_POLICIES</code>、<code>resolve_execution_policy()</code></td></tr>
-  <tr><td><code>worker/core/nightly_strategy.py</code></td><td>層級設定常數、<code>NightlyCrawlPlan</code>、<code>build_nightly_crawl_plan()</code>、熔斷器邏輯</td></tr>
   <tr><td><code>worker/core/pricing_engine.py</code></td><td><code>recommend_price()</code>（相似度加權均值）、釘選比較物件加成、<code>build_transparent_result()</code></td></tr>
   <tr><td><code>worker/core/similarity.py</code></td><td>所有相似度權重與容差、<code>similarity_score()</code>、<code>filter_similar_candidates()</code>、房源類型硬性門檻、門檻常數</td></tr>
   <tr><td><code>worker/core/dynamic_pricing.py</code></td><td>需求評分公式、<code>compute_time_multiplier()</code>、<code>compute_demand_adjustment()</code>、<code>compute_dynamic_pricing_adjustment()</code></td></tr>

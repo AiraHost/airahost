@@ -1,0 +1,5 @@
+requests>=2.31.0
+
+# Optional: only needed for get_hash.py / the crawler's auto-hash-refresh.
+# After installing, run once: python -m playwright install chromium
+playwright>=1.40.0

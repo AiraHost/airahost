@@ -1,0 +1,21 @@
+-- ============================================================
+-- AiraHost — Close anon read access to pricing_reports
+-- Migration 027: Reverts the policy added by 026.
+--
+-- 026 let the anon key read every pricing_reports row because the
+-- standalone admin dashboard queried Supabase directly from the
+-- browser with no login. The dashboard now lives at /admin in the
+-- Next.js app: it is password-gated (ADMIN_PASSWORD) and reads with
+-- SUPABASE_SERVICE_ROLE_KEY server-side, so it no longer needs — and
+-- must not rely on — anon read access.
+--
+-- Leaving 026's policy in place would make every user's report data
+-- readable by anyone holding the public anon key, which would defeat
+-- the point of the password gate.
+--
+-- Verified before writing: no browser/anon-key code path in src/ reads
+-- pricing_reports. Share links (/api/r/[shareId]) and all report reads
+-- go through getSupabaseAdmin().
+-- ============================================================
+
+DROP POLICY IF EXISTS "Anon can read all reports (admin dashboard)" ON pricing_reports;

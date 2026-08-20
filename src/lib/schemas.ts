@@ -441,6 +441,8 @@ export interface RecommendedPrice {
 export interface BenchmarkInfo {
   benchmarkUsed: boolean;
   benchmarkUrl: string;
+  /** Real listing name resolved by the worker (user-saved name, PDP title, or search-card title). */
+  benchmarkTitle?: string | null;
   /** "search_hit" | "direct_page" | "failed" */
   benchmarkFetchStatus: string;
   benchmarkFetchMethod: string;

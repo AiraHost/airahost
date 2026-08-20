@@ -63,6 +63,73 @@ $Command
   )
 }
 
+function Test-TcpPortOpen {
+  param(
+    [int]$Port,
+    [int]$TimeoutMs = 1000
+  )
+
+  $client = [System.Net.Sockets.TcpClient]::new()
+  try {
+    $asyncResult = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    if (-not $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+      return $false
+    }
+    try {
+      $client.EndConnect($asyncResult)
+      return $true
+    } catch {
+      return $false
+    }
+  } finally {
+    $client.Close()
+  }
+}
+
+function Get-CdpVersionInfo {
+  param(
+    [int]$Port,
+    [int]$TimeoutSec = 2
+  )
+
+  # TCP-level check first: reliably tells "nothing listening" (connection
+  # refused/timeout) apart from "something listening but not speaking CDP",
+  # which an HTTP-only probe cannot always distinguish (a non-HTTP service can
+  # hang a request until it times out, same as an unbound port can).
+  if (-not (Test-TcpPortOpen -Port $Port -TimeoutMs ([Math]::Max(1, $TimeoutSec) * 1000))) {
+    return @{ Ready = $false; PortFree = $true; Info = $null; Error = "nothing is listening on port $Port" }
+  }
+
+  $probeUri = "http://127.0.0.1:$Port/json/version"
+  try {
+    $response = Invoke-RestMethod -Method Get -Uri $probeUri -TimeoutSec $TimeoutSec
+    if (-not ($response.webSocketDebuggerUrl -or $response.Browser)) {
+      return @{ Ready = $false; PortFree = $false; Info = $null; Error = "response did not look like a CDP /json/version payload" }
+    }
+    return @{ Ready = $true; PortFree = $false; Info = $response; Error = $null }
+  } catch {
+    return @{ Ready = $false; PortFree = $false; Info = $null; Error = $_.Exception.Message }
+  }
+}
+
+function Wait-CdpReady {
+  param(
+    [int]$Port,
+    [int]$TimeoutSec = 30
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  do {
+    $probe = Get-CdpVersionInfo -Port $Port -TimeoutSec 2
+    if ($probe.Ready) {
+      return $probe
+    }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $deadline)
+
+  throw "Chrome CDP on port $Port did not become ready within ${TimeoutSec}s after launch. Check that Chrome started successfully and nothing else is blocking the port."
+}
+
 function Wait-ForFrontend {
   param([int]$Port)
 
@@ -122,17 +189,30 @@ if (-not $internalSecret) {
 
 Write-Host "Starting AiraHost local stack from $RepoRoot" -ForegroundColor Cyan
 
+$CdpPort = 9222
 if (-not $SkipChrome) {
-  $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-  if (Test-Path $chromePath) {
-    Write-Host "Starting Chrome CDP on :9222" -ForegroundColor Cyan
-    Start-Process $chromePath -ArgumentList @(
-      "--remote-debugging-port=9222",
-      "--user-data-dir=$env:USERPROFILE\chrome-cdp-profile"
-    )
+  $cdpProbe = Get-CdpVersionInfo -Port $CdpPort
+  if ($cdpProbe.Ready) {
+    Write-Host "Detected an existing CDP endpoint on port ${CdpPort}: reusing it, not launching a new Chrome." -ForegroundColor Cyan
+  } elseif ($cdpProbe.PortFree) {
+    $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if (Test-Path $chromePath) {
+      Write-Host "Starting Chrome CDP on :$CdpPort" -ForegroundColor Cyan
+      Start-Process $chromePath -ArgumentList @(
+        "--remote-debugging-port=$CdpPort",
+        "--user-data-dir=$env:USERPROFILE\chrome-cdp-profile"
+      )
+      Write-Host "Waiting for Chrome CDP on :$CdpPort to become ready..." -ForegroundColor Cyan
+      Wait-CdpReady -Port $CdpPort -TimeoutSec 30 | Out-Null
+      Write-Host "Chrome CDP on :$CdpPort is ready." -ForegroundColor Green
+    } else {
+      Write-Warning "Chrome was not found at $chromePath. Start CDP Chrome manually or rerun with -SkipChrome."
+    }
   } else {
-    Write-Warning "Chrome was not found at $chromePath. Start CDP Chrome manually or rerun with -SkipChrome."
+    throw "Port $CdpPort is occupied by something that is not a Chrome CDP endpoint ($($cdpProbe.Error)). Stop that process, free the port, or rerun with -SkipChrome."
   }
+} else {
+  Write-Host "SkipChrome set: not launching Chrome. The worker's own CDP preflight (ports 9222-9224) is authoritative for readiness." -ForegroundColor Yellow
 }
 
 Write-Host "Starting Next.js dev server" -ForegroundColor Cyan

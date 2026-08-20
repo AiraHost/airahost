@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
+from worker.core.scrape_trace import propagate
 from worker.core.similarity import comp_urls_match
 from worker.core.concurrent_runner import MAX_SCRAPER_WORKERS
 from worker.core.geo_filter import apply_geo_filter
@@ -25,6 +26,13 @@ from worker.scraper.parsers import (
     parse_search_response,
 )
 from worker.scraper.price_normalizer import normalize_raw_price
+from worker.scraper.scraper_errors import AirbnbSearchBlocked
+from worker.scraper.search_result_contract import (
+    USABLE as PAYLOAD_USABLE,
+    VALID_EMPTY as PAYLOAD_VALID_EMPTY,
+    classify_search_payload,
+    row_is_bookable_priced,
+)
 from worker.scraper.target_extractor import (
     ListingSpec,
     normalize_property_type,
@@ -393,9 +401,11 @@ def _enrich_comps_baths_and_property_type_from_pdp(
         and hasattr(client, "config")
         and isinstance(getattr(client, "config", None), dict)
     )
+    forked_pool = False
     if use_fast_detail:
+        forked_pool = hasattr(client, "fork")
         browser_pool = [
-            client.fork() if hasattr(client, "fork") else client
+            client.fork() if forked_pool else client
             for _ in range(effective_workers)
         ]
         browser_locks = [threading.BoundedSemaphore(_tabs_per_browser()) for _ in browser_pool]
@@ -487,7 +497,10 @@ def _enrich_comps_baths_and_property_type_from_pdp(
     amenities_populated = 0
     try:
         with ThreadPoolExecutor(max_workers=effective_workers) as ex:
-            futures = [ex.submit(_fetch, query_arg) for query_arg in work_args]
+            # propagate(): carry this report's trace/search IDs into the pool
+            # threads, which do not inherit contextvars on their own.
+            submit_fetch = propagate(_fetch)
+            futures = [ex.submit(submit_fetch, query_arg) for query_arg in work_args]
             for f in as_completed(futures):
                 idx, a_val, b_val, p_val, amenities, pdp_title = f.result()
                 comp = comps[idx]
@@ -524,6 +537,12 @@ def _enrich_comps_baths_and_property_type_from_pdp(
                     updated += 1
     finally:
         if use_pool:
+            close_browser_client_pool(browser_pool)  # type: ignore[arg-type]
+        elif forked_pool:
+            # Forks hold their own lease on the shared endpoint runtime. They
+            # used to be left to garbage collection, which is also how each one
+            # used to leak a Playwright driver; release them explicitly. The
+            # root client keeps its own lease, so the runtime stays up.
             close_browser_client_pool(browser_pool)  # type: ignore[arg-type]
 
     # Batch update local cache, persist to file, and upsert to Supabase.
@@ -569,6 +588,10 @@ def collect_search_comps(
     pdp_structural_enrichment_limit: Optional[int] = None,
     prefer_two_night: bool = False,
     prefer_one_night: bool = False,
+    target_amenity_ids: Optional[List[int]] = None,
+    min_priced_target: Optional[int] = None,
+    span_nights: Optional[int] = None,
+    enforce_exact_capacity: bool = True,
 ) -> Tuple[List[ListingSpec], int]:
     collect_start = time.perf_counter()
     base_origin = safe_domain_base(str(base_origin or "https://www.airbnb.com"))
@@ -584,6 +607,16 @@ def collect_search_comps(
         offset_sets.append(deep_offsets)
     fallback_unpriced_comps: List[ListingSpec] = []
     fallback_unpriced_query_nights: int = 1
+    # Page-level outcome counters, kept separate so a blocked or malformed page
+    # can never be read as "no inventory" in the logs or by the caller.
+    page_counters: Dict[str, int] = {
+        "blocked_pages": 0,
+        "malformed_pages": 0,
+        "valid_empty_pages": 0,
+        "unknown_availability": 0,
+        "missing_price": 0,
+        "malformed_rows": 0,
+    }
     map_bounds: Optional[Tuple[float, float, float, float]] = None
     if (
         center_lat is not None
@@ -599,9 +632,12 @@ def collect_search_comps(
 
     # Default: 1-night primary, 2-night fallback.
     # Optional modes:
+    #   - span_nights=N          -> single N-night window (e.g. pool discovery)
     #   - prefer_two_night=True  -> 2-night only
     #   - prefer_one_night=True  -> 1-night only
-    if prefer_two_night:
+    if span_nights is not None and int(span_nights) > 0:
+        query_night_sequence = (int(span_nights),)
+    elif prefer_two_night:
         query_night_sequence = (2,)
     elif prefer_one_night:
         query_night_sequence = (1,)
@@ -649,6 +685,8 @@ def collect_search_comps(
                     overrides["swLng"] = sw_lng
                 # Explicitly disable Guest Favorite filter for raw search requests.
                 overrides["guestFavorite"] = False
+                if target_amenity_ids:
+                    overrides["amenityIds"] = list(target_amenity_ids)
                 if target_accommodates is not None:
                     overrides["guests"] = int(target_accommodates)
                 # Structural filter boundaries based on Medium-tier similarity tolerances
@@ -678,43 +716,64 @@ def collect_search_comps(
                     debug_search_url,
                 )
                 status, search_data = client.search_listings_with_overrides(overrides)
-                if status < 200 or status >= 300:
+
+                # Defense in depth: validate the payload *before* it counts as a
+                # page. Treating every 2xx as page_ok is what let a synthesized
+                # ID-only payload seed the candidate pool.
+                page_ctx = parse_search_listing_context(search_data)
+                payload_state = classify_search_payload(
+                    search_data, status, context=page_ctx, query_nights=query_nights
+                )
+                if payload_state.is_blocked:
+                    page_counters["blocked_pages"] += 1
                     logger.warning(
-                        "[%s] %s: search status=%s offset=%s",
+                        "[%s] %s: search page blocked reason=%s offset=%s",
                         log_prefix,
                         checkin_str,
+                        payload_state.reason_code,
+                        offset,
+                    )
+                    # A session-wide block is not empty inventory; propagate it
+                    # instead of returning a partial pool as if it were complete.
+                    raise AirbnbSearchBlocked(payload_state.reason_code)
+                if payload_state.outcome not in (PAYLOAD_USABLE, PAYLOAD_VALID_EMPTY):
+                    page_counters["malformed_pages"] += 1
+                    logger.warning(
+                        "[%s] %s: search page degraded reason=%s status=%s offset=%s",
+                        log_prefix,
+                        checkin_str,
+                        payload_state.reason_code,
                         status,
                         offset,
                     )
                     continue
                 page_ok = True
+                if payload_state.outcome == PAYLOAD_VALID_EMPTY:
+                    page_counters["valid_empty_pages"] += 1
 
                 page_ids = parse_search_response(search_data)
-                page_ctx = parse_search_listing_context(search_data)
-                priced_page_rows = sum(
-                    1
-                    for row in page_ctx.values()
-                    if (row.get("nightly_price") or 0) > 0
-                    or (row.get("total_price") or 0) > 0
-                )
+                priced_page_rows = payload_state.priced_count
                 logger.info(
-                    "[%s] %s: page_funnel query_nights=%s offset=%s "
+                    "[%s] %s: page_funnel query_nights=%s offset=%s outcome=%s "
                     "ids=%s context=%s priced_rows=%s elapsed_ms=%s",
                     log_prefix,
                     checkin_str,
                     query_nights,
                     offset,
+                    payload_state.outcome,
                     len(page_ids),
                     len(page_ctx),
                     priced_page_rows,
                     round((time.perf_counter() - collect_start) * 1000),
                 )
+                new_ids_this_page = 0
                 for lid in page_ids:
                     sid = str(lid)
                     row = page_ctx.get(sid, {})
                     if sid not in seen_ids:
                         listing_ids.append(sid)
                         seen_ids.add(sid)
+                        new_ids_this_page += 1
                         logger.info(
                             "[%s] %s: new comp listing id=%s rating=%s reviews=%s",
                             log_prefix,
@@ -726,17 +785,27 @@ def collect_search_comps(
                     existing = context.get(sid)
                     if existing is None:
                         context[sid] = row
-                    else:
-                        existing_has_price = bool(
-                            (existing.get("nightly_price") or 0) > 0
-                            or (existing.get("total_price") or 0) > 0
-                        )
-                        row_has_price = bool(
-                            (row.get("nightly_price") or 0) > 0
-                            or (row.get("total_price") or 0) > 0
-                        )
-                        if row_has_price and not existing_has_price:
-                            context[sid] = row
+                    elif row_is_bookable_priced(row, query_nights) and not row_is_bookable_priced(
+                        existing, query_nights
+                    ):
+                        context[sid] = row
+
+                # When the result set is exhausted, Airbnb serves the same page
+                # (or an empty one) for every deeper offset — each costing a
+                # full search request. Stop the deep sweep at the first page
+                # that adds no new listings. Only an *authoritative* page may
+                # justify this: a blocked or malformed response is not evidence
+                # that the result set ran out.
+                if offset_set_idx > 0 and new_ids_this_page == 0:
+                    logger.info(
+                        "[%s] %s: offset=%s added no new listings (outcome=%s); "
+                        "result set exhausted — stopping deeper paging",
+                        log_prefix,
+                        checkin_str,
+                        offset,
+                        payload_state.outcome,
+                    )
+                    break
 
             if not page_ok:
                 continue
@@ -806,7 +875,11 @@ def collect_search_comps(
                     adults=adults,
                 )
             structural_excluded = 0
-            if target_accommodates is not None:
+            # enforce_exact_capacity=False (benchmark fast path): search cards
+            # frequently omit per-listing capacity, and the exact-match filter
+            # would drop every candidate — the server-side guests filter in the
+            # request already guarantees capacity >= target.
+            if target_accommodates is not None and enforce_exact_capacity:
                 before = len(comps)
                 new_comps = []
                 for c in comps:
@@ -823,36 +896,67 @@ def collect_search_comps(
                 comps = new_comps
                 structural_excluded = before - len(comps)
 
-            # Keep only listings with a positive nightly price AND marked available.
+            # Keep listings with a positive nightly price for the exact dates
+            # and no explicit negative signal. `row_is_bookable_priced()` is
+            # the single acceptance rule shared with the payload classifier
+            # above: explicit availability=True is accepted, and so is
+            # unknown availability (the card simply did not say) as long as
+            # nothing explicitly says otherwise. Only explicit
+            # unavailable/min-stay signals reject a priced row.
             priced: List[ListingSpec] = []
+            # Rows that failed only for want of a price — the sole population
+            # the unpriced fallback may draw from. Rows rejected for
+            # availability or minimum-stay reasons must never reappear there:
+            # a min-stay-blocked card still carries a displayed price, and
+            # letting it through the fallback would put a ghost price into a
+            # report for dates the listing cannot actually be booked.
+            unpriced_eligible: List[ListingSpec] = []
             unavailable_count = 0
+            unknown_availability_count = 0
+            unknown_availability_priced_count = 0
             min_stay_blocked_count = 0
             no_price_count = 0
+            malformed_count = 0
             for c in comps:
                 lid = c.url.rsplit("/", 1)[-1] if c.url else ""
                 row = context.get(str(lid), {})
-                is_available = bool(row.get("is_available", True))
+                is_available = row.get("is_available")
                 min_nights = row.get("min_nights")
+                has_price = bool(c.nightly_price and c.nightly_price > 0)
+                if not (str(c.title or "").strip() or str(c.location or "").strip()) and c.accommodates is None:
+                    malformed_count += 1
                 if isinstance(min_nights, int) and min_nights > int(query_nights):
                     min_stay_blocked_count += 1
                     rejected_log.append(f"{lid}: min-stay-blocked")
-                elif not is_available:
+                elif is_available is False:
                     unavailable_count += 1
                     rejected_log.append(f"{lid}: unavailable")
-                elif not bool(c.nightly_price and c.nightly_price > 0):
+                elif c.url and row_is_bookable_priced(row, query_nights):
+                    priced.append(c)
+                    if is_available is None:
+                        unknown_availability_priced_count += 1
+                elif is_available is None:
+                    unknown_availability_count += 1
+                    rejected_log.append(f"{lid}: unknown-availability")
+                    if c.url and not has_price:
+                        unpriced_eligible.append(c)
+                else:
                     no_price_count += 1
                     rejected_log.append(f"{lid}: no-price")
-                elif c.url:
-                    priced.append(c)
-            
+                    if c.url:
+                        unpriced_eligible.append(c)
+            page_counters["unknown_availability"] += unknown_availability_count
+            page_counters["missing_price"] += no_price_count
+
             if rejected_log:
                 logger.debug("[%s] %s: Filtered candidates: %s", log_prefix, checkin_str, ", ".join(rejected_log))
 
             logger.info(
                 "[%s] %s: candidate_funnel query_nights=%s offsets=%s "
                 "fetched=%s parsed=%s self_excluded=%s structural_excluded=%s "
-                "unavailable=%s min_stay_blocked=%s no_price=%s priced=%s "
-                "elapsed_ms=%s",
+                "unavailable=%s unknown_availability=%s unknown_availability_priced=%s "
+                "min_stay_blocked=%s no_price=%s priced=%s blocked_pages=%s malformed_pages=%s "
+                "valid_empty_pages=%s elapsed_ms=%s",
                 log_prefix,
                 checkin_str,
                 query_nights,
@@ -862,13 +966,44 @@ def collect_search_comps(
                 self_excluded,
                 structural_excluded,
                 unavailable_count,
+                unknown_availability_count,
+                unknown_availability_priced_count,
                 min_stay_blocked_count,
                 no_price_count,
                 len(priced),
+                page_counters["blocked_pages"],
+                page_counters["malformed_pages"],
+                page_counters["valid_empty_pages"],
                 round((time.perf_counter() - collect_start) * 1000),
             )
 
-            priced_target = page_size
+            # Concise, bounded, single-line diagnostic summary at the
+            # acceptance boundary. `priced_but_unknown_availability` is a
+            # subset of `priced_and_accepted` (not a rejection) — it exists so
+            # a future incident can see how much of the trusted pool relies on
+            # unstated-but-priced evidence rather than explicit availability.
+            logger.info(
+                "[%s] %s: acceptance_diagnostics priced_and_accepted=%s "
+                "priced_but_unknown_availability=%s explicitly_unavailable=%s "
+                "min_stay_blocked=%s missing_price=%s malformed=%s",
+                log_prefix,
+                checkin_str,
+                len(priced),
+                unknown_availability_priced_count,
+                unavailable_count,
+                min_stay_blocked_count,
+                unknown_availability_count + no_price_count,
+                malformed_count,
+            )
+
+            # Stop paging once min_priced_target available comps are found (default
+            # keeps the legacy full-page target). Deeper offsets are only scanned
+            # when the first page yields fewer than the target.
+            priced_target = (
+                page_size
+                if min_priced_target is None
+                else max(1, min(int(min_priced_target), page_size))
+            )
             enough_priced = len(priced) >= priced_target
             exhausted_offsets = offset_set_idx >= len(offset_sets) - 1
             explicit_offsets = page_offsets is not None
@@ -892,11 +1027,31 @@ def collect_search_comps(
                     offsets,
                     priced_target,
                 )
-            if comps and not fallback_unpriced_comps:
-                # Keep first non-empty candidate set even when prices are missing,
-                # so downstream can still render a transparent report.
-                fallback_unpriced_comps = comps
-                fallback_unpriced_query_nights = query_nights
+            if unpriced_eligible and not fallback_unpriced_comps:
+                # Keep the first non-empty candidate set even when prices are
+                # missing, so downstream can still render a transparent report —
+                # but only rows that carry real structural evidence. An ID-only
+                # row (no title, no location, no capacity, no price) has nothing
+                # to render and nothing to verify, and retaining those is how
+                # the incident's 18 unusable candidates reached the report.
+                structural_fallback = [
+                    c
+                    for c in unpriced_eligible
+                    if (str(c.title or "").strip() or str(c.location or "").strip())
+                    and c.accommodates is not None
+                ]
+                dropped = len(unpriced_eligible) - len(structural_fallback)
+                if dropped:
+                    page_counters["malformed_rows"] += dropped
+                    logger.info(
+                        "[%s] %s: dropped %s id-only candidates from unpriced fallback",
+                        log_prefix,
+                        checkin_str,
+                        dropped,
+                    )
+                if structural_fallback:
+                    fallback_unpriced_comps = structural_fallback
+                    fallback_unpriced_query_nights = query_nights
 
             reason = "unknown"
             if min_stay_blocked_count > 0:
@@ -949,4 +1104,16 @@ def collect_search_comps(
         )
         return fallback_unpriced_comps, fallback_unpriced_query_nights
 
+    logger.info(
+        "[%s] %s: no comps collected blocked_pages=%s malformed_pages=%s "
+        "valid_empty_pages=%s unknown_availability=%s missing_price=%s malformed_rows=%s",
+        log_prefix,
+        checkin_str,
+        page_counters["blocked_pages"],
+        page_counters["malformed_pages"],
+        page_counters["valid_empty_pages"],
+        page_counters["unknown_availability"],
+        page_counters["missing_price"],
+        page_counters["malformed_rows"],
+    )
     return [], 1

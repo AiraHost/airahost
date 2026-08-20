@@ -45,12 +45,18 @@ class AirbnbClient:
         self._get_playwright_scraper().ensure_browser_ready()
 
     def close_browser(self) -> None:
+        """Release this client's runtime lease.
+
+        Failures are logged rather than swallowed: a silently incomplete
+        release leaves a lease — and therefore a Playwright driver — alive for
+        the rest of the worker process.
+        """
         if self._playwright_scraper is None:
             return
         try:
             self._playwright_scraper.close_browser()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("browser lease release failed cdp=%s err=%s", self.cdp_url, exc)
 
     def close_extra_tabs(self) -> None:
         """Close all browser tabs except one after a scraping task completes."""
@@ -97,6 +103,17 @@ class AirbnbClient:
     ) -> Tuple[int, Dict[str, Any]]:
         return self._get_playwright_scraper().search_listings_with_overrides(overrides)
 
+    def search_listings_direct_only(
+        self, overrides: Dict[str, Any]
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """StaysSearch via direct HTTP replay only — never the browser.
+
+        Unlike search_listings_with_overrides, a legitimately empty result page
+        is returned as-is instead of triggering a multi-second browser
+        navigation. Returns None when the direct replay itself failed.
+        """
+        return self._get_playwright_scraper().fetch_search_direct(overrides)
+
     def get_listing_details(
         self,
         listing_id: str,
@@ -126,6 +143,10 @@ class AirbnbClient:
             adults=int(adults if adults is not None else self.config.get("ADULTS", 1)),
         )
 
+    def fetch_listing_page_html(self, listing_id: str) -> Optional[str]:
+        """Direct HTTP GET of the listing page's server-rendered HTML (~1s, no browser tab)."""
+        return self._get_playwright_scraper()._fetch_listing_page_html_direct(str(listing_id))
+
     def fetch_pdp_price_direct(
         self,
         listing_id: str,
@@ -136,6 +157,20 @@ class AirbnbClient:
         """Direct HTTP PDP price fetch — no browser tab, ~300ms vs 5-15s browser nav."""
         scraper = self._get_playwright_scraper()
         fetcher = getattr(scraper, "fetch_pdp_price_direct", None)
+        if fetcher is None:
+            return None
+        return fetcher(listing_id=str(listing_id), checkin=checkin, checkout=checkout, adults=adults)
+
+    def fetch_pdp_payload_prioritized(
+        self,
+        listing_id: str,
+        checkin: str,
+        checkout: str,
+        adults: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """PDP payload for browser-free hot paths: airbnb pdp api first, direct-template replay second."""
+        scraper = self._get_playwright_scraper()
+        fetcher = getattr(scraper, "fetch_pdp_payload_prioritized", None)
         if fetcher is None:
             return None
         return fetcher(listing_id=str(listing_id), checkin=checkin, checkout=checkout, adults=adults)
