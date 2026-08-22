@@ -99,11 +99,27 @@ class _FakeResponse:
         return self._payload
 
 
+class _FakeLocator:
+    def __init__(self, texts: List[str]):
+        self._texts = texts
+
+    async def all_text_contents(self):
+        return list(self._texts)
+
+
 class _FakePage:
-    def __init__(self, *, final_url: str, dom_signals, responses: Optional[List[_FakeResponse]] = None):
+    def __init__(
+        self,
+        *,
+        final_url: str,
+        dom_signals,
+        responses: Optional[List[_FakeResponse]] = None,
+        deferred_state_scripts: Optional[List[str]] = None,
+    ):
         self.url = final_url
         self._dom_signals = dom_signals
         self._responses = list(responses or [])
+        self._deferred_state_scripts = list(deferred_state_scripts or [])
         self._handlers: List[Any] = []
         self.navigations: List[str] = []
         self.mouse = self
@@ -113,6 +129,11 @@ class _FakePage:
     def on(self, event, handler):
         if event == "response":
             self._handlers.append(handler)
+
+    def locator(self, selector):
+        if selector == 'script[id^="data-deferred-state"]':
+            return _FakeLocator(self._deferred_state_scripts)
+        return _FakeLocator([])
 
     async def goto(self, url, **kwargs):
         self.navigations.append(url)
@@ -364,3 +385,143 @@ def test_search_attempt_log_is_bounded_and_redacted(monkeypatch, caplog):
     for record in caplog.records:
         assert "html_preview" not in record.getMessage()
         assert len(record.getMessage()) < 2000
+
+
+# ── SSR-embedded StaysSearch recovery ─────────────────────────────────────
+# Airbnb's search page frequently answers a first-page load without ever
+# issuing a separate client-side StaysSearch XHR: results are server-rendered
+# and shipped inline in a data-deferred-state-N script tag as a niobe GraphQL
+# cache entry keyed "StaysSearch:{...variables...}". When no live XHR fires,
+# that embedded state is the only place the results exist.
+
+
+def _deferred_state_script(payload: Dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "niobeClientData": [
+                [
+                    "StaysSearch:{\"unrelatedCacheKeyVariables\":true}",
+                    {"data": payload["data"], "variables": {}},
+                ]
+            ]
+        }
+    )
+
+
+def test_embedded_ssr_state_is_used_when_no_live_xhr_fires(monkeypatch):
+    payload = _valid_payload(6)
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[],  # no live XHR captured at all
+        deferred_state_scripts=[_deferred_state_script(payload)],
+    )
+    _scraper, (status, data) = _run_search(page, monkeypatch)
+    assert status == 200
+    assert data["data"] == payload["data"]
+    # Recovered from the primary navigation's embedded state — no need to
+    # spend a second navigation on the filter_change nudge.
+    assert len(page.navigations) == 1
+
+
+def test_embedded_ssr_state_is_tried_again_after_filter_change_nudge(monkeypatch):
+    # The primary page has no embedded state yet; only the fallback
+    # navigation's rendered document carries it (e.g. hydration was still
+    # settling on the first read).
+    payload = _valid_payload(4)
+    calls: List[int] = []
+
+    def _scripts(call_index: int):
+        calls.append(call_index)
+        return [] if call_index == 1 else [_deferred_state_script(payload)]
+
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[],
+    )
+    page.locator_calls = 0
+    original_locator = page.locator
+
+    def _locator(selector):
+        if selector == 'script[id^="data-deferred-state"]':
+            page.locator_calls += 1
+            return _FakeLocator(_scripts(page.locator_calls))
+        return original_locator(selector)
+
+    page.locator = _locator
+
+    _scraper, (status, data) = _run_search(page, monkeypatch)
+    assert status == 200
+    assert data["data"] == payload["data"]
+    assert len(page.navigations) == 2  # primary + filter-change fallback
+
+
+def test_no_embedded_state_and_no_live_xhr_still_raises_degraded(monkeypatch):
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[],
+        deferred_state_scripts=[],
+    )
+    with pytest.raises(AirbnbSearchDegraded) as ctx:
+        _run_search(page, monkeypatch)
+    assert ctx.value.reason_code == "no_stayssearch_response_healthy_search"
+
+
+def test_malformed_embedded_state_is_ignored_not_raised(monkeypatch):
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[],
+        deferred_state_scripts=["{not valid json", "{\"niobeClientData\": \"not-a-list\"}"],
+    )
+    with pytest.raises(AirbnbSearchDegraded):
+        _run_search(page, monkeypatch)
+
+
+# ── CDN static-asset URLs must never be mistaken for the StaysSearch API ───
+# A response listener matching by bare substring ("stayssearch" in url) also
+# matches the CDN-served route bundle
+# (.../StaysSearchRoute/StaysSearchRoute.<hash>.js), which is never JSON and
+# always fails decode — that used to surface as the misleading
+# "stayssearch_json_decode_failed", masking the real problem (no API response
+# at all). It must be ignored so the true, embedded-state-based diagnosis (or
+# lack thereof) is what surfaces.
+
+
+def test_cdn_route_bundle_response_is_not_mistaken_for_the_api_response(monkeypatch):
+    bundle_url = (
+        "https://a0.muscache.com/airbnb/static/packages/web/en-CA/frontend/"
+        "stays-search/routes/StaysSearchRoute/StaysSearchRoute.846724c230.js"
+    )
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[_FakeResponse(bundle_url, json_raises=True, method="GET")],
+        deferred_state_scripts=[],
+    )
+    with pytest.raises(AirbnbSearchDegraded) as ctx:
+        _run_search(page, monkeypatch)
+    # Not misattributed to a decode failure on the (irrelevant) bundle asset.
+    assert ctx.value.reason_code != "stayssearch_json_decode_failed"
+    assert ctx.value.reason_code == "no_stayssearch_response_healthy_search"
+
+
+def test_cdn_route_bundle_response_does_not_block_the_real_api_capture(monkeypatch):
+    payload = _valid_payload(3)
+    bundle_url = (
+        "https://a0.muscache.com/airbnb/static/packages/web/en-CA/frontend/"
+        "stays-search/routes/StaysSearchRoute/StaysSearchRoute.846724c230.js"
+    )
+    page = _FakePage(
+        final_url=f"{SEARCH_HOST}/s/Belmont/homes",
+        dom_signals=_healthy_dom(),
+        responses=[
+            _FakeResponse(bundle_url, json_raises=True, method="GET"),
+            _FakeResponse(STAYSSEARCH_URL, payload=payload),
+        ],
+    )
+    _scraper, (status, data) = _run_search(page, monkeypatch)
+    assert status == 200
+    assert data == payload
