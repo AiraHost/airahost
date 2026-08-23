@@ -2107,6 +2107,26 @@ class PlaywrightScraper:
                 if captured_data is not None:
                     break
                 await page.wait_for_timeout(int(random.uniform(250, 550)))
+                if captured_data is None:
+                    # No live XHR intercepted yet. Airbnb frequently answers a
+                    # first-page load without ever issuing a separate
+                    # client-side StaysSearch request — the results are
+                    # server-rendered and shipped inline (see
+                    # _extract_embedded_stays_search) as soon as the page
+                    # hydrates, well before this loop's full budget elapses.
+                    # Check every iteration instead of only after the whole
+                    # loop, so a hydrated page is used immediately rather than
+                    # waiting out ~10s of polling for a request that, on a
+                    # server-rendered result, is never going to arrive.
+                    embedded = await self._extract_embedded_stays_search(page)
+                    if embedded is not None:
+                        captured_status = 200
+                        captured_data = embedded
+                        logger.info(
+                            "Playwright search: recovered StaysSearch results from "
+                            "embedded SSR state (no live XHR captured)"
+                        )
+                        break
 
             # Classify after hydration, not from the commit-time snapshot. The
             # result is recomputed on every navigation below — an early blocked
@@ -2115,21 +2135,6 @@ class PlaywrightScraper:
             state = await self._classify_live_page(
                 page, final_url=latest_nav_url, status=latest_status
             )
-
-            if captured_data is None and not state.is_blocked:
-                # No live XHR intercepted. Airbnb frequently answers a
-                # first-page load without ever issuing a separate client-side
-                # StaysSearch request — the results are server-rendered and
-                # shipped inline (see _extract_embedded_stays_search). Try
-                # that before spending a second navigation on the nudge below.
-                embedded = await self._extract_embedded_stays_search(page)
-                if embedded is not None:
-                    captured_status = 200
-                    captured_data = embedded
-                    logger.info(
-                        "Playwright search: recovered StaysSearch results from "
-                        "embedded SSR state (no live XHR captured)"
-                    )
 
             if captured_data is None and not state.is_blocked:
                 # One fallback nudge to trigger the XHR search. Rebuild the query
@@ -2153,15 +2158,16 @@ class PlaywrightScraper:
                     if captured_data is not None:
                         break
                     await page.wait_for_timeout(int(random.uniform(250, 550)))
-                if captured_data is None:
-                    embedded = await self._extract_embedded_stays_search(page)
-                    if embedded is not None:
-                        captured_status = 200
-                        captured_data = embedded
-                        logger.info(
-                            "Playwright search: recovered StaysSearch results from "
-                            "embedded SSR state after filter_change nudge"
-                        )
+                    if captured_data is None:
+                        embedded = await self._extract_embedded_stays_search(page)
+                        if embedded is not None:
+                            captured_status = 200
+                            captured_data = embedded
+                            logger.info(
+                                "Playwright search: recovered StaysSearch results from "
+                                "embedded SSR state after filter_change nudge"
+                            )
+                            break
                 previous_kind = state.kind
                 state = await self._classify_live_page(
                     page, final_url=latest_nav_url, status=latest_status

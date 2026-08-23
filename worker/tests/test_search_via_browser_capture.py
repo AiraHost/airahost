@@ -425,16 +425,11 @@ def test_embedded_ssr_state_is_used_when_no_live_xhr_fires(monkeypatch):
 
 
 def test_embedded_ssr_state_is_tried_again_after_filter_change_nudge(monkeypatch):
-    # The primary page has no embedded state yet; only the fallback
-    # navigation's rendered document carries it (e.g. hydration was still
-    # settling on the first read).
+    # The primary page's rendered document never carries the embedded state
+    # (e.g. hydration stalled); only the fallback navigation's document does.
+    # Tied to navigation count, not a call index, since the state is now
+    # polled on every wait iteration rather than once after the loop.
     payload = _valid_payload(4)
-    calls: List[int] = []
-
-    def _scripts(call_index: int):
-        calls.append(call_index)
-        return [] if call_index == 1 else [_deferred_state_script(payload)]
-
     page = _FakePage(
         final_url=f"{SEARCH_HOST}/s/Belmont/homes",
         dom_signals=_healthy_dom(),
@@ -446,7 +441,8 @@ def test_embedded_ssr_state_is_tried_again_after_filter_change_nudge(monkeypatch
     def _locator(selector):
         if selector == 'script[id^="data-deferred-state"]':
             page.locator_calls += 1
-            return _FakeLocator(_scripts(page.locator_calls))
+            after_fallback_nav = len(page.navigations) >= 2
+            return _FakeLocator([_deferred_state_script(payload)] if after_fallback_nav else [])
         return original_locator(selector)
 
     page.locator = _locator
@@ -455,6 +451,7 @@ def test_embedded_ssr_state_is_tried_again_after_filter_change_nudge(monkeypatch
     assert status == 200
     assert data["data"] == payload["data"]
     assert len(page.navigations) == 2  # primary + filter-change fallback
+    assert page.locator_calls > 1  # polled more than once before recovering
 
 
 def test_no_embedded_state_and_no_live_xhr_still_raises_degraded(monkeypatch):
