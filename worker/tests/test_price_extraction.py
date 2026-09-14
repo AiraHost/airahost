@@ -178,10 +178,11 @@ def test_float_value_preserved():
     assert result[0] == 123.45
 
 
-def test_client_pdp_extraction_uses_price_after_discount_not_primary_price():
+def test_client_pdp_extraction_prefers_primary_price_over_breakdown():
     """
-    Airbnb can place the visible one-night price in a "price after discount"
-    breakdown row while primaryLine carries another nearby price.
+    primaryLine is what Airbnb displays to the guest and is trusted directly,
+    even when explanationData's breakdown carries a different nearby amount
+    (e.g. a pre-discount base rate).
     """
 
     class _Client:
@@ -232,7 +233,7 @@ def test_client_pdp_extraction_uses_price_after_discount_not_primary_price():
         adults=1,
     )
 
-    assert price == 684.0
+    assert price == 769.0
     assert confidence == "high"
 
 

@@ -802,10 +802,11 @@ def test_parse_pdp_response_divides_two_night_total():
     assert out["price_kind"] == "trip_total_from_pdp"
 
 
-def test_parse_pdp_response_prefers_nightly_breakdown_over_fee_inclusive_primary_total():
+def test_parse_pdp_response_prefers_primary_total_over_breakdown_nightly_rate():
     """
-    User-listing prices must reflect the nightly base rate shown by Airbnb,
-    not a fee-inclusive booking total from primaryLine.
+    primaryLine is Airbnb's displayed price and is trusted directly, even
+    when explanationData's breakdown shows a different (e.g. fee-exclusive)
+    nightly base rate for the same stay.
     """
     payload = {
         "data": {
@@ -850,8 +851,8 @@ def test_parse_pdp_response_prefers_nightly_breakdown_over_fee_inclusive_primary
 
     out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
 
-    assert out["nightly_price"] == 430.0
-    assert out["total_price"] == 860.0
+    assert out["nightly_price"] == 524.0
+    assert out["total_price"] == 1048.0
     assert out["price_nights"] == 2
     assert out["price_kind"] == "nightly_from_pdp_breakdown"
     assert out["currency"] == "USD"
@@ -864,7 +865,7 @@ def test_parse_pdp_response_uses_display_primary_when_breakdown_has_cent_artifac
     choose the displayed primary amount when it matches the breakdown total
     within display precision.
     """
-    fixture = Path("worker/tests/fixtures/pdp_sparse_1408676238256636483.json")
+    fixture = Path(__file__).parent / "fixtures" / "pdp_sparse_1408676238256636483.json"
     payload = json.loads(fixture.read_text(encoding="utf-8"))
 
     out = parse_pdp_response(payload, "1408676238256636483", "https://www.airbnb.ca")
@@ -964,12 +965,12 @@ def test_parse_pdp_response_supports_amount_before_nights_breakdown_shape():
 
     out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
 
-    assert out["nightly_price"] == 430.0
+    assert out["nightly_price"] == 524.0
     assert out["price_nights"] == 2
     assert out["price_kind"] == "nightly_from_pdp_breakdown"
 
 
-def test_parse_pdp_response_prefers_one_night_price_after_discount_over_primary_price():
+def test_parse_pdp_response_prefers_primary_price_over_one_night_discount_breakdown():
     payload = {
         "data": {
             "presentation": {
@@ -1010,8 +1011,8 @@ def test_parse_pdp_response_prefers_one_night_price_after_discount_over_primary_
 
     out = parse_pdp_response(payload, "12345", "https://www.airbnb.com")
 
-    assert out["nightly_price"] == 684
-    assert out["total_price"] == 684
+    assert out["nightly_price"] == 769.0
+    assert out["total_price"] == 769.0
     assert out["price_nights"] == 1
     assert out["price_kind"] == "nightly_from_pdp_breakdown"
     assert out["currency"] == "USD"
