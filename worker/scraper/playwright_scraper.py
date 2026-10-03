@@ -1922,6 +1922,50 @@ class PlaywrightScraper:
             graphql_auth_error=graphql_auth_error,
         )
 
+    @staticmethod
+    async def _extract_embedded_stays_search(page) -> Optional[Dict[str, Any]]:
+        """Recover StaysSearch results embedded in server-rendered hydration state.
+
+        Airbnb's search page frequently answers a first-page load without ever
+        issuing a separate client-side StaysSearch XHR: the results are
+        rendered server-side and shipped inline in a
+        ``<script id="data-deferred-state-N">`` tag as a niobe GraphQL cache
+        entry keyed ``"StaysSearch:{...variables...}"``. When no live XHR was
+        intercepted (the response listener in ``_search_via_browser`` never
+        fires), this is the only place those results exist. Best-effort: any
+        parse failure returns None so the caller keeps its existing nav-nudge
+        and blocked/degraded handling unchanged.
+        """
+        try:
+            texts = await page.locator('script[id^="data-deferred-state"]').all_text_contents()
+        except Exception:
+            return None
+        for raw in texts:
+            if "StaysSearch" not in raw:
+                continue
+            try:
+                blob = json.loads(raw)
+            except Exception:
+                continue
+            entries = blob.get("niobeClientData") if isinstance(blob, dict) else None
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                key = entry[0]
+                if not isinstance(key, str) or not key.startswith("StaysSearch:"):
+                    continue
+                # entry[1] is shaped like a raw GraphQL response body
+                # ({"data": {...}, "variables": {...}}) — the same envelope
+                # classify_search_payload()/_search_results() expect from a
+                # captured live XHR, so return it as-is rather than unwrapping
+                # further.
+                value = entry[1]
+                if isinstance(value, dict) and isinstance(value.get("data"), dict):
+                    return value
+        return None
+
     async def _search_via_browser(self, overrides: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
         """Run a real browser search and capture the live StaysSearch JSON response.
 
@@ -1961,9 +2005,15 @@ class PlaywrightScraper:
                     req = resp.request
                     req_method = str(getattr(req, "method", "") or "").upper()
                     resp_url = str(getattr(resp, "url", "") or "")
-                    # Airbnb endpoints drift (slash/no-slash, locale/CDN variants).
-                    # Match by operation token instead of exact hardcoded path.
-                    if "stayssearch" not in resp_url.lower():
+                    # Airbnb endpoints drift (slash/no-slash, locale/CDN variants),
+                    # so match by operation token in the API path rather than an
+                    # exact hardcoded path. A bare substring check on "stayssearch"
+                    # also matches the CDN-served route bundle
+                    # (.../StaysSearchRoute/StaysSearchRoute.<hash>.js), which is
+                    # never JSON and always fails decode — restrict to the actual
+                    # GraphQL API path so that asset never gets misclassified as a
+                    # failed StaysSearch response.
+                    if not re.search(r"/api/v\d+/stayssearch", resp_url, re.IGNORECASE):
                         return
                     if req_method not in ("POST", "GET"):
                         diag["method_mismatch"] += 1
@@ -2057,6 +2107,26 @@ class PlaywrightScraper:
                 if captured_data is not None:
                     break
                 await page.wait_for_timeout(int(random.uniform(250, 550)))
+                if captured_data is None:
+                    # No live XHR intercepted yet. Airbnb frequently answers a
+                    # first-page load without ever issuing a separate
+                    # client-side StaysSearch request — the results are
+                    # server-rendered and shipped inline (see
+                    # _extract_embedded_stays_search) as soon as the page
+                    # hydrates, well before this loop's full budget elapses.
+                    # Check every iteration instead of only after the whole
+                    # loop, so a hydrated page is used immediately rather than
+                    # waiting out ~10s of polling for a request that, on a
+                    # server-rendered result, is never going to arrive.
+                    embedded = await self._extract_embedded_stays_search(page)
+                    if embedded is not None:
+                        captured_status = 200
+                        captured_data = embedded
+                        logger.info(
+                            "Playwright search: recovered StaysSearch results from "
+                            "embedded SSR state (no live XHR captured)"
+                        )
+                        break
 
             # Classify after hydration, not from the commit-time snapshot. The
             # result is recomputed on every navigation below — an early blocked
@@ -2088,6 +2158,16 @@ class PlaywrightScraper:
                     if captured_data is not None:
                         break
                     await page.wait_for_timeout(int(random.uniform(250, 550)))
+                    if captured_data is None:
+                        embedded = await self._extract_embedded_stays_search(page)
+                        if embedded is not None:
+                            captured_status = 200
+                            captured_data = embedded
+                            logger.info(
+                                "Playwright search: recovered StaysSearch results from "
+                                "embedded SSR state after filter_change nudge"
+                            )
+                            break
                 previous_kind = state.kind
                 state = await self._classify_live_page(
                     page, final_url=latest_nav_url, status=latest_status
@@ -2721,14 +2801,16 @@ class PlaywrightScraper:
             self._raise_if_search_circuit_open()
             direct = self._try_direct_search(overrides)
             reason = getattr(self, "_last_direct_search_reason", None)
+            offset = int(ov.get("itemsOffset") or 0)
             if direct is not None:
                 self._reset_search_circuit()
                 status_code, data = direct
-                if reason == "empty_result_set":
-                    # Authoritative empty page: nothing here for Playwright to
-                    # recover (see SEARCH_SKIP_FALLBACK_REASONS), so this is a
-                    # deliberate skip, not a fallback decision or a "found
-                    # results" success.
+                if reason == "empty_result_set" and offset > 0:
+                    # Authoritative empty page beyond the first page: nothing
+                    # here for Playwright to recover (see
+                    # SEARCH_SKIP_FALLBACK_REASONS), so this is a deliberate
+                    # skip, not a fallback decision or a "found results"
+                    # success.
                     scrape_events.emit(
                         scrape_events.FALLBACK_SKIPPED,
                         request_class=CLASS_SEARCH,
@@ -2738,6 +2820,27 @@ class PlaywrightScraper:
                         result_count=self._count_search_results(data),
                     )
                     return direct
+                if reason == "empty_result_set":
+                    # A *first*-page empty result is a much weaker signal than
+                    # a deep-offset one: a real market/listing essentially
+                    # never has zero results on page 1, so this is far more
+                    # likely a stale replay (hardcoded/cached StaysSearch
+                    # template, rotated persisted-query hash, etc.) than a
+                    # genuinely empty market. Escalate once to the real,
+                    # logged-in browser — which also re-captures a live
+                    # StaysSearch template via _capture_search_request_template,
+                    # self-healing the direct-HTTP path for the rest of this
+                    # search (see docs/scraper implementation prompts/
+                    # skip_futile_playwright_fallbacks.md for why deeper
+                    # offsets stay skipped).
+                    scrape_events.emit(
+                        scrape_events.FALLBACK_SELECTED,
+                        request_class=CLASS_BROWSER_NAVIGATION,
+                        fallback_from=SOURCE_DIRECT_JSON,
+                        source=SOURCE_PLAYWRIGHT_CAPTURE,
+                        fallback_reason=reason,
+                    )
+                    return self._run_browser_search(ov, op_name="search_listings_with_overrides")
                 scrape_events.emit(
                     scrape_events.DIRECT_HTTP_SUCCEEDED,
                     request_class=CLASS_SEARCH,
