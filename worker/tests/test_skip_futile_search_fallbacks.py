@@ -1,10 +1,19 @@
-"""search_listings_with_overrides must skip the Playwright fallback entirely
-for the two StaysSearch direct-HTTP reasons that a browser retry essentially
-never recovers from (see docs/scraper implementation prompts/
-skip_futile_playwright_fallbacks.md for the log evidence): an authoritative
-empty page (`empty_result_set`) and a transport failure with no response at
-all (`direct_http_failed`). Every other reason must keep escalating to
-Playwright exactly as before.
+"""search_listings_with_overrides must skip the Playwright fallback for a
+StaysSearch direct-HTTP transport failure with no response at all
+(`direct_http_failed`), and for an authoritative empty page
+(`empty_result_set`) *beyond the first page* — Airbnb re-serves page 1 to the
+browser for out-of-range offsets, so a deep-offset fallback costs a
+multi-second goto for no new listings (see docs/scraper implementation
+prompts/skip_futile_playwright_fallbacks.md for the log evidence backing
+that).
+
+A *first*-page empty result is a much weaker signal — a real market/listing
+essentially never has zero results on page 1 — so it still escalates to the
+browser: a stale/rotated direct-HTTP replay (hardcoded template, expired
+persisted-query hash, etc.) looks identical to a genuinely empty market
+until a real browser confirms it, and that escalation is also what
+re-captures a live StaysSearch template for the rest of the search. Every
+other reason must keep escalating to Playwright exactly as before.
 """
 
 import logging
@@ -62,20 +71,26 @@ def _make_scraper(*, has_template: bool = True) -> "pws.PlaywrightScraper":
     return scraper
 
 
-def test_first_page_empty_result_returns_unchanged_without_browser():
+def test_first_page_empty_result_falls_back_to_browser():
     scraper = _make_scraper()
     scraper.fetch_search_direct = lambda overrides: (200, _EMPTY_PAYLOAD)
+    called: Dict[str, bool] = {}
+
+    def fake_browser(overrides: Dict[str, Any], *, op_name: str):
+        called["invoked"] = True
+        return 200, _EMPTY_PAYLOAD
+
+    scraper._run_browser_search = fake_browser
     with _CaptureContext() as cap:
         result = scraper.search_listings_with_overrides({"checkin": "2026-06-01"})
 
+    assert called.get("invoked") is True
     assert result == (200, _EMPTY_PAYLOAD)
     names = cap.names()
-    assert scrape_events.FALLBACK_SKIPPED in names
-    assert scrape_events.FALLBACK_SELECTED not in names
-    skipped = next(e for e in cap.events if e["event"] == scrape_events.FALLBACK_SKIPPED)
-    assert skipped["reason_code"] == "empty_result_set"
-    assert skipped["result_count"] == 0
-    assert skipped["source"] == pws.SOURCE_DIRECT_JSON
+    assert scrape_events.FALLBACK_SELECTED in names
+    assert scrape_events.FALLBACK_SKIPPED not in names
+    fallback = next(e for e in cap.events if e["event"] == scrape_events.FALLBACK_SELECTED)
+    assert fallback["fallback_reason"] == "empty_result_set"
 
 
 def test_deep_offset_empty_result_returns_unchanged_without_browser():
