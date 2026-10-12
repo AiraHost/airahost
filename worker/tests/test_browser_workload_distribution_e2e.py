@@ -522,7 +522,11 @@ def test_self_price_capture_does_not_backfill_observed_price_from_later_date(mon
         minimum_booking_nights=1,
     )
 
-    assert allow_retry_values == [False, False, False]
+    # 2026-06-01 never prices (1-night, then the 2-night fallback), so the
+    # daily-capture retry pass re-attempts it once more; 2026-06-02 prices on
+    # its first try and is never retried. allow_retry_matrix stays False
+    # throughout — none of these calls opt into cross-window retry.
+    assert allow_retry_values == [False, False, False, False, False]
     assert result["capturedDays"] == 1
     assert result["priceByDate"] == {"2026-06-02": 155}
     assert result["observedListingPrice"] is None

@@ -57,7 +57,10 @@ def test_winerror_1455_at_startup_reproduces_the_classified_failure(install_play
     assert factory.start_calls == 1
     assert ctx.value.reason_code == "process_spawn_resource_exhausted"
     assert isinstance(ctx.value.__cause__, OSError)
-    assert ctx.value.__cause__.winerror == 1455
+    # .winerror is only populated by CPython on Windows builds; the
+    # production classifier falls back to args[3] for other platforms
+    # (see playwright_runtime._winerror_of), so assert through it here too.
+    assert pr._winerror_of(ctx.value.__cause__) == 1455
 
 
 def test_nested_winerror_is_recognized_and_unrelated_oserrors_are_not():
